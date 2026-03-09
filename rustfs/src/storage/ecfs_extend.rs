@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Extended S3 API logic: list objects, copy, multipart, restore, and helpers.
+
 use crate::config::workload_profiles::{
     RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
 };
@@ -856,7 +858,7 @@ pub(crate) async fn wrap_response_with_cors<T>(
     response
 }
 
-/// Parse part number from Option<i32> to Option<usize> with validation
+/// Parse part number from `Option<i32>` to `Option<usize>` with validation
 /// This function checks that the part number is greater than 0 and
 /// converts it to usize, returning an error if invalid
 ///

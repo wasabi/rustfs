@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Archive and compression helpers for backup/restore (tar, gzip, etc.).
+
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, XzDecoder, ZlibDecoder, ZstdDecoder};
 use async_compression::tokio::write::{BzEncoder, GzipEncoder, XzEncoder, ZlibEncoder, ZstdEncoder};
 use std::path::Path;

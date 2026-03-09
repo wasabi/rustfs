@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Event notification configuration admin handlers.
+
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;

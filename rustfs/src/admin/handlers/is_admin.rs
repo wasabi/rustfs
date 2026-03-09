@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Admin authentication check handler.
+
 use crate::admin::router::Operation;
 use crate::auth::{check_key_valid, constant_time_eq, get_condition_values, get_session_token};
 use http::{HeaderMap, HeaderValue};

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! ListMultipartUploads and ListParts response builders.
+
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;

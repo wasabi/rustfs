@@ -285,13 +285,13 @@ pub fn get_env_opt_i64(key: &str) -> Option<i64> {
     env::var(key).ok().and_then(|v| v.parse().ok())
 }
 
-/// Retrieve an environment variable as a specific type, returning Option<Option<i64>> if not set or parsing fails.
+/// Retrieve an environment variable as a specific type, returning `Option<Option<i64>>` if not set or parsing fails.
 ///
 /// #Parameters
 /// - `key`: The environment variable key to look up.
 ///
-/// #Returns
-/// - `Option<Option<i64>>`: The parsed value as i64 if successful, otherwise None
+/// # Returns
+/// - `Option<Option<i64>>`: The parsed value as `i64` if successful, otherwise `None`
 ///
 pub fn get_env_opt_opt_i64(key: &str) -> Option<Option<i64>> {
     env::var(key).ok().map(|v| v.parse().ok())

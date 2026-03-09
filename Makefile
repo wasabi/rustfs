@@ -68,6 +68,11 @@ How to use me:
 		make test                                # Run tests
 		make pre-commit                          # Run all pre-commit checks
 
+	📚 Documentation:
+		make doc                                 # Generate Rust API docs (target/doc)
+		make doc-serve                           # Serve docs at http://127.0.0.1:8765/ (links work)
+		make doc-open                            # Generate docs, serve, and open in browser
+
 	🚀 Quick Start:
 		make build                               # Build RustFS binary
 		make docker-dev-local                    # Build development Docker image (local)

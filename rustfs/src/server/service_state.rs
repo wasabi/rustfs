@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Service state (running/stopping/stopped) and graceful shutdown.
+
 use atomic_enum::atomic_enum;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

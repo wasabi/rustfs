@@ -128,7 +128,7 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Creates a new [`Builder`] with a given name for instrumentation.
+    /// Creates a new builder with a given name for instrumentation.
     pub fn builder<S: Into<Cow<'static, str>>>(name: S) -> Builder {
         Builder {
             builder: MeterProviderBuilder::default(),

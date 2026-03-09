@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! End-to-end test suite for RustFS (buckets, objects, versioning, KMS, policy, protocols).
+
 mod reliant;
 
 // Common utilities for all E2E tests

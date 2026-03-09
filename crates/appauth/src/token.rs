@@ -26,8 +26,8 @@ pub struct Token {
 }
 
 /// Public key generation Token
-/// [token] Token object
-/// [key] Public key string
+/// * `token` - Token object
+/// * `key` - Public key string
 /// Returns the encrypted string processed by base64
 pub fn gencode(token: &Token, key: &str) -> Result<String> {
     let data = serde_json::to_vec(token)?;
@@ -38,8 +38,8 @@ pub fn gencode(token: &Token, key: &str) -> Result<String> {
 }
 
 /// Private key resolution Token
-/// [token] Encrypted string processed by base64
-/// [key] Private key string
+/// * `token` - Encrypted string processed by base64
+/// * `key` - Private key string
 /// Return to the Token object
 pub fn parse(token: &str, key: &str) -> Result<Token> {
     let encrypted_data = base64_simd::URL_SAFE_NO_PAD

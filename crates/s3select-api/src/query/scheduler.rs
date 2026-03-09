@@ -26,7 +26,7 @@ pub trait Scheduler {
     /// Schedule the provided [`ExecutionPlan`] on this [`Scheduler`].
     ///
     /// Returns a [`ExecutionResults`] that can be used to receive results as they are produced,
-    /// as a [`futures::Stream`] of [`RecordBatch`]
+    /// as a [`futures::Stream`] of `RecordBatch`
     async fn schedule(&self, plan: Arc<dyn ExecutionPlan>, context: Arc<TaskContext>) -> Result<ExecutionResults>;
 }
 

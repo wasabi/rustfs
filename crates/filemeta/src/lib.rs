@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! File and object metadata management, cache, and replication helpers.
+
 mod error;
 mod fileinfo;
 mod filemeta;

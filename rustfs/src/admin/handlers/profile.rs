@@ -12,6 +12,8 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+//! CPU and memory profiling trigger handlers.
+
 use crate::admin::router::Operation;
 use http::header::CONTENT_TYPE;
 use http::{HeaderMap, StatusCode};

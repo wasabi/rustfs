@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Server configuration: environment variables, constants, and feature-gated modules.
+
 #[cfg(feature = "constants")]
 pub mod constants;
 #[cfg(feature = "constants")]

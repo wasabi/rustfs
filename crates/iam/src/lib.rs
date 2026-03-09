@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Identity and Access Management: users, groups, policies, OIDC, and store.
+
 use crate::error::{Error, Result};
 use manager::IamCache;
 use oidc::OidcSys;

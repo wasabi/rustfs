@@ -20,6 +20,8 @@
     rust_2018_idioms
 )]
 
+//! Data scanner for integrity checks and health monitoring.
+
 pub mod data_usage_define;
 pub mod error;
 pub mod last_minute;

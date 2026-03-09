@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Heal and rebalance admin API handlers.
+
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::ADMIN_PREFIX;
 use bytes::Bytes;

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! S3 API implementation: bucket, object, and multipart operations via ECStore.
+
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;

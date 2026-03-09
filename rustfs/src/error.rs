@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Error types and conversion from storage/IAM to S3 API errors.
+
 use rustfs_ecstore::bucket::quota::QuotaError;
 use rustfs_ecstore::error::StorageError;
 use s3s::{S3Error, S3ErrorCode};

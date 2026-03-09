@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Utilities: TLS/certs, IP, HTTP, env, compression, hashing, and more.
+
 #[cfg(feature = "tls")]
 pub mod certs;
 #[cfg(feature = "ip")]

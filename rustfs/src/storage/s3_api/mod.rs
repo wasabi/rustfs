@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! S3 API response builders and shared types (owner, initiator, etc.).
+
 #![allow(dead_code)]
 
 //! Facade modules for incremental S3 API extraction from `ecfs.rs`.

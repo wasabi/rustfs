@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Erasure-coded storage: buckets, objects, disks, pools, and replication.
+
 extern crate core;
 
 pub mod admin_server_info;

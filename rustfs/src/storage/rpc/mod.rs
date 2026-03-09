@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! gRPC (tonic) services for the storage node (bucket metadata, disk, health, lock, metrics).
+
 pub mod node_service;
 
 pub use node_service::{NodeService, make_server};

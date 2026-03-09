@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Web console server (Axum), favicon, and health/ready endpoints.
+
 use crate::admin::handlers::health::{HealthProbe, build_component_details, collect_dependency_readiness, health_check_state};
 use crate::config::build;
 use crate::license::get_license;

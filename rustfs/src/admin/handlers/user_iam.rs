@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! IAM import/export admin handlers.
+
 use super::user::{ExportIam, ImportIam};
 use crate::{
     admin::router::{AdminOperation, S3Router},

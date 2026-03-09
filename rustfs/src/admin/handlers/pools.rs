@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Storage pool admin handlers.
+
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};

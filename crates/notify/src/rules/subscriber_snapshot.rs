@@ -84,7 +84,7 @@ where
         self.event_mask == 0 || self.rules.is_empty()
     }
 
-    /// [debug] Assert that `event_mask` is consistent with the event declared in `rules`.
+    /// Debug assertion: `event_mask` is consistent with the event declared in `rules`.
     ///
     /// Constraints:
     /// - only runs in debug builds (release incurs no cost).

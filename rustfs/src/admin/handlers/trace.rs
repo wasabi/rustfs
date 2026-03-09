@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Distributed tracing admin handler.
+
 use crate::admin::router::Operation;
 use crate::app::context::resolve_endpoints_handle;
 use http::StatusCode;

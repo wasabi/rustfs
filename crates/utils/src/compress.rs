@@ -65,14 +65,14 @@ impl str::FromStr for CompressionAlgorithm {
 }
 
 /// Compress a block of data using the specified compression algorithm.
-/// Returns the compressed data as a Vec<u8>.
+/// Returns the compressed data as a `Vec<u8>`.
 ///
 /// # Arguments
 /// * `input` - The input data to be compressed.
 /// * `algorithm` - The compression algorithm to use.
 ///
 /// # Returns
-/// * A Vec<u8> containing the compressed data.
+/// * A `Vec<u8>` containing the compressed data.
 ///
 pub fn compress_block(input: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> {
     match algorithm {
@@ -117,14 +117,14 @@ pub fn compress_block(input: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> 
 }
 
 /// Decompress a block of data using the specified compression algorithm.
-/// Returns the decompressed data as a Vec<u8>.
+/// Returns the decompressed data as a `Vec<u8>`.
 ///
 /// # Arguments
 /// * `compressed` - The compressed data to be decompressed.
 /// * `algorithm` - The compression algorithm used for compression.
 ///
 /// # Returns
-/// * A Result containing a Vec<u8> with the decompressed data, or an io::Error.
+/// * A Result containing a `Vec<u8>` with the decompressed data, or an io::Error.
 ///
 pub fn decompress_block(compressed: &[u8], algorithm: CompressionAlgorithm) -> io::Result<Vec<u8>> {
     match algorithm {

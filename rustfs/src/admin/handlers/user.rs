@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! User and sub-handler registration (account info, group, service account, IAM, policy binding).
+
 use super::{account_info, group, service_account, user_iam, user_lifecycle, user_policy_binding};
 use crate::{
     admin::{

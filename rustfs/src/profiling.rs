@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Performance profiling (jemalloc, Pyroscope) and allocator selection.
+
 #[cfg(all(
     not(target_os = "windows"),
     not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))

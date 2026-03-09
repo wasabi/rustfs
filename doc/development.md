@@ -52,6 +52,9 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md) for detailed formatting and clippy rul
 - `make check` — Compilation check
 - `make test` — Tests
 - `make pre-commit` — All checks required before commit
+- `make doc` — Generate Rust API documentation (HTML in `target/doc`)
+- `make doc-serve` — Generate docs and serve at http://127.0.0.1:8765/ (all links work; Ctrl+C to stop)
+- `make doc-open` — Generate docs, start local server, and open browser (use this so cross-crate links work)
 
 ## CI
 

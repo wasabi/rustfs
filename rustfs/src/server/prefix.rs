@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Path constants for profiling, favicon, and admin/console prefixes.
+
 /// Predefined CPU profiling path for RustFS server.
 /// This path is used to access CPU profiling data.
 pub(crate) const PROFILE_CPU_PATH: &str = "/profile/cpu";

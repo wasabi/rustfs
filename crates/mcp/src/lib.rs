@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! MCP (Model Context Protocol) server for S3 operations.
+
 pub mod config;
 pub mod s3_client;
 pub mod server;

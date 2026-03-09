@@ -21,6 +21,8 @@
     rust_2018_idioms
 )]
 
+//! Client and server checksum algorithms (CRC32, CRC32C, CRC64-NVME) and HTTP integration.
+
 use crate::error::UnknownChecksumAlgorithmError;
 
 use bytes::Bytes;

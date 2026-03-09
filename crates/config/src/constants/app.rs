@@ -89,25 +89,25 @@ pub const RUSTFS_CA_CERT: &str = "ca.crt";
 /// Default HTTP prefix for rustfs
 /// This is the default HTTP prefix for rustfs.
 /// It is used to identify HTTP URLs.
-/// Default value: http://
+/// Default value: <http://>
 pub const RUSTFS_HTTP_PREFIX: &str = "http://";
 
 /// Default HTTPS prefix for rustfs
 /// This is the default HTTPS prefix for rustfs.
 /// It is used to identify HTTPS URLs.
-/// Default value: https://
+/// Default value: <https://>
 pub const RUSTFS_HTTPS_PREFIX: &str = "https://";
 
 /// Default documentation URL for rustfs
 /// This is the default documentation URL for rustfs.
 /// It is used to provide the documentation of the application.
-/// Default value: https://docs.rustfs.com
+/// Default value: <https://docs.rustfs.com>
 pub const RUSTFS_DOCS_URL: &str = "https://docs.rustfs.com";
 
 /// Default GitHub URL for rustfs
 /// This is the default GitHub URL for rustfs.
 /// It is used to provide the source code of the application.
-/// Default value: https://github.com/rustfs/rustfs
+/// Default value: <https://github.com/rustfs/rustfs>
 pub const RUSTFS_GITHUB_URL: &str = "https://github.com/rustfs/rustfs";
 
 /// Default license for rustfs
@@ -119,7 +119,7 @@ pub const RUSTFS_LICENSE: &str = "Apache-2.0";
 /// Default license URL for rustfs
 /// This is the default license URL for rustfs.
 /// It is used to provide the license URL of the application.
-/// Default value: https://www.apache.org/licenses/LICENSE-2.0
+/// Default value: <https://www.apache.org/licenses/LICENSE-2.0>
 pub const RUSTFS_LICENSE_URL: &str = "https://www.apache.org/licenses/LICENSE-2.0";
 
 /// Environment variable for rustfs address

@@ -12,6 +12,8 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+//! Event notifier lifecycle (startup and shutdown).
+
 use crate::app::context::resolve_server_config;
 use tracing::{error, info, instrument, warn};
 

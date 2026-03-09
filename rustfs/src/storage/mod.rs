@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Storage layer: S3 API handlers, EC store integration, RPC, and SSE.
+//!
+//! Implements object and bucket operations, multipart uploads, encryption, and gRPC
+//! services for distributed storage.
+
 pub mod access;
 pub mod concurrency;
 pub mod ecfs;

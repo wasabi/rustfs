@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! User policy binding admin handlers.
+
 use super::{event, policies};
 use crate::admin::router::{AdminOperation, S3Router};
 

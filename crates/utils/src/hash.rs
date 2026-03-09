@@ -71,7 +71,7 @@ fn u8x32_from_u64x4(input: [u64; 4]) -> [u8; 32] {
 }
 
 impl HashAlgorithm {
-    /// Hash the input data and return the hash result as Vec<u8>.
+    /// Hash the input data and return the hash result as `Vec<u8>`.
     ///
     /// # Arguments
     /// * `data` - A byte slice representing the data to be hashed

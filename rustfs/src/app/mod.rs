@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Application layer module entry.
-//! Concrete use-case modules will be introduced incrementally in Phase 3.
+//! Application layer and use-case orchestration.
+//!
+//! Contains bucket, object, multipart, and admin use-cases plus the global application context
+//! used across the server.
 
 pub mod admin_usecase;
 pub mod bucket_usecase;
