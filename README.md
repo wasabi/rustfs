@@ -208,7 +208,8 @@ nix run
 
 ## Documentation
 
-For detailed documentation, including configuration options, API references, and advanced usage, please visit our [Documentation](https://docs.rustfs.com).
+- **[In-repository docs](doc/)** — Architecture, development guide, and configuration overview (this repo).
+- **[RustFS Documentation](https://docs.rustfs.com)** — Full manual, installation, configuration options, API reference, and advanced usage.
 
 ## Getting Help
 
@@ -220,6 +221,7 @@ If you have any questions or need assistance:
 
 ## Links
 
+- [In-repository documentation](doc/) - Architecture, development, and configuration (this repo)
 - [Documentation](https://docs.rustfs.com) - The manual you should read
 - [Changelog](https://github.com/rustfs/rustfs/releases) - What we broke and fixed
 - [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) - Where the community lives

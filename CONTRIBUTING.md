@@ -2,7 +2,7 @@
 
 ## 📋 Code Quality Requirements
 
-For instructions on setting up and running the local development environment, please see [Development Guide](docs/DEVELOPMENT.md).
+For instructions on setting up and running the local development environment, please see [Development Guide](doc/development.md).
 
 ### 🔧 Code Formatting Rules
 
