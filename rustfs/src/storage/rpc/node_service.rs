@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! NodeService gRPC implementation and request routing.
+
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;

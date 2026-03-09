@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! S3Response helpers and error-to-response conversion.
+
 use crate::error::ApiError;
 use rustfs_ecstore::error::StorageError;
 use s3s::{S3Error, S3ErrorCode, S3Response};

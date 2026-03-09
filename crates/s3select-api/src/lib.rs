@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! S3 Select API: object store integration, query server, and execution types.
+
 use datafusion::{common::DataFusionError, sql::sqlparser::parser::ParserError};
 use snafu::{Backtrace, Location, Snafu};
 use std::fmt::Display;

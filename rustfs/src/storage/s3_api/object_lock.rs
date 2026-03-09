@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Object lock and legal hold response builders.
+
 use s3s::dto::{
     GetObjectLegalHoldOutput, GetObjectLockConfigurationOutput, GetObjectRetentionOutput, ObjectLockConfiguration,
     ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, PutObjectLegalHoldOutput,

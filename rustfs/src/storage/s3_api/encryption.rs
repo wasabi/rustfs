@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Bucket encryption (SSE) response builders.
+
 use s3s::dto::{GetBucketEncryptionOutput, PutBucketEncryptionOutput, ServerSideEncryptionConfiguration};
 
 pub(crate) fn build_get_bucket_encryption_output(

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! License parsing and global license state.
+
 use rustfs_appauth::token::Token;
 use std::io::{Error, Result};
 use std::sync::OnceLock;

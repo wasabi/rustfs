@@ -18,8 +18,8 @@ use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 
-/// RulesMap - Rule mapping organized by event name。
-/// `event.RulesMap` (map[Name]Rules) in the corresponding Go code
+/// RulesMap - Rule mapping organized by event name.
+/// `event.RulesMap` (`map[Name]Rules`) in the corresponding Go code
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RulesMap {
     map: HashMap<EventName, PatternRules>,

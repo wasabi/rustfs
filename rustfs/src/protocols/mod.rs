@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Protocol adapters (e.g. FTPS/SFTP) and S3 client for protocol servers.
+
 pub mod client;
 
 pub use client::ProtocolStorageClient;

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Bucket and object tagging response builders and validation.
+
 use s3s::dto::{
     DeleteBucketTaggingOutput, DeleteObjectTaggingOutput, GetBucketTaggingOutput, GetObjectTaggingOutput, PutBucketTaggingOutput,
     PutObjectTaggingOutput, Tag,

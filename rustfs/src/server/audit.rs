@@ -12,6 +12,8 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+//! Audit system startup and shutdown using global server config.
+
 use crate::app::context::resolve_server_config;
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;

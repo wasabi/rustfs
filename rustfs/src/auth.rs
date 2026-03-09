@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! S3 request authentication (signature v4, presigned URLs) and authorization.
+
 use http::HeaderMap;
 use http::Uri;
 use rustfs_credentials::{Credentials, get_global_action_cred};

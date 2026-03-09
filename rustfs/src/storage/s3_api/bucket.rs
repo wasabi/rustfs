@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! ListBuckets, ListObjects, ListObjectVersions response builders.
+
 use crate::storage::s3_api::common::rustfs_owner;
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::store_api::{BucketInfo, ListObjectVersionsInfo, ListObjectsV2Info};

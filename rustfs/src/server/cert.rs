@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! TLS certificate loading and global mTLS/root cert configuration.
+
 use rustfs_common::{MtlsIdentityPem, set_global_mtls_identity, set_global_root_cert};
 use rustfs_config::{RUSTFS_CA_CERT, RUSTFS_PUBLIC_CERT, RUSTFS_TLS_CERT};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};

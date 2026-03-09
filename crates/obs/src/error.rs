@@ -19,11 +19,9 @@ use tokio::sync::SetError;
 /// Error type for global guard operations
 #[derive(Debug, thiserror::Error)]
 pub enum GlobalError {
-    /// Occurs when attempting to set a global recorder (e.g., via [`crate::Recorder::install_global`] or [`metrics::set_global_recorder`])
+    /// Occurs when attempting to set a global recorder (e.g., when calling [`crate::set_global_guard`]
+    /// or [metrics::set_global_recorder](https://docs.rs/metrics/latest/metrics/fn.set_global_recorder.html))
     /// but a global recorder is already initialized.
-    ///
-    /// [`crate::Recorder::install_global`]: crate::Recorder::install_global
-    /// [`metrics::set_global_recorder`]: https://docs.rs/metrics/latest/metrics/fn.set_global_recorder.html
     #[error("Failed to set a global recorder: {0}")]
     SetRecorder(#[from] metrics::SetRecorderError<crate::Recorder>),
     #[error("Failed to set global guard: {0}")]

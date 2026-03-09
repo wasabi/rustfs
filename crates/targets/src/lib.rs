@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Event targets: ARN, event names, store, and target implementations.
+
 pub mod arn;
 mod check;
 pub mod error;

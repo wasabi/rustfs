@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Bucket and object ACL response builders.
+
 use crate::storage::s3_api::common::rustfs_owner;
 use s3s::dto::{GetBucketAclOutput, GetObjectAclOutput, Grant, Grantee, Permission, Type};
 

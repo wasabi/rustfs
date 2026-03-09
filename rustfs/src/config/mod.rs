@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Command-line and configuration parsing for the RustFS server (address, TLS, region, workload profiles, etc.).
+
 use clap::Parser;
 use clap::builder::NonEmptyStringValueParser;
 use const_str::concat;

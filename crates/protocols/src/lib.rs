@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Protocol adapters (FTPS, etc.) and S3 action authorization for protocol sessions.
+
 #![deny(unsafe_code)]
 
 pub mod common;

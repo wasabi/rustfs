@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Helpers for audit logging, notifications, and response metadata.
+
 use http::StatusCode;
 use rustfs_audit::{
     entity::{ApiDetails, ApiDetailsBuilder, AuditEntryBuilder},

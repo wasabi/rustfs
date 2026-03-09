@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Server bootstrap: KMS, IAM, replication, scanner, heal, and notification setup.
+
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK, RUSTFS_REGION};

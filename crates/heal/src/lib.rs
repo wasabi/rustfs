@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Heal manager, heal channel, and global heal service lifecycle.
+
 mod error;
 pub mod heal;
 

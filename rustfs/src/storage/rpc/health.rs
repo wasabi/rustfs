@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! NodeService RPC handlers for process info and health.
+
 use super::*;
 
 impl NodeService {

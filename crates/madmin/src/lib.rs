@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Management API types and helpers (health, metrics, users, heal, trace, etc.).
+
 pub mod group;
 pub mod heal_commands;
 pub mod health;

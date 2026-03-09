@@ -202,7 +202,7 @@ impl QueueConfig {
 }
 
 /// Corresponding to the `lambda` structure in the Go code.
-/// Used to parse <CloudFunction> ARN from inside the <CloudFunctionConfiguration> tag.
+/// Used to parse `CloudFunction` ARN from inside the `CloudFunctionConfiguration` tag.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct LambdaConfigDetail {
     #[serde(rename = "CloudFunction")]
@@ -220,7 +220,7 @@ pub struct LambdaConfigDetail {
 }
 
 /// Corresponding to the `topic` structure in the Go code.
-/// Used to parse <Topic> ARN from inside the <TopicConfiguration> tag.
+/// Used to parse `Topic` ARN from inside the `TopicConfiguration` tag.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct TopicConfigDetail {
     #[serde(rename = "Topic")]

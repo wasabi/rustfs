@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! In-memory and seekable async readers for GET/HEAD and SSE.
+
 use tokio::io::{AsyncRead, AsyncSeek};
 
 /// Seekable in-memory async reader used by internal S3 API fast paths (e.g., GET/HEAD)

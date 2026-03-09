@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Prefix listing and key/prefix validation utilities.
+
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::ListOperations;
 use std::sync::Arc;

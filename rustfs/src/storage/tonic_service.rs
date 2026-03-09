@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Re-exports for the gRPC (tonic) storage node service.
+
 pub use crate::storage::rpc::make_server;
 #[allow(dead_code)]
 pub type NodeService = crate::storage::rpc::NodeService;

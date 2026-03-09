@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! I/O utilities: limit reader, etag reader, hash reader, compression index.
+
 // Default encryption block size - aligned with system default read buffer size (1MB)
 pub const DEFAULT_ENCRYPTION_BLOCK_SIZE: usize = 1024 * 1024;
 

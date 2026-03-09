@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Request signing (SigV2, SigV4, streaming) and verification utilities.
+
 pub mod constants;
 pub mod request_signature_streaming;
 pub mod request_signature_streaming_unsigned_trailer;

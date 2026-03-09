@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Tracing allocator wrapper for memory profiling (e.g. MiMalloc on non-Linux).
+
 #![allow(unsafe_code)]
 
 use backtrace::Backtrace;
