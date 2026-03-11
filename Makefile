@@ -73,6 +73,11 @@ How to use me:
 		make doc-serve                           # Serve docs at http://127.0.0.1:8765/ (links work)
 		make doc-open                            # Generate docs, serve, and open in browser
 
+	📊 Coverage (requires: cargo install cargo-llvm-cov; rustup component add llvm-tools-preview):
+		make coverage-unit                       # Unit/integration coverage (excludes e2e_test)
+		make coverage-e2e                        # E2E coverage (e2e_test crate)
+		make coverage-combined                   # All tests, single combined report
+
 	🚀 Quick Start:
 		make build                               # Build RustFS binary
 		make docker-dev-local                    # Build development Docker image (local)

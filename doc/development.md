@@ -56,6 +56,27 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md) for detailed formatting and clippy rul
 - `make doc-serve` — Generate docs and serve at http://127.0.0.1:8765/ (all links work; Ctrl+C to stop)
 - `make doc-open` — Generate docs, start local server, and open browser (use this so cross-crate links work)
 
+## Coverage
+
+Coverage uses `cargo-llvm-cov`. Install once:
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+```
+
+Then run:
+
+- `make coverage-unit` — Unit and integration tests (all crates except `e2e_test`). Writes LCOV to `lcov.info` (repo root).
+- `make coverage-e2e` — E2E tests only (`e2e_test` crate). Writes LCOV to `target/coverage/e2e/lcov.info`.
+- `make coverage-combined` — All tests in one run. Writes LCOV to `lcov.info` (repo root).
+
+Use the LCOV file in Cursor or VS Code with a coverage extension (e.g. Coverage Gutters) for inline coverage; the extension looks for `lcov.info` in the workspace by default. Override the path with `COVERAGE_LCOV_PATH`, or for e2e use `COVERAGE_OUTPUT_DIR`.
+
+Doctests are not included in coverage (they require the nightly toolchain).
+
+Coverage builds use the BFD linker (`-fuse-ld=bfd`) by default to avoid LLD duplicate-symbol errors with `-C instrument-coverage` (e.g. with datafusion/arrow deps). This requires binutils (e.g. `ld.bfd`) on the system. To use another linker, set `COVERAGE_RUSTFLAGS` when invoking the target, e.g. `make coverage-unit COVERAGE_RUSTFLAGS=`.
+
 ## CI
 
 Quality gates are defined in [.github/workflows/ci.yml](../.github/workflows/ci.yml). Keep local checks aligned with CI so `make pre-commit` matches what runs on the branch.
