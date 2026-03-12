@@ -229,7 +229,29 @@ impl RustFSTestEnvironment {
         info!("Starting RustFS server with args: {:?}", args);
 
         let binary_path = rustfs_binary_path();
-        let process = Command::new(&binary_path).args(&args).spawn()?;
+        if !binary_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "RustFS binary not found at {:?}. Build it from workspace root with: cargo build --bin rustfs",
+                    binary_path
+                ),
+            )
+            .into());
+        }
+        let process = Command::new(&binary_path).args(&args).spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "RustFS binary not found at {:?}. Build it from workspace root with: cargo build --bin rustfs",
+                        binary_path
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
 
         self.process = Some(process);
 
@@ -343,7 +365,19 @@ pub async fn execute_awscurl(
 
     info!("Executing awscurl: {} {}", method, url);
     let awscurl_path = awscurl_binary_path();
-    let output = Command::new(&awscurl_path).args(&args).output()?;
+    let output = Command::new(&awscurl_path).args(&args).output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "awscurl not found at {:?}. Install it (e.g. pip install awscurl) or set AWSCURL_PATH to the binary.",
+                    awscurl_path
+                ),
+            )
+        } else {
+            e
+        }
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

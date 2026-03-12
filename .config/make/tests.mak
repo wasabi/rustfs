@@ -14,11 +14,11 @@ test: core-deps test-deps ## Run all tests
 	cargo test --all --doc
 
 .PHONY: e2e-server
-e2e-server: ## Run e2e-server tests
+e2e-server: ensure-awscurl ## Run e2e-server tests
 	sh $(shell pwd)/scripts/run.sh
 
 .PHONY: probe-e2e
-probe-e2e: ## Probe e2e tests
+probe-e2e: ensure-awscurl ## Probe e2e tests
 	sh $(shell pwd)/scripts/probe.sh
 
 # E2E tests start a RustFS server each; they must run single-threaded so one test
