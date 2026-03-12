@@ -29,9 +29,7 @@ use tokio::time::{Duration, sleep};
 use tracing::info;
 
 /// Comprehensive test: Full KMS workflow with all encryption types
-#[tokio::test]
-#[serial]
-async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn run_test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🏁 Start the KMS full-featured synthesis test");
 
@@ -63,6 +61,12 @@ async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ KMS fully functional comprehensive test passed");
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_kms_full_workflow().await
 }
 
 /// Test mixed encryption workload with different file sizes and encryption types
@@ -98,9 +102,7 @@ async fn test_mixed_encryption_workload(
 }
 
 /// Comprehensive stress test: Large dataset with multiple encryption types
-#[tokio::test]
-#[serial]
-async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn run_test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("💪 Start the KMS stress test");
 
@@ -132,10 +134,14 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Test encryption key isolation and security
 #[tokio::test]
 #[serial]
-async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_stress_test().await
+}
+
+/// Test encryption key isolation and security
+pub(crate) async fn run_test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🔐 Begin the comprehensive test of encryption key isolation");
 
@@ -204,10 +210,14 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Test concurrent encryption operations
 #[tokio::test]
 #[serial]
-async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_key_isolation().await
+}
+
+/// Test concurrent encryption operations
+pub(crate) async fn run_test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("⚡ Started comprehensive testing of concurrent encryption operations");
 
@@ -250,10 +260,14 @@ async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// Test encryption/decryption performance with different file sizes
 #[tokio::test]
 #[serial]
-async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_concurrent_operations().await
+}
+
+/// Test encryption/decryption performance with different file sizes
+pub(crate) async fn run_test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("📊 Start KMS performance benchmarking");
 
@@ -296,4 +310,10 @@ async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::e
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ KMS performance benchmark passed");
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_performance_benchmark().await
 }

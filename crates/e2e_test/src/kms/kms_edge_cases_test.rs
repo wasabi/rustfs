@@ -32,9 +32,7 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 /// Test encryption of zero-byte files (empty files)
-#[tokio::test]
-#[serial]
-async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn run_test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS encryption with zero-byte files");
 
@@ -105,10 +103,14 @@ async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Test encryption of single-byte files
 #[tokio::test]
 #[serial]
-async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_zero_byte_file_encryption().await
+}
+
+/// Test encryption of single-byte files
+pub(crate) async fn run_test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS encryption with single-byte files");
 
@@ -198,10 +200,14 @@ async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-/// Test multipart upload boundary conditions (minimum 5MB part size)
 #[tokio::test]
 #[serial]
-async fn test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_single_byte_file_encryption().await
+}
+
+/// Test multipart upload boundary conditions (minimum 5MB part size)
+pub(crate) async fn run_test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS multipart upload boundary conditions");
 
@@ -274,10 +280,14 @@ async fn test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Test invalid key scenarios and error handling
 #[tokio::test]
 #[serial]
-async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_multipart_boundary_conditions().await
+}
+
+/// Test invalid key scenarios and error handling
+pub(crate) async fn run_test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS invalid key scenarios and error handling");
 
@@ -362,10 +372,14 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Test concurrent encryption operations
 #[tokio::test]
 #[serial]
-async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_invalid_key_scenarios().await
+}
+
+/// Test concurrent encryption operations
+pub(crate) async fn run_test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS concurrent encryption operations");
 
@@ -470,10 +484,14 @@ async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Test key validation and security properties
 #[tokio::test]
 #[serial]
-async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_concurrent_encryption().await
+}
+
+/// Test key validation and security properties
+pub(crate) async fn run_test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS key validation and security properties");
 
@@ -570,4 +588,10 @@ async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Er
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ Key validation and security test completed successfully");
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_key_validation_security().await
 }

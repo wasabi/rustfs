@@ -406,10 +406,77 @@ impl KMSTestSuite {
 
     /// Run a single test by dispatching to the appropriate test function
     async fn run_single_test(&self, test_def: &TestDefinition) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // This is a placeholder for test dispatch logic
-        // In a real implementation, this would dispatch to actual test functions
-        warn!("⚠️  Test '{}' is not implemented in the unified runner; skipping", test_def.name);
-        Ok(())
+        /// Run a test that returns (); spawn to catch panic
+        async fn run_unit_test<F>(f: F) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            match tokio::task::spawn(f).await {
+                Ok(()) => Ok(()),
+                Err(join_err) => Err(join_err.to_string().into()),
+            }
+        }
+
+        match test_def.name.as_str() {
+            // Core functionality — call run_* body (#[tokio::test] exposes a sync wrapper)
+            "test_local_kms_end_to_end" => super::kms_local_test::run_test_local_kms_end_to_end().await,
+            "test_local_kms_key_isolation" => run_unit_test(super::kms_local_test::run_test_local_kms_key_isolation()).await,
+            "test_local_kms_multipart_upload" => {
+                run_unit_test(super::kms_local_test::run_test_local_kms_multipart_upload()).await
+            }
+            // Multipart encryption
+            "test_step1_basic_single_file_encryption" => {
+                super::multipart_encryption_test::run_test_step1_basic_single_file_encryption().await
+            }
+            "test_step2_basic_multipart_upload_without_encryption" => {
+                super::multipart_encryption_test::run_test_step2_basic_multipart_upload_without_encryption().await
+            }
+            "test_step3_multipart_upload_with_sse_s3" => {
+                super::multipart_encryption_test::run_test_step3_multipart_upload_with_sse_s3().await
+            }
+            "test_step4_large_multipart_upload_with_encryption" => {
+                super::multipart_encryption_test::run_test_step4_large_multipart_upload_with_encryption().await
+            }
+            "test_step5_all_encryption_types_multipart" => {
+                super::multipart_encryption_test::run_test_step5_all_encryption_types_multipart().await
+            }
+            // Edge cases
+            "test_kms_zero_byte_file_encryption" => super::kms_edge_cases_test::run_test_kms_zero_byte_file_encryption().await,
+            "test_kms_single_byte_file_encryption" => {
+                super::kms_edge_cases_test::run_test_kms_single_byte_file_encryption().await
+            }
+            "test_kms_multipart_boundary_conditions" => {
+                super::kms_edge_cases_test::run_test_kms_multipart_boundary_conditions().await
+            }
+            "test_kms_invalid_key_scenarios" => super::kms_edge_cases_test::run_test_kms_invalid_key_scenarios().await,
+            "test_kms_concurrent_encryption" => super::kms_edge_cases_test::run_test_kms_concurrent_encryption().await,
+            "test_kms_key_validation_security" => super::kms_edge_cases_test::run_test_kms_key_validation_security().await,
+            // Fault recovery
+            "test_kms_key_directory_unavailable" => {
+                super::kms_fault_recovery_test::run_test_kms_key_directory_unavailable().await
+            }
+            "test_kms_corrupted_key_files" => super::kms_fault_recovery_test::run_test_kms_corrupted_key_files().await,
+            "test_kms_multipart_upload_interruption" => {
+                super::kms_fault_recovery_test::run_test_kms_multipart_upload_interruption().await
+            }
+            "test_kms_resource_constraints" => super::kms_fault_recovery_test::run_test_kms_resource_constraints().await,
+            // Comprehensive
+            "test_comprehensive_kms_full_workflow" => {
+                super::kms_comprehensive_test::run_test_comprehensive_kms_full_workflow().await
+            }
+            "test_comprehensive_stress_test" => super::kms_comprehensive_test::run_test_comprehensive_stress_test().await,
+            "test_comprehensive_key_isolation" => super::kms_comprehensive_test::run_test_comprehensive_key_isolation().await,
+            "test_comprehensive_concurrent_operations" => {
+                super::kms_comprehensive_test::run_test_comprehensive_concurrent_operations().await
+            }
+            "test_comprehensive_performance_benchmark" => {
+                super::kms_comprehensive_test::run_test_comprehensive_performance_benchmark().await
+            }
+            other => {
+                warn!("⚠️  Test '{}' is not implemented in the unified runner; skipping", other);
+                Ok(())
+            }
+        }
     }
 
     /// Print comprehensive test summary

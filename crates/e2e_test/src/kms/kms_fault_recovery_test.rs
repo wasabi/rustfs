@@ -31,9 +31,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 /// Test KMS behavior when key directory is temporarily unavailable
-#[tokio::test]
-#[serial]
-async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn run_test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS behavior with unavailable key directory");
 
@@ -121,10 +119,14 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Test handling of corrupted key files
 #[tokio::test]
 #[serial]
-async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_key_directory_unavailable().await
+}
+
+/// Test handling of corrupted key files
+pub(crate) async fn run_test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS behavior with corrupted key files");
 
@@ -213,10 +215,14 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 
-/// Test multipart upload interruption and recovery
 #[tokio::test]
 #[serial]
-async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_corrupted_key_files().await
+}
+
+/// Test multipart upload interruption and recovery
+pub(crate) async fn run_test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS multipart upload interruption and recovery");
 
@@ -397,10 +403,14 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Test KMS resilience to temporary resource constraints
 #[tokio::test]
 #[serial]
-async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_multipart_upload_interruption().await
+}
+
+/// Test KMS resilience to temporary resource constraints
+pub(crate) async fn run_test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS behavior under resource constraints");
 
@@ -461,4 +471,10 @@ async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ Resource constraints test completed successfully");
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_resource_constraints().await
 }
