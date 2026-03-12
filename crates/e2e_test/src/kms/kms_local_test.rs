@@ -140,8 +140,9 @@ async fn test_local_kms_key_isolation() {
     let key2 = "98765432109876543210987654321098";
     let key1_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key1);
     let key2_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key2);
-    let key1_md5 = format!("{:x}", md5::compute(key1));
-    let key2_md5 = format!("{:x}", md5::compute(key2));
+    // S3 SSE-C key MD5 header must be Base64-encoded 128-bit MD5 digest of the key (not hex).
+    let key1_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key1).0);
+    let key2_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key2).0);
 
     let data1 = b"Data encrypted with key 1";
     let data2 = b"Data encrypted with key 2";
@@ -559,10 +560,10 @@ async fn test_multipart_upload_with_sse_c(
     let total_parts = 2;
     let total_size = part_size * total_parts;
 
-    // SSE-C encryption key
+    // SSE-C encryption key; MD5 header must be Base64-encoded digest per S3 spec
     let encryption_key = "01234567890123456789012345678901";
     let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, encryption_key);
-    let key_md5 = format!("{:x}", md5::compute(encryption_key));
+    let key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(encryption_key).0);
 
     // Generate test data
     let test_data: Vec<u8> = (0..total_size).map(|i| ((i * 3) % 256) as u8).collect();

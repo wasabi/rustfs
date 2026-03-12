@@ -133,8 +133,8 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
     let key2 = "98765432109876543210987654321098";
     let key1_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key1);
     let key2_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key2);
-    let key1_md5 = format!("{:x}", compute(key1));
-    let key2_md5 = format!("{:x}", compute(key2));
+    let key1_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, compute(key1).0);
+    let key2_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, compute(key2).0);
 
     let data1 = b"Vault data encrypted with key 1";
     let data2 = b"Vault data encrypted with key 2";

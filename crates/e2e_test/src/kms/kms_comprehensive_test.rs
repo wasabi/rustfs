@@ -149,8 +149,8 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     // Test different SSE-C keys to ensure isolation
     let key1 = "01234567890123456789012345678901";
     let key2 = "98765432109876543210987654321098";
-    let key1_md5 = format!("{:x}", md5::compute(key1));
-    let key2_md5 = format!("{:x}", md5::compute(key2));
+    let key1_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key1).0);
+    let key2_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key2).0);
 
     let config1 = MultipartTestConfig::new(
         "isolation-test-key1",
@@ -183,7 +183,7 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     info!("🔒 Verify key isolation");
     let wrong_key = "11111111111111111111111111111111";
     let wrong_key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, wrong_key);
-    let wrong_key_md5 = format!("{:x}", md5::compute(wrong_key));
+    let wrong_key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(wrong_key).0);
 
     // Try to read file encrypted with key1 using wrong key
     let wrong_read_result = s3_client

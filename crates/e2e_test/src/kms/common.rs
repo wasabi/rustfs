@@ -155,7 +155,7 @@ pub async fn test_sse_c_encryption(s3_client: &Client, bucket: &str) -> Result<(
 
     let test_key = "01234567890123456789012345678901"; // 32-byte key
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let test_key_md5 = format!("{:x}", md5::compute(test_key));
+    let test_key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(test_key).0);
     let test_data = b"Hello, KMS SSE-C World!";
     let object_key = "test-sse-c-object";
 
@@ -324,8 +324,8 @@ pub async fn test_error_scenarios(s3_client: &Client, bucket: &str) -> Result<()
     let wrong_key = "98765432109876543210987654321098";
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
     let wrong_key_b64 = base64::engine::general_purpose::STANDARD.encode(wrong_key);
-    let test_key_md5 = format!("{:x}", md5::compute(test_key));
-    let wrong_key_md5 = format!("{:x}", md5::compute(wrong_key));
+    let test_key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(test_key).0);
+    let wrong_key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(wrong_key).0);
     let test_data = b"Test data for error scenarios";
     let object_key = "test-error-object";
 
@@ -687,7 +687,7 @@ pub async fn test_multipart_upload_with_config(
 /// Create a standard SSE-C encryption configuration for testing
 pub fn create_sse_c_config() -> EncryptionType {
     let key = "01234567890123456789012345678901"; // 32-byte key
-    let key_md5 = format!("{:x}", md5::compute(key));
+    let key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key).0);
     EncryptionType::SSEC {
         key: key.to_string(),
         key_md5,

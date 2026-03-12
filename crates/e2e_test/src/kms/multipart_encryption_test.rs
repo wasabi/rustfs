@@ -504,7 +504,7 @@ async fn test_multipart_encryption_type(
     let (sse_c_key, sse_c_md5) = if matches!(encryption_type, EncryptionType::SSEC) {
         let key = "01234567890123456789012345678901";
         let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
-        let key_md5 = format!("{:x}", md5::compute(key));
+        let key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key).0);
         (Some(key_b64), Some(key_md5))
     } else {
         (None, None)
