@@ -22,5 +22,7 @@ Applies to `crates/e2e_test/`.
 
 ## Suggested Validation
 
-- `cargo test --package e2e_test`
+- Run e2e tests **single-threaded** so one test does not kill another's RustFS server:
+  - `make e2e-test`, or
+  - `cargo test -p e2e_test -- --test-threads=1`
 - Full gate before commit: `make pre-commit`

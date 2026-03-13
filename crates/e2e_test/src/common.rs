@@ -44,22 +44,32 @@ pub fn workspace_root() -> PathBuf {
     path
 }
 
+/// Path to the rustfs binary under target (debug or release).
+fn default_rustfs_binary_path() -> PathBuf {
+    let mut path = workspace_root();
+    path.push("target");
+    let profile_dir = if cfg!(debug_assertions) { "debug" } else { "release" };
+    path.push(profile_dir);
+    path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    path
+}
+
 /// Resolve the RustFS binary relative to the workspace.
-/// Always builds the binary to ensure it's up to date.
+/// Uses CARGO_BIN_EXE_rustfs if set (cargo already built it). Otherwise builds rustfs
+/// once and only once per process so e2e tests share a single binary.
 pub fn rustfs_binary_path() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
         return PathBuf::from(path);
     }
 
-    // Always build the binary to ensure it's up to date
-    info!("Building RustFS binary to ensure it's up to date...");
-    build_rustfs_binary();
+    let binary_path = default_rustfs_binary_path();
 
-    let mut binary_path = workspace_root();
-    binary_path.push("target");
-    let profile_dir = if cfg!(debug_assertions) { "debug" } else { "release" };
-    binary_path.push(profile_dir);
-    binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    // Always build once and only once per process so we use a single, consistent binary.
+    static BUILD_ONCE: Once = Once::new();
+    BUILD_ONCE.call_once(|| {
+        info!("Building RustFS binary once at {:?}...", binary_path);
+        build_rustfs_binary();
+    });
 
     info!("Using RustFS binary at {:?}", binary_path);
     binary_path
