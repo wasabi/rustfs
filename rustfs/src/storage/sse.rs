@@ -87,7 +87,7 @@ use rustfs_kms::{
     service_manager::get_global_encryption_service,
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
-use rustfs_rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, WarpReader};
+use rustfs_rio::{DecryptReader, EncryptReader, ExactLengthReader, HardLimitReader, Reader, WarpReader};
 use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
 use std::collections::HashMap;
@@ -628,9 +628,10 @@ impl DecryptionMaterial {
         };
 
         // Add hard limit reader to prevent over-reading
-        // final_stream is already Box<dyn Reader>, no need to wrap with WarpReader
         let limit_reader = HardLimitReader::new(final_stream, response_content_length);
-        final_stream = Box::new(limit_reader);
+        // Error if stream ends before expected bytes (avoids IncompleteBody for decrypted GET)
+        let exact_reader = ExactLengthReader::new(Box::new(limit_reader), response_content_length);
+        final_stream = Box::new(exact_reader);
 
         debug!(
             "{:?} decryption applied: plaintext_size={}, encrypted_size={}",
@@ -988,7 +989,7 @@ async fn apply_ssec_decryption_material(
 // ============================================================================
 
 #[allow(clippy::too_many_arguments)]
-async fn apply_managed_encryption_material(
+pub(crate) async fn apply_managed_encryption_material(
     bucket: &str,
     key: &str,
     server_side_encryption: ServerSideEncryption,
@@ -1055,7 +1056,7 @@ async fn apply_managed_encryption_material(
             .decode(part_key.as_bytes())
             .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decode data key: {e}"))))?;
         let _data_key = provider
-            .decrypt_sse_dek(encrypted_data_key.as_slice(), &kms_key_to_use)
+            .decrypt_sse_dek(encrypted_data_key.as_slice(), &kms_key_to_use, None)
             .await?;
         let data_key = DataKey {
             plaintext_key: _data_key,
@@ -1073,7 +1074,13 @@ async fn apply_managed_encryption_material(
         (data_key, encrypted_data_key)
     };
 
-    let algorithm = DEFAULT_SSE_ALGORITHM.to_string();
+    // Persist the S3 SSE type (AES256 or aws:kms) so GET/HEAD return the same value; do not use cipher name.
+    let algorithm = server_side_encryption.as_str().to_string();
+
+    // Include bucket and object_key in encryption_context so decrypt can pass the same context the envelope has
+    let mut enc_ctx = context.encryption_context.clone();
+    enc_ctx.insert("bucket".to_string(), bucket.to_string());
+    enc_ctx.insert("object_key".to_string(), key.to_string());
 
     let encryption_metadata = EncryptionMetadata {
         algorithm: algorithm.clone(),
@@ -1081,7 +1088,7 @@ async fn apply_managed_encryption_material(
         key_version: 1,
         iv: data_key.nonce.to_vec(),
         tag: None,
-        encryption_context: context.encryption_context.clone(),
+        encryption_context: enc_ctx,
         encrypted_at: jiff::Zoned::now(),
         original_size: if content_size >= 0 { content_size as u64 } else { 0 },
         encrypted_data_key,
@@ -1103,8 +1110,8 @@ async fn apply_managed_encryption_material(
         metadata.insert("x-rustfs-encryption-algorithm".to_string(), encryption_metadata.algorithm.clone());
         metadata.insert("x-amz-server-side-encryption".to_string(), server_side_encryption.as_str().to_string());
 
-        // if kms_key is changed, we need to update the metadata
-        if kms_key_id.is_none() {
+        // Per S3 semantics, only store KMS key ID for aws:kms; do not expose it for AES256 (SSE-S3).
+        if server_side_encryption.as_str() == ServerSideEncryption::AWS_KMS && kms_key_id.is_none() {
             metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
         }
     }
@@ -1126,7 +1133,7 @@ async fn apply_managed_encryption_material(
     })
 }
 
-async fn apply_managed_decryption_material(
+pub(crate) async fn apply_managed_decryption_material(
     _bucket: &str,
     _key: &str,
     metadata: &HashMap<String, String>,
@@ -1140,7 +1147,7 @@ async fn apply_managed_decryption_material(
     let server_side_encryption = metadata.get("x-amz-server-side-encryption").cloned().unwrap_or_default();
 
     // Parse metadata - try using service if available, otherwise parse manually
-    let (encrypted_data_key, iv, algorithm) = if let Some(service) = get_global_encryption_service().await {
+    let (encrypted_data_key, iv, algorithm, encryption_context) = if let Some(service) = get_global_encryption_service().await {
         // Production mode: use service for metadata parsing
         let parsed = service
             .headers_to_metadata(metadata)
@@ -1150,7 +1157,7 @@ async fn apply_managed_decryption_material(
             return Err(ApiError::from(StorageError::other("Invalid encryption nonce length; expected 12 bytes")));
         }
 
-        (parsed.encrypted_data_key, parsed.iv, parsed.algorithm)
+        (parsed.encrypted_data_key, parsed.iv, parsed.algorithm, Some(parsed.encryption_context))
     } else {
         // Test mode: parse metadata manually
         let encrypted_key_b64 = metadata
@@ -1176,19 +1183,30 @@ async fn apply_managed_decryption_material(
             .cloned()
             .unwrap_or_else(|| "AES256".to_string());
 
-        (encrypted_data_key, iv, algorithm)
+        (encrypted_data_key, iv, algorithm, None)
     };
 
-    // Extract KMS key ID from metadata (optional, used for provider context)
+    // Extract KMS key ID from metadata (optional, used for provider context).
+    // SSE-S3 uses x-rustfs-encryption-key-id only; SSE-KMS may use either.
     let kms_key_id = metadata
-        .get("x-amz-server-side-encryption-aws-kms-key-id")
+        .get("x-rustfs-encryption-key-id")
+        .or_else(|| metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
         .cloned()
         .unwrap_or_else(|| "default".to_string());
 
-    // Use factory pattern to get provider (test or production mode)
+    // Narrowing GET decryption failures: run e2e (or GET) with RUST_LOG=rustfs::storage::sse=trace
+    // and check has_encryption_context / encryption_context_keys to see if the store returned context.
+    tracing::trace!(
+        has_encryption_context = encryption_context.as_ref().map(|m| !m.is_empty()).unwrap_or(false),
+        encryption_context_keys = ?encryption_context.as_ref().map(|m| m.keys().cloned().collect::<Vec<_>>()),
+        "apply_managed_decryption_material: metadata for decrypt_sse_dek"
+    );
+
+    // Use factory pattern to get provider (test or production mode).
+    // Pass encryption_context so backends can verify it matches the envelope (e.g. local backend).
     let provider = get_sse_dek_provider().await?;
     let key_bytes = provider
-        .decrypt_sse_dek(&encrypted_data_key, &kms_key_id)
+        .decrypt_sse_dek(&encrypted_data_key, &kms_key_id, encryption_context.as_ref().filter(|m| !m.is_empty()))
         .await
         .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
 
@@ -1263,8 +1281,14 @@ pub trait SseDekProvider: Send + Sync {
     /// Generate an SSE data encryption key
     async fn generate_sse_dek(&self, bucket: &str, key: &str, kms_key_id: &str) -> Result<(DataKey, Vec<u8>), ApiError>;
 
-    /// Decrypt an SSE data encryption key (returns only plaintext key, nonce should be read from metadata)
-    async fn decrypt_sse_dek(&self, encrypted_dek: &[u8], kms_key_id: &str) -> Result<[u8; 32], ApiError>;
+    /// Decrypt an SSE data encryption key (returns only plaintext key, nonce from metadata).
+    /// `encryption_context` should be the stored context from metadata when available.
+    async fn decrypt_sse_dek(
+        &self,
+        encrypted_dek: &[u8],
+        kms_key_id: &str,
+        encryption_context: Option<&HashMap<String, String>>,
+    ) -> Result<[u8; 32], ApiError>;
 }
 
 // ============================================================================
@@ -1302,12 +1326,15 @@ impl SseDekProvider for KmsSseDekProvider {
         Ok((data_key, encrypted_data_key))
     }
 
-    async fn decrypt_sse_dek(&self, encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8; 32], ApiError> {
-        // Create a minimal context for decryption
-        let context = ObjectEncryptionContext::new("".to_string(), "".to_string());
+    async fn decrypt_sse_dek(
+        &self,
+        encrypted_dek: &[u8],
+        _kms_key_id: &str,
+        encryption_context: Option<&HashMap<String, String>>,
+    ) -> Result<[u8; 32], ApiError> {
         let data_key = self
             .service
-            .decrypt_data_key(encrypted_dek, &context)
+            .decrypt_data_key_with_context(encrypted_dek, encryption_context)
             .await
             .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {}", e))))?;
 
@@ -1493,7 +1520,12 @@ impl SseDekProvider for TestSseDekProvider {
         ))
     }
 
-    async fn decrypt_sse_dek(&self, encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8; 32], ApiError> {
+    async fn decrypt_sse_dek(
+        &self,
+        encrypted_dek: &[u8],
+        _kms_key_id: &str,
+        _encryption_context: Option<&HashMap<String, String>>,
+    ) -> Result<[u8; 32], ApiError> {
         // Decrypt data key with master key
         let encrypted_dek_str = std::str::from_utf8(encrypted_dek)
             .map_err(|_| ApiError::from(StorageError::other("Invalid UTF-8 in encrypted DEK")))?;
@@ -1780,6 +1812,11 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 mod tests {
     use super::*;
     use http::HeaderValue;
+    use rustfs_kms::types::CreateKeyRequest;
+    use rustfs_kms::{KmsConfig, get_global_encryption_service, get_global_kms_service_manager, init_global_kms_service_manager};
+    use serial_test::serial;
+    use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn test_extract_ssec_params_from_headers() {
@@ -2461,7 +2498,7 @@ mod tests {
 
         // 3. Later, decrypt the DEK
         let decrypted_plaintext_key = provider
-            .decrypt_sse_dek(&encrypted_dek, kms_key_id)
+            .decrypt_sse_dek(&encrypted_dek, kms_key_id, None)
             .await
             .expect("Failed to decrypt DEK");
 
@@ -2494,6 +2531,59 @@ mod tests {
         assert_eq!(decrypted_data, plaintext, "Data decrypted with recovered key should match original");
 
         println!("✅ Full cycle (generate -> encrypt DEK -> decrypt DEK -> decrypt data) test passed!");
+    }
+
+    // ============================================================================
+    // In-process SSE-S3 roundtrip with real KMS (no e2e subprocess)
+    // ============================================================================
+
+    /// PUT-then-GET style roundtrip using the storage layer and global KMS (local backend).
+    /// Reproduces the same encrypt/decrypt path as production without the ecstore or HTTP.
+    #[tokio::test]
+    #[serial]
+    async fn test_sse_s3_roundtrip_with_global_kms() {
+        use std::io::Cursor;
+
+        let plaintext = b"Hello, SSE-S3 in-process roundtrip!";
+        let bucket = "test-bucket";
+        let key = "test-object";
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let manager = get_global_kms_service_manager().unwrap_or_else(init_global_kms_service_manager);
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_default_key("test-key".to_string());
+        manager.configure(config).await.expect("configure KMS");
+        manager.start().await.expect("start KMS");
+
+        let service = get_global_encryption_service().await.expect("KMS service");
+        let create_req = CreateKeyRequest {
+            key_name: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        service.create_key(create_req).await.expect("create test key");
+
+        let sse = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
+        let material = apply_managed_encryption_material(bucket, key, sse, None, plaintext.len() as i64, None, None, None)
+            .await
+            .expect("apply_managed_encryption_material");
+
+        let plain_reader = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        let mut encrypt_reader = material.wrap_reader(plain_reader);
+        let mut encrypted = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted).await.expect("read encrypted");
+
+        let dec_material = apply_managed_decryption_material(bucket, key, &material.metadata, None)
+            .await
+            .expect("apply_managed_decryption_material")
+            .expect("decryption material");
+
+        let encrypted_reader = WarpReader::new(Cursor::new(encrypted));
+        let mut decrypt_reader = dec_material.wrap_single_reader(encrypted_reader);
+        let mut decrypted = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted).await.expect("read decrypted");
+
+        assert_eq!(decrypted.as_slice(), plaintext, "decrypted body must match original plaintext");
+
+        let _ = manager.stop().await;
     }
 
     #[test]

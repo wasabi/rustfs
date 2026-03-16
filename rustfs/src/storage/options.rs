@@ -423,7 +423,17 @@ pub fn extract_metadata_from_mime_with_object_name(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    filter_object_metadata_with_options(metadata, false)
+}
+
+/// Like filter_object_metadata but allows including managed encryption metadata (x-rustfs-encryption-*)
+/// in the response for HeadObject/GetObject when clients need to verify encryption or admin tooling.
+pub(crate) fn filter_object_metadata_with_options(
+    metadata: &HashMap<String, String>,
+    include_managed_encryption_metadata: bool,
+) -> Option<HashMap<String, String>> {
     // HTTP headers that should NOT be returned in the Metadata field.
     // These headers are returned as separate response headers, not user metadata.
     const EXCLUDED_HEADERS: &[&str] = &[
@@ -451,8 +461,8 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
             continue;
         }
 
-        // Skip internal encryption metadata
-        if lower_key.starts_with(RUSTFS_ENCRYPTION_LOWER) {
+        // Skip internal encryption metadata unless explicitly included (e.g. for Head/Get response)
+        if !include_managed_encryption_metadata && lower_key.starts_with(RUSTFS_ENCRYPTION_LOWER) {
             continue;
         }
 
