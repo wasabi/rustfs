@@ -35,7 +35,6 @@ fn create_user_s3_client(env: &RustFSTestEnvironment, access_key: &str, secret_k
 /// Test that deleting a group with members fails, and deleting an empty group succeeds.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-#[ignore = "requires awscurl and spawns a real RustFS server"]
 async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -95,7 +94,6 @@ async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std
 /// and can perform actions allowed by the group (regression test for #2028.1).
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-#[ignore = "requires awscurl and spawns a real RustFS server"]
 async fn test_user_with_only_group_gets_group_policies() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -140,12 +138,24 @@ async fn test_user_with_only_group_gets_group_policies() -> Result<(), Box<dyn s
     awscurl_put(&update_members_url, &add_member_body.to_string(), &env.access_key, &env.secret_key).await?;
     info!("Added {} to group {}", user_name, group_name);
 
-    // 4. Attach policy to group
+    // 4. Attach policy to group (retry on connection reset in case server was briefly busy)
     let set_policy_url = format!(
         "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=true",
         env.url, policy_name, group_name
     );
-    awscurl_put(&set_policy_url, "", &env.access_key, &env.secret_key).await?;
+    for attempt in 1..=3 {
+        match awscurl_put(&set_policy_url, "", &env.access_key, &env.secret_key).await {
+            Ok(_) => break,
+            Err(e) => {
+                let retryable = e.to_string().contains("Connection reset") || e.to_string().contains("Connection aborted");
+                if attempt < 3 && retryable {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500 * attempt)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
     info!("Attached policy {} to group {}", policy_name, group_name);
 
     // 5. User with only group (no user policy) should be able to list buckets
@@ -163,7 +173,6 @@ async fn test_user_with_only_group_gets_group_policies() -> Result<(), Box<dyn s
 /// (regression test for #2028.2: delete group uses backend membership, not stale cache).
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-#[ignore = "requires awscurl and spawns a real RustFS server"]
 async fn test_delete_group_after_deleting_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 

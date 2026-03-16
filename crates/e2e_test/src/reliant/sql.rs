@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -21,21 +22,21 @@ use aws_sdk_s3::types::{
 };
 use bytes::Bytes;
 use serial_test::serial;
-use std::error::Error;
 
-const ENDPOINT: &str = "http://localhost:9000";
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 const ACCESS_KEY: &str = "rustfsadmin";
 const SECRET_KEY: &str = "rustfsadmin";
 const BUCKET: &str = "test-sql-bucket";
 const CSV_OBJECT: &str = "test-data.csv";
 const JSON_OBJECT: &str = "test-data.json";
 
-async fn create_aws_s3_client() -> Result<Client, Box<dyn Error>> {
+async fn create_aws_s3_client(endpoint_url: &str) -> Result<Client, BoxError> {
     let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
     let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region_provider)
         .credentials_provider(Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "static"))
-        .endpoint_url(ENDPOINT)
+        .endpoint_url(endpoint_url)
         .load()
         .await;
 
@@ -49,7 +50,7 @@ async fn create_aws_s3_client() -> Result<Client, Box<dyn Error>> {
     Ok(client)
 }
 
-async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn setup_test_bucket(client: &Client) -> Result<(), BoxError> {
     match client.create_bucket().bucket(BUCKET).send().await {
         Ok(_) => {}
         Err(e) => {
@@ -62,7 +63,7 @@ async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn upload_test_csv(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn upload_test_csv(client: &Client) -> Result<(), BoxError> {
     let csv_data = "name,age,city\nAlice,30,New York\nBob,25,Los Angeles\nCharlie,35,Chicago\nDiana,28,Boston";
 
     client
@@ -76,7 +77,7 @@ async fn upload_test_csv(client: &Client) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn upload_test_json(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn upload_test_json(client: &Client) -> Result<(), BoxError> {
     let json_data = r#"{"name":"Alice","age":30,"city":"New York"}
 {"name":"Bob","age":25,"city":"Los Angeles"}
 {"name":"Charlie","age":35,"city":"Chicago"}
@@ -94,7 +95,7 @@ async fn upload_test_json(client: &Client) -> Result<(), Box<dyn Error>> {
 
 async fn process_select_response(
     mut event_stream: aws_sdk_s3::operation::select_object_content::SelectObjectContentOutput,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<String, BoxError> {
     let mut total_data = Vec::new();
 
     while let Ok(Some(event)) = event_stream.payload.recv().await {
@@ -119,9 +120,11 @@ async fn process_select_response(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_csv_basic() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_csv_basic() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -161,9 +164,11 @@ async fn test_select_object_content_csv_basic() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_csv_aggregation() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_csv_aggregation() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -207,16 +212,19 @@ async fn test_select_object_content_csv_aggregation() -> Result<(), Box<dyn Erro
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_json_basic() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_json_basic() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
     upload_test_json(&client).await?;
 
     // Construct JSON query
     let sql = "SELECT s.name, s.age FROM S3Object s WHERE s.age > 28";
 
-    let json_input = JsonInput::builder().set_type(Some(JsonType::Document)).build();
+    // Input is newline-delimited JSON (one object per line); use Lines not Document.
+    let json_input = JsonInput::builder().set_type(Some(JsonType::Lines)).build();
 
     let input_serialization = InputSerialization::builder().json(json_input).build();
 
@@ -249,9 +257,11 @@ async fn test_select_object_content_json_basic() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_csv_limit() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_csv_limit() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -289,9 +299,11 @@ async fn test_select_object_content_csv_limit() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_csv_order_by() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_csv_order_by() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -333,9 +345,11 @@ async fn test_select_object_content_csv_order_by() -> Result<(), Box<dyn Error>>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_error_handling() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_error_handling() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -369,9 +383,11 @@ async fn test_select_object_content_error_handling() -> Result<(), Box<dyn Error
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_nonexistent_object() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_nonexistent_object() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
 
     // Test query on nonexistent object

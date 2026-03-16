@@ -19,6 +19,7 @@
 
 #![cfg(test)]
 
+use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -26,20 +27,20 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use bytes::Bytes;
 use serial_test::serial;
-use std::error::Error;
 use tracing::info;
 
-const ENDPOINT: &str = "http://localhost:9000";
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 const ACCESS_KEY: &str = "rustfsadmin";
 const SECRET_KEY: &str = "rustfsadmin";
 const BUCKET: &str = "test-head-deleted-versioning-bucket";
 
-async fn create_aws_s3_client() -> Result<Client, Box<dyn Error>> {
+async fn create_aws_s3_client(endpoint_url: &str) -> Result<Client, BoxError> {
     let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
     let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region_provider)
         .credentials_provider(Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "static"))
-        .endpoint_url(ENDPOINT)
+        .endpoint_url(endpoint_url)
         .load()
         .await;
 
@@ -53,7 +54,7 @@ async fn create_aws_s3_client() -> Result<Client, Box<dyn Error>> {
 }
 
 /// Setup test bucket, creating it if it doesn't exist, and enable versioning
-async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn setup_test_bucket(client: &Client) -> Result<(), BoxError> {
     match client.create_bucket().bucket(BUCKET).send().await {
         Ok(_) => {}
         Err(SdkError::ServiceError(e)) => {
@@ -86,16 +87,13 @@ async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
 /// Test that HeadObject on a deleted object returns NoSuchKey when versioning is enabled
 #[tokio::test]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_head_deleted_object_versioning_returns_nosuchkey() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_test_writer()
-        .try_init();
-
+async fn test_head_deleted_object_versioning_returns_nosuchkey() -> Result<(), BoxError> {
+    init_logging();
     info!("🧪 Starting test_head_deleted_object_versioning_returns_nosuchkey");
 
-    let client = create_aws_s3_client().await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
 
     let key = "test-head-deleted-versioning.txt";

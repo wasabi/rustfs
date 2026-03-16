@@ -31,7 +31,8 @@ use tracing::info;
 const FTPS_PORT: u16 = 9021;
 const FTPS_ADDRESS: &str = "127.0.0.1:9021";
 
-/// Test FTPS: put, ls, mkdir, rmdir, delete operations
+/// Test FTPS: put, ls, mkdir, rmdir, delete operations.
+/// Requires rustfs built with ftps feature (e.g. run e2e tests with RUSTFS_BUILD_FEATURES=ftps).
 pub async fn test_ftps_core_operations() -> Result<()> {
     let env = ProtocolTestEnvironment::new().map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -68,8 +69,8 @@ pub async fn test_ftps_core_operations() -> Result<()> {
 
     // Ensure server is cleaned up even on failure
     let result = async {
-        // Wait for server to be ready
-        ProtocolTestEnvironment::wait_for_port_ready(FTPS_PORT, 30)
+        // Wait for server to be ready (allow time for full init: storage, KMS, IAM, then FTPS bind).
+        ProtocolTestEnvironment::wait_for_port_ready(FTPS_PORT, 60)
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
