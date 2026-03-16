@@ -358,13 +358,19 @@ impl DefaultMultipartUsecase {
             .global_region()
             .map(|region| region.to_string())
             .unwrap_or_else(|| RUSTFS_REGION.to_string());
+        // Per S3 semantics, do not expose ssekms_key_id for SSE-S3 (AES256).
+        let ssekms_key_id_for_response = server_side_encryption
+            .as_ref()
+            .filter(|s| s.as_str() != "AES256")
+            .and_then(|_| ssekms_key_id.clone());
+
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
             location: Some(region.clone()),
             server_side_encryption: server_side_encryption.clone(),
-            ssekms_key_id: ssekms_key_id.clone(),
+            ssekms_key_id: ssekms_key_id_for_response,
             checksum_crc32: checksum_crc32.clone(),
             checksum_crc32c: checksum_crc32c.clone(),
             checksum_sha1: checksum_sha1.clone(),
@@ -460,11 +466,18 @@ impl DefaultMultipartUsecase {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
+        // Per S3 semantics, x-amz-server-side-encryption-aws-kms-key-id is only valid with aws:kms.
+        // Ignore a spurious key ID when the client requested AES256 (SSE-S3) to avoid InvalidArgument.
+        let ssekms_key_id_for_sse = server_side_encryption
+            .as_ref()
+            .filter(|s| s.as_str() == "aws:kms")
+            .and_then(|_| ssekms_key_id.clone());
+
         let encryption_request = PrepareEncryptionRequest {
             bucket: &bucket,
             key: &key,
             server_side_encryption,
-            ssekms_key_id,
+            ssekms_key_id: ssekms_key_id_for_sse,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key_md5: sse_customer_key_md5.clone(),
         };
@@ -511,13 +524,19 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        // Per S3 semantics, do not expose ssekms_key_id for SSE-S3 (AES256); client would echo it and get InvalidArgument.
+        let ssekms_key_id_for_response = effective_sse
+            .as_ref()
+            .filter(|s| s.as_str() != "AES256")
+            .and_then(|_| effective_kms_key_id.clone());
+
         let output = CreateMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
             upload_id: Some(upload_id),
             server_side_encryption: effective_sse,
             sse_customer_algorithm,
-            ssekms_key_id: effective_kms_key_id,
+            ssekms_key_id: ssekms_key_id_for_response,
             checksum_algorithm: checksum_algo.map(ChecksumAlgorithm::from),
             checksum_type: checksum_type.map(ChecksumType::from),
             ..Default::default()
