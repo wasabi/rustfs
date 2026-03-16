@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Import HTTP server components and compression configuration
+//! Main HTTP server: S3 and admin routing, compression, auth, and TLS.
+
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::auth_keystone;
@@ -522,7 +523,7 @@ struct ConnectionContext {
     readiness: Arc<GlobalReadiness>,
 }
 
-/// Adapter that implements the OpenTelemetry [`Extractor`] trait for Hyper's
+/// Adapter that implements the OpenTelemetry [`opentelemetry::propagation::Extractor`] trait for Hyper's
 /// [`HeaderMap`], enabling trace context propagation by extracting
 /// OpenTelemetry headers from incoming HTTP requests.
 pub struct HeaderMapCarrier<'a> {

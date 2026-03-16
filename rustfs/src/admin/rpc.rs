@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Admin gRPC/streaming RPC endpoint registration and handling.
+
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::RPC_PREFIX;
 use futures::StreamExt;

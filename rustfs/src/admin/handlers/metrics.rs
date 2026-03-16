@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Prometheus metrics export handler.
+
 use crate::admin::router::Operation;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};

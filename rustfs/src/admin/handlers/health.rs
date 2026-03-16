@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Health and readiness probes and CPU/memory profiling triggers.
+
 use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::app::admin_usecase::DefaultAdminUsecase;

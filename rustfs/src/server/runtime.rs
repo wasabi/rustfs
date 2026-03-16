@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Tokio runtime builder (stack size, worker threads) for the server.
+
 use std::time::Duration;
 use sysinfo::{RefreshKind, System};
 

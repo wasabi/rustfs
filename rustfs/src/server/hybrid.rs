@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Hybrid HTTP body type (streaming vs one-shot) for S3 and admin.
+
 use futures::Future;
 use http_body::Frame;
 use hyper::body::Incoming;

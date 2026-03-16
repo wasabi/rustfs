@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! HTTP server, TLS, runtime, and lifecycle.
+//!
+//! Handles TLS setup, audit system, event notifier, readiness, and the main HTTP server
+//! that serves S3 and admin APIs.
+
 mod audit;
 mod cert;
 mod compress;

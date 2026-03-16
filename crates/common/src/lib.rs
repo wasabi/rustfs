@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Shared types and utilities: globals, readiness, heal channel, metrics, data usage.
+
 pub mod bucket_stats;
 // pub mod error;
 pub mod data_usage;

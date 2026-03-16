@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Readiness probe layer and response for Kubernetes/load balancers.
+
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! S3 client used by protocol layer to perform object operations.
+
 use crate::storage::ecfs::FS;
 use http::{HeaderMap, Method};
 use rustfs_credentials;

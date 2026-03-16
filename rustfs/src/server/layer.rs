@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Tower layers: routing, CORS, and request handling for S3/admin/console.
+
 use crate::admin::console::is_console_path;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;

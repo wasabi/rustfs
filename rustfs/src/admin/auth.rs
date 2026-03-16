@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Admin request authorization (IAM and policy checks).
+
 use crate::auth::get_condition_values;
 use http::HeaderMap;
 use rustfs_credentials::Credentials;

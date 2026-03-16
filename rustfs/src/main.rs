@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! RustFS binary crate.
+//!
+//! This crate is the main entry point for the RustFS object storage server. It wires together
+//! configuration, observability, storage, admin API, and S3-compatible HTTP services.
+
 mod admin;
 mod app;
 mod auth;
@@ -94,6 +99,7 @@ static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Entry point: builds the Tokio runtime and runs the async server.
 fn main() {
     let runtime = server::tokio_runtime_builder()
         .build()
@@ -105,6 +111,7 @@ fn main() {
         std::process::exit(1);
     }
 }
+/// Async main: parses config, initializes observability and TLS, then runs the server.
 async fn async_main() -> Result<()> {
     // Parse the obtained parameters
     let config = config::Config::parse()?;
@@ -170,6 +177,7 @@ async fn async_main() -> Result<()> {
     }
 }
 
+/// Runs the server: initializes readiness, storage, IAM, HTTP, and admin, then waits for shutdown.
 #[instrument(skip(config))]
 async fn run(config: config::Config) -> Result<()> {
     debug!("config: {:?}", &config);

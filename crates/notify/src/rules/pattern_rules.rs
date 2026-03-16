@@ -20,7 +20,7 @@ use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 
 /// PatternRules - Event rule that maps object name patterns to TargetID collections.
-/// `event.Rules` (map[string]TargetIDSet) in the Go code
+/// `event.Rules` (`map[string]TargetIDSet`) in the Go code
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PatternRules {
     pub(crate) rules: HashMap<String, TargetIdSet>,

@@ -169,7 +169,7 @@ pub fn certs_error(err: String) -> Error {
 /// * `dir_path` - A string slice that holds the path to the directory containing the certificates and private keys.
 ///
 /// # Returns
-/// * An io::Result containing a HashMap where the keys are domain names (or "default" for the root certificate) and the values are tuples of (Vec<CertificateDer>, PrivateKeyDer). If no valid certificate/private key pairs are found, an io::Error is returned.
+/// * An io::Result containing a HashMap where the keys are domain names (or "default" for the root certificate) and the values are tuples of (`Vec<CertificateDer>`, `PrivateKeyDer`). If no valid certificate/private key pairs are found, an io::Error is returned.
 ///
 pub fn load_all_certs_from_directory(
     dir_path: &str,
@@ -283,7 +283,7 @@ fn load_cert_key_pair(cert_path: &str, key_path: &str) -> io::Result<(Vec<Certif
 /// The rest of the certificates/private keys are used for SNI resolution.
 ///
 /// # Arguments
-/// * `cert_key_pairs` - A HashMap where the keys are domain names (or "default" for the root certificate) and the values are tuples of (Vec<CertificateDer>, PrivateKeyDer).
+/// * `cert_key_pairs` - A HashMap where the keys are domain names (or "default" for the root certificate) and the values are tuples of (`Vec<CertificateDer>`, `PrivateKeyDer`).
 ///
 /// # Returns
 /// * An io::Result containing an implementation of ResolvesServerCert if successful, or an io::Error if an error occurs during loading.

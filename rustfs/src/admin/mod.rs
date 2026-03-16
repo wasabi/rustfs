@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Admin API and management console.
+//!
+//! Registers admin routes (health, users, system, pools, heal, tier, quota, replication,
+//! KMS, OIDC, etc.) and serves the web console when enabled.
+
 mod auth;
 pub mod console;
 pub mod handlers;

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Bucket replication response builders.
+
 use s3s::dto::{GetBucketReplicationOutput, PutBucketReplicationOutput, ReplicationConfiguration};
 
 pub(crate) fn build_get_bucket_replication_output(

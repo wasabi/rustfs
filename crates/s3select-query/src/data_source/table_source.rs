@@ -102,7 +102,7 @@ impl TableSource for TableSourceAdapter {
         self.table_handle.supports_filters_pushdown(filter)
     }
 
-    /// Called by [`InlineTableScan`]
+    /// Called by `InlineTableScan`
     fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         Some(Cow::Owned(self.plan.clone()))
     }

@@ -33,7 +33,7 @@ use tracing::{debug, error, info};
 
 /// Log-file lifecycle manager.
 ///
-/// Holds all cleanup policy parameters and exposes a single [`cleanup`] method
+/// Holds all cleanup policy parameters and exposes a single [`LogCleaner::cleanup`] method
 /// that performs one full cleanup pass.
 ///
 /// # Thread-safety

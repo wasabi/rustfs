@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! RestoreObject response builders.
+
 use s3s::dto::{RequestCharged, RestoreObjectOutput};
 
 pub(crate) fn build_restore_object_output(

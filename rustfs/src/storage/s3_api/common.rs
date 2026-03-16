@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Shared owner/initiator constants and types for S3 responses.
+
 use s3s::dto::{Initiator, Owner};
 
 // Stable owner identity used in S3 response payloads (for example ACL, ListBuckets, and multipart listings).

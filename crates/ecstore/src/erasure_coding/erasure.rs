@@ -435,7 +435,7 @@ impl Erasure {
     /// # Arguments
     /// * `reader` - An async reader implementing AsyncRead + Send + Sync + Unpin
     /// * `mut on_block` - Async callback that receives encoded blocks and returns a Result
-    /// * `F` - Callback type: FnMut(Result<Vec<Bytes>, std::io::Error>) -> Future<Output=Result<(), E>> + Send
+    /// * `F` - Callback type: `FnMut(Result<Vec<Bytes>, std::io::Error>) -> Future<Output=Result<(), E>> + Send`
     /// * `Fut` - Future type returned by the callback
     /// * `E` - Error type returned by the callback
     /// * `R` - Reader type implementing AsyncRead + Send + Sync + Unpin

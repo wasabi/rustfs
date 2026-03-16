@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Access control: IAM/policy checks and pre-write validation for S3 operations.
+
 use super::ecfs::FS;
 use crate::auth::{check_key_valid, get_condition_values_with_query, get_session_token};
 use crate::license::license_check;

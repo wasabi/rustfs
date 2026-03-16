@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! S3 Select response builders.
+
 use s3s::dto::{SelectObjectContentEventStream, SelectObjectContentOutput};
 
 pub(crate) fn build_select_object_content_output(payload: SelectObjectContentEventStream) -> SelectObjectContentOutput {

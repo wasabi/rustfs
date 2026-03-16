@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Trusted proxy detection and forwarding for cloud and on-prem deployments.
+
 mod cloud;
 mod config;
 mod error;

@@ -17,10 +17,10 @@
 //! This module provides collectors that convert RustFS data into Prometheus
 //! metrics format. Each collector is responsible for a specific domain:
 //!
-//! - [`cluster`]: Cluster-wide capacity and object statistics
-//! - [`bucket`]: Per-bucket usage and quota metrics
-//! - [`node`]: Per-node disk capacity and health metrics
-//! - [`resource`]: System resource metrics (CPU, memory, uptime)
+//! - **cluster**: Cluster-wide capacity and object statistics
+//! - **bucket**: Per-bucket usage and quota metrics
+//! - **node**: Per-node disk capacity and health metrics
+//! - **resource**: System resource metrics (CPU, memory, uptime)
 //!
 //! # Design Philosophy
 //!

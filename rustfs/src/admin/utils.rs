@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Small utilities for admin request validation.
+
 pub(crate) fn has_space_be(s: &str) -> bool {
     s.trim().len() != s.len()
 }

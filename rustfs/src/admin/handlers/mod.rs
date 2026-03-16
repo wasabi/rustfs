@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Admin API handlers: health, users, system, pools, heal, KMS, OIDC, replication, etc.
+
 pub mod account_info;
 pub mod bucket_meta;
 pub mod event;

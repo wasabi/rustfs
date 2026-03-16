@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! User lifecycle (add, remove, list, set status) admin handlers.
+
 use super::user::{AddUser, GetUserInfo, ListUsers, RemoveUser, SetUserStatus};
 use crate::{
     admin::router::{AdminOperation, S3Router},

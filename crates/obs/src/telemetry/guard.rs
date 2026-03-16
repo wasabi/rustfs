@@ -35,8 +35,8 @@ use pyroscope::pyroscope::PyroscopeAgentRunning;
 /// RAII guard that owns all active OpenTelemetry providers and the
 /// `tracing_appender` worker guard.
 ///
-/// Construct this via the `init_*` functions in [`crate::telemetry`] rather
-/// than directly.  The guard must be kept alive for the entire duration of the
+/// Construct this via the `init_*` functions (e.g. [`crate::init_obs`]) rather than
+/// directly.  The guard must be kept alive for the entire duration of the
 /// application — once dropped, all telemetry pipelines are shut down.
 pub struct OtelGuard {
     /// Optional tracer provider for distributed tracing.
