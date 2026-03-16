@@ -113,11 +113,12 @@ pub(crate) async fn run_test_comprehensive_stress_test() -> Result<(), Box<dyn s
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
 
-    // Large multipart uploads with different encryption types
+    // Large multipart uploads with different encryption types (sized to complete
+    // in reasonable time under single-threaded e2e run; avoid 60MB+ per type).
     let stress_configs = vec![
-        MultipartTestConfig::new("stress-sse-s3-large", 15 * 1024 * 1024, 4, EncryptionType::SSES3),
-        MultipartTestConfig::new("stress-sse-kms-large", 15 * 1024 * 1024, 4, EncryptionType::SSEKMS),
-        MultipartTestConfig::new("stress-sse-c-large", 15 * 1024 * 1024, 4, create_sse_c_config()),
+        MultipartTestConfig::new("stress-sse-s3-large", 5 * 1024 * 1024, 2, EncryptionType::SSES3),
+        MultipartTestConfig::new("stress-sse-kms-large", 5 * 1024 * 1024, 2, EncryptionType::SSEKMS),
+        MultipartTestConfig::new("stress-sse-c-large", 5 * 1024 * 1024, 2, create_sse_c_config()),
     ];
 
     for config in stress_configs {

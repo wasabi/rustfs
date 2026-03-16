@@ -125,7 +125,9 @@ pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<
     let mut key_data = [0u8; 32];
     rand::rng().fill_bytes(&mut key_data);
 
-    // Create the stored key structure that Local KMS backend expects
+    // Create the stored key structure that Local KMS backend expects.
+    // encrypted_key_material must be base64-encoded (backend uses String, not byte array).
+    let encrypted_key_material_b64 = base64::engine::general_purpose::STANDARD.encode(key_data);
     let stored_key = serde_json::json!({
         "key_id": key_id,
         "version": 1u32,
@@ -136,7 +138,7 @@ pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<
         "created_at": chrono::Utc::now().to_rfc3339(),
         "rotated_at": serde_json::Value::Null,
         "created_by": "e2e-test",
-        "encrypted_key_material": key_data.to_vec(),
+        "encrypted_key_material": encrypted_key_material_b64,
         "nonce": Vec::<u8>::new()
     });
 
@@ -463,6 +465,70 @@ impl VaultTestEnvironment {
         }
 
         info!("Vault transit engine setup completed");
+        Ok(())
+    }
+
+    /// Ensure the KV v2 secrets engine is mounted at "secret" (used by KMS config).
+    pub async fn ensure_vault_kv_secret_mount(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let response = reqwest::Client::new()
+            .post(format!("{VAULT_URL}/v1/sys/mounts/secret"))
+            .header("X-Vault-Token", VAULT_TOKEN)
+            .json(&serde_json::json!({ "type": "kv", "options": { "version": "2" } }))
+            .send()
+            .await?;
+        if !response.status().is_success() && response.status() != 400 {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to enable KV v2 at secret: {}", text).into());
+        }
+        Ok(())
+    }
+
+    /// Seed the default KMS key in Vault KV so the backend can find it.
+    /// The Vault KMS backend stores keys in KV (key_path_prefix/key_id), not in Transit.
+    pub async fn seed_vault_default_key(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use rand::Rng;
+        use std::collections::HashMap;
+
+        self.ensure_vault_kv_secret_mount().await?;
+
+        let key_id = VAULT_KEY_NAME;
+        let path = format!("{}/{}", "rustfs/kms/keys", key_id);
+
+        // Generate 32-byte key material and base64-encode (backend stores it this way when not using transit encryption)
+        let mut key_data = [0u8; 32];
+        rand::rng().fill_bytes(&mut key_data);
+        let encrypted_key_material = base64::engine::general_purpose::STANDARD.encode(key_data);
+
+        let now = chrono::Utc::now();
+        let secs = now.timestamp();
+        let nsecs = i64::from(now.timestamp_subsec_nanos());
+        let data = serde_json::json!({
+            "algorithm": "AES_256",
+            "usage": "EncryptDecrypt",
+            "created_at": [secs, nsecs],
+            "status": "Active",
+            "version": 1u32,
+            "description": serde_json::Value::Null,
+            "metadata": HashMap::<String, String>::new(),
+            "tags": HashMap::<String, String>::new(),
+            "encrypted_key_material": encrypted_key_material,
+        });
+
+        let url = format!("{VAULT_URL}/v1/secret/data/{path}");
+        let body = serde_json::json!({ "data": data });
+        let response = reqwest::Client::new()
+            .post(&url)
+            .header("X-Vault-Token", VAULT_TOKEN)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to seed default key in Vault KV: {} {}", status, text).into());
+        }
+        info!("Seeded default KMS key '{}' in Vault KV at {}", key_id, path);
         Ok(())
     }
 

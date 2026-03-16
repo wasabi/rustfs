@@ -23,6 +23,8 @@
 
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Once;
@@ -209,6 +211,15 @@ impl RustFSTestEnvironment {
 
     /// Start RustFS server with basic configuration
     pub async fn start_rustfs_server(&mut self, extra_args: Vec<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_with_env(extra_args, &[]).await
+    }
+
+    /// Start RustFS server with optional environment variables (e.g. for scanner speed).
+    pub async fn start_rustfs_server_with_env(
+        &mut self,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.cleanup_existing_processes().await?;
 
         let mut args = vec![
@@ -220,10 +231,7 @@ impl RustFSTestEnvironment {
             &self.secret_key,
         ];
 
-        // Add extra arguments
         args.extend(extra_args);
-
-        // Add temp directory as the last argument
         args.push(&self.temp_dir);
 
         info!("Starting RustFS server with args: {:?}", args);
@@ -239,7 +247,16 @@ impl RustFSTestEnvironment {
             )
             .into());
         }
-        let process = Command::new(&binary_path).args(&args).spawn().map_err(|e| {
+        let mut cmd = Command::new(&binary_path);
+        cmd.args(&args);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        // Run server in its own process group so it does not receive signals
+        // sent to the test runner (e.g. SIGTERM), which could cause mid-test shutdown.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let process = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,

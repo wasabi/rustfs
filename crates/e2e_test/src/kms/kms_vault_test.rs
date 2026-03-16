@@ -40,6 +40,8 @@ impl VaultKmsTestContext {
 
         env.start_vault().await?;
         env.setup_vault_transit().await?;
+        // Backend expects the default key in KV, not only in Transit; seed it.
+        env.seed_vault_default_key().await?;
 
         env.start_rustfs_for_vault().await?;
         env.configure_vault_kms().await?;
