@@ -56,10 +56,51 @@ runs:
           libssl-dev
 
     - name: Install protoc
-      uses: arduino/setup-protoc@v3
-      with:
-        version: "33.1"
-        repo-token: ${{ inputs.github-token }}
+      shell: bash
+      run: |
+        set -e
+        PROTOC_VERSION="33.1"
+        BASE_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}"
+        ARCH=$(uname -m)
+        case "$RUNNER_OS" in
+          Linux)
+            case "$ARCH" in
+              x86_64)  SUFFIX="linux-x86_64" ;;
+              aarch64) SUFFIX="linux-aarch_64" ;;
+              *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+            esac
+            echo "Installing protoc ${PROTOC_VERSION} (${SUFFIX})..."
+            curl -sSL -o /tmp/protoc.zip "${BASE_URL}/protoc-${PROTOC_VERSION}-${SUFFIX}.zip"
+            sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+            sudo chmod +x /usr/local/bin/protoc
+            rm /tmp/protoc.zip
+            ;;
+          macOS)
+            case "$ARCH" in
+              x86_64) SUFFIX="osx-x86_64" ;;
+              arm64)  SUFFIX="osx-aarch_64" ;;
+              *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+            esac
+            echo "Installing protoc ${PROTOC_VERSION} (${SUFFIX})..."
+            curl -sSL -o /tmp/protoc.zip "${BASE_URL}/protoc-${PROTOC_VERSION}-${SUFFIX}.zip"
+            sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+            sudo chmod +x /usr/local/bin/protoc
+            rm /tmp/protoc.zip
+            ;;
+          Windows)
+            echo "Installing protoc ${PROTOC_VERSION} (win64)..."
+            curl -sSL -o "$RUNNER_TEMP/protoc.zip" "${BASE_URL}/protoc-${PROTOC_VERSION}-win64.zip"
+            unzip -q -o "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+            echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+            echo "PATH=$RUNNER_TEMP/protoc/bin:$PATH" >> "$GITHUB_ENV"
+            rm "$RUNNER_TEMP/protoc.zip"
+            "$RUNNER_TEMP/protoc/bin/protoc.exe" --version
+            exit 0
+            ;;
+          *)
+            echo "Unsupported OS: $RUNNER_OS"; exit 1 ;;
+        esac
+        protoc --version
 
     - name: Install flatc
       uses: Nugine/setup-flatc@v1
