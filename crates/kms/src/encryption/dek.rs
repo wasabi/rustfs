@@ -22,10 +22,119 @@
 
 use crate::error::{KmsError, Result};
 use async_trait::async_trait;
-use jiff::Zoned;
+use jiff::{Timestamp, Zoned};
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
+use std::time::SystemTime;
+
+/// Converts a serde_json Value (string or [secs, nsecs] array) into Zoned.
+fn zoned_from_value(v: serde_json::Value) -> std::result::Result<Zoned, String> {
+    match v {
+        serde_json::Value::String(s) => {
+            let normalized = normalize_zoned_str(&s);
+            Zoned::from_str(&normalized).map_err(|e| e.to_string())
+        }
+        serde_json::Value::Array(arr) => {
+            if arr.len() >= 2 {
+                let secs = arr[0].as_i64().ok_or("zoned array[0]: expected integer seconds")?;
+                let nsecs = arr[1].as_i64().ok_or("zoned array[1]: expected integer nanoseconds")? as i32;
+                let ts = Timestamp::new(secs, nsecs).map_err(|e| e.to_string())?;
+                Ok(Zoned::new(ts, jiff::tz::TimeZone::UTC))
+            } else {
+                Err("zoned array: expected [secs, nsecs] with 2 elements".to_string())
+            }
+        }
+        _ => Err("created_at: expected string or [secs, nsecs] array".to_string()),
+    }
+}
+
+/// Normalizes a zoned datetime string for parsing: if it lacks the RFC 8536
+/// bracket time zone (e.g. `[UTC]`), appends or rewrites so the parser accepts it.
+fn normalize_zoned_str(s: &str) -> String {
+    let s = s.trim();
+    if s.contains('[') {
+        return s.to_string();
+    }
+    if s.ends_with('Z') {
+        let base = s.trim_end_matches('Z');
+        return format!("{}+00:00[UTC]", base);
+    }
+    if s.ends_with("+0000") {
+        let base = s.trim_end_matches("+0000");
+        return format!("{}+00:00[UTC]", base);
+    }
+    if s.ends_with("+00:00") {
+        let base = s.trim_end_matches("+00:00");
+        return format!("{}+00:00[UTC]", base);
+    }
+    format!("{}+00:00[UTC]", s)
+}
+
+/// Deserializes a `Zoned` from JSON, accepting: (1) RFC 8536 string with bracket,
+/// (2) legacy string formats (e.g. trailing `Z` or `+00:00` without `[UTC]`),
+/// (3) a two-element array `[secs, nsecs]` (e.g. from jiff's default serde).
+/// Uses Value deserialization so both string and array are accepted regardless of format.
+pub fn deserialize_zoned_utc_compatible<'de, D>(d: D) -> std::result::Result<Zoned, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    zoned_from_value(v).map_err(serde::de::Error::custom)
+}
+
+/// Deserializes `Option<Zoned>` with the same lenient rules as `deserialize_zoned_utc_compatible`.
+pub fn deserialize_opt_zoned_utc_compatible<'de, D>(d: D) -> std::result::Result<Option<Zoned>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<serde_json::Value> = Option::deserialize(d)?;
+    match opt {
+        None => Ok(None),
+        Some(v) => zoned_from_value(v).map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// Newtype that deserializes from either string or `[secs, nsecs]` array.
+/// Use this as the field type so the type system always uses our Deserialize impl.
+#[derive(Debug, Clone, Serialize)]
+pub struct ZonedUtcCompatible(#[serde(serialize_with = "serialize_zoned")] pub Zoned);
+
+fn serialize_zoned<S>(z: &Zoned, s: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    z.serialize(s)
+}
+
+impl<'de> Deserialize<'de> for ZonedUtcCompatible {
+    fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(d)?;
+        zoned_from_value(v).map(ZonedUtcCompatible).map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::ops::Deref for ZonedUtcCompatible {
+    type Target = Zoned;
+    fn deref(&self) -> &Zoned {
+        &self.0
+    }
+}
+
+/// Current time in UTC for use in serialized envelopes.
+/// Using UTC ensures the string always includes the RFC 8536 time zone annotation
+/// (e.g. `+00:00[UTC]`), so deserialization works regardless of system timezone.
+#[inline]
+pub fn zoned_now_utc() -> Zoned {
+    Zoned::new(
+        Timestamp::try_from(SystemTime::now()).expect("system time valid"),
+        jiff::tz::TimeZone::UTC,
+    )
+}
 
 /// Data key envelope for encrypting/decrypting data keys
 ///
@@ -40,7 +149,7 @@ pub struct DataKeyEnvelope {
     pub encrypted_key: Vec<u8>,
     pub nonce: Vec<u8>,
     pub encryption_context: HashMap<String, String>,
-    pub created_at: Zoned,
+    pub created_at: ZonedUtcCompatible,
 }
 
 /// Trait for encrypting and decrypting data encryption keys (DEK)
@@ -280,7 +389,7 @@ mod tests {
                 map.insert("bucket".to_string(), "test-bucket".to_string());
                 map
             },
-            created_at: Zoned::now(),
+            created_at: ZonedUtcCompatible(zoned_now_utc()),
         };
 
         // Test serialization

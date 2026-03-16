@@ -71,8 +71,10 @@ impl KmsManager {
 
     /// Generate a data encryption key
     pub async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
-        // Check cache first if enabled
-        if self.config.enable_cache {
+        // Only use cache when there is no encryption context: context-bound DEKs must be unique per (bucket, object_key).
+        let use_cache = self.config.enable_cache && request.encryption_context.is_empty();
+
+        if use_cache {
             let cache = self.cache.read().await;
             if let Some(cached_key) = cache.get_data_key(&request.key_id).await
                 && cached_key.key_spec == request.key_spec
@@ -88,8 +90,7 @@ impl KmsManager {
         // Generate new data key from backend
         let response = self.backend.generate_data_key(request).await?;
 
-        // Cache the data key if enabled
-        if self.config.enable_cache {
+        if use_cache {
             let mut cache = self.cache.write().await;
             cache
                 .put_data_key(&response.key_id, &response.plaintext_key, &response.ciphertext_blob)

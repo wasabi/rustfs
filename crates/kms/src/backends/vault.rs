@@ -16,7 +16,7 @@
 
 use crate::backends::{BackendInfo, KmsBackend, KmsClient};
 use crate::config::{KmsConfig, VaultConfig};
-use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
+use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material, zoned_now_utc};
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use async_trait::async_trait;
@@ -51,6 +51,7 @@ struct VaultKeyData {
     /// Key usage type
     usage: KeyUsage,
     /// Key creation timestamp
+    #[serde(deserialize_with = "crate::encryption::deserialize_zoned_utc_compatible")]
     created_at: Zoned,
     /// Key status
     status: KeyStatus,
@@ -308,7 +309,7 @@ impl KmsClient for VaultKmsClient {
             encrypted_key: encrypted_key.clone(),
             nonce,
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: crate::encryption::ZonedUtcCompatible(zoned_now_utc()),
         };
 
         // Serialize the envelope as the ciphertext
@@ -393,7 +394,7 @@ impl KmsClient for VaultKmsClient {
         let key_data = VaultKeyData {
             algorithm: algorithm.to_string(),
             usage: KeyUsage::EncryptDecrypt,
-            created_at: Zoned::now(),
+            created_at: zoned_now_utc(),
             status: KeyStatus::Active,
             version: 1,
             description: None,
@@ -549,7 +550,7 @@ impl KmsClient for VaultKmsClient {
             description: None, // Rotate preserves existing description (would need key lookup)
             metadata: key_data.metadata,
             created_at: key_data.created_at,
-            rotated_at: Some(Zoned::now()),
+            rotated_at: Some(zoned_now_utc()),
             created_by: None,
         };
 
@@ -640,7 +641,7 @@ impl KmsBackend for VaultKmsBackend {
             key_state: KeyState::Enabled,
             key_usage: request.key_usage,
             description: request.description,
-            creation_date: Zoned::now(),
+            creation_date: zoned_now_utc(),
             deletion_date: None,
             origin: "VAULT".to_string(),
             key_manager: "VAULT".to_string(),
@@ -755,7 +756,7 @@ impl KmsBackend for VaultKmsBackend {
             } else {
                 // For non-pending keys, mark as PendingDeletion
                 key_metadata.key_state = KeyState::PendingDeletion;
-                key_metadata.deletion_date = Some(Zoned::now());
+                key_metadata.deletion_date = Some(zoned_now_utc());
 
                 // Update the key metadata in Vault storage to reflect the new state
                 self.update_key_metadata_in_storage(key_id, &key_metadata).await?;
@@ -771,7 +772,7 @@ impl KmsBackend for VaultKmsBackend {
                 ));
             }
 
-            let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
+            let deletion_date = zoned_now_utc() + Duration::from_secs(days as u64 * 86400);
             key_metadata.key_state = KeyState::PendingDeletion;
             key_metadata.deletion_date = Some(deletion_date.clone());
 

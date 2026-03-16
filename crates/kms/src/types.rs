@@ -14,6 +14,7 @@
 
 //! Core type definitions for KMS operations
 
+use crate::encryption::zoned_now_utc;
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,7 +62,7 @@ impl DataKeyInfo {
             ciphertext,
             key_spec,
             metadata: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: zoned_now_utc(),
         }
     }
 
@@ -139,7 +140,7 @@ impl MasterKeyInfo {
             status: KeyStatus::Active,
             description: None,
             metadata: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: zoned_now_utc(),
             rotated_at: None,
             created_by,
         }
@@ -170,7 +171,7 @@ impl MasterKeyInfo {
             status: KeyStatus::Active,
             description,
             metadata: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: zoned_now_utc(),
             rotated_at: None,
             created_by,
         }

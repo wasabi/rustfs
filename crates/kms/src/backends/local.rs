@@ -17,7 +17,7 @@
 use crate::backends::{BackendInfo, KmsBackend, KmsClient};
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
-use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
+use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material, zoned_now_utc};
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use aes_gcm::{
@@ -26,7 +26,6 @@ use aes_gcm::{
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use jiff::Zoned;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,8 +56,8 @@ struct StoredMasterKey {
     status: KeyStatus,
     description: Option<String>,
     metadata: HashMap<String, String>,
-    created_at: Zoned,
-    rotated_at: Option<Zoned>,
+    created_at: crate::encryption::ZonedUtcCompatible,
+    rotated_at: Option<crate::encryption::ZonedUtcCompatible>,
     created_by: Option<String>,
     /// Encrypted key material (32 bytes encoded in base64 for AES-256)
     encrypted_key_material: String,
@@ -160,8 +159,8 @@ impl LocalKmsClient {
             status: stored_key.status,
             description: stored_key.description,
             metadata: stored_key.metadata,
-            created_at: stored_key.created_at,
-            rotated_at: stored_key.rotated_at,
+            created_at: stored_key.created_at.0.clone(),
+            rotated_at: stored_key.rotated_at.as_ref().map(|z| z.0.clone()),
             created_by: stored_key.created_by,
         })
     }
@@ -194,8 +193,8 @@ impl LocalKmsClient {
             status: master_key.status.clone(),
             description: master_key.description.clone(),
             metadata: master_key.metadata.clone(),
-            created_at: master_key.created_at.clone(),
-            rotated_at: master_key.rotated_at.clone(),
+            created_at: crate::encryption::ZonedUtcCompatible(master_key.created_at.clone()),
+            rotated_at: master_key.rotated_at.clone().map(crate::encryption::ZonedUtcCompatible),
             created_by: master_key.created_by.clone(),
             encrypted_key_material,
             nonce,
@@ -260,7 +259,8 @@ impl KmsClient for LocalKmsClient {
         // Encrypt the data key with the master key
         let (encrypted_key, nonce) = self.encrypt_with_master_key(&request.master_key_id, &plaintext_key).await?;
 
-        // Create data key envelope with master key version for rotation support
+        // Create data key envelope with master key version for rotation support.
+        // Use UTC for created_at so serde round-trips regardless of system timezone.
         let envelope = DataKeyEnvelope {
             key_id: uuid::Uuid::new_v4().to_string(),
             master_key_id: request.master_key_id.clone(),
@@ -268,7 +268,7 @@ impl KmsClient for LocalKmsClient {
             encrypted_key: encrypted_key.clone(),
             nonce,
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: crate::encryption::ZonedUtcCompatible(zoned_now_utc()),
         };
 
         // Serialize the envelope as the ciphertext
@@ -516,7 +516,7 @@ impl KmsClient for LocalKmsClient {
 
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.version += 1;
-        master_key.rotated_at = Some(Zoned::now());
+        master_key.rotated_at = Some(zoned_now_utc());
 
         // Generate new key material
         let key_material = generate_key_material(&master_key.algorithm)?;
@@ -604,7 +604,7 @@ impl KmsBackend for LocalKmsBackend {
             key_state: KeyState::Enabled,
             key_usage: request.key_usage,
             description: request.description,
-            creation_date: Zoned::now(),
+            creation_date: zoned_now_utc(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
@@ -724,7 +724,7 @@ impl KmsBackend for LocalKmsBackend {
                 key_usage: master_key.usage,
                 key_state: KeyState::PendingDeletion, // AWS KMS compatibility
                 creation_date: master_key.created_at,
-                deletion_date: Some(Zoned::now()),
+                deletion_date: Some(zoned_now_utc()),
                 key_manager: "CUSTOMER".to_string(),
                 origin: "AWS_KMS".to_string(),
                 tags: master_key.metadata,
@@ -742,7 +742,7 @@ impl KmsBackend for LocalKmsBackend {
                 return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30".to_string()));
             }
 
-            let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
+            let deletion_date = zoned_now_utc() + Duration::from_secs(days as u64 * 86400);
             master_key.status = KeyStatus::PendingDeletion;
 
             (Some(deletion_date.to_string()), Some(deletion_date))
