@@ -29,6 +29,9 @@ pub use compress_reader::{CompressReader, DecompressReader};
 mod encrypt_reader;
 pub use encrypt_reader::{DecryptReader, EncryptReader};
 
+mod exact_length_reader;
+pub use exact_length_reader::ExactLengthReader;
+
 mod hardlimit_reader;
 pub use hardlimit_reader::HardLimitReader;
 
@@ -85,6 +88,7 @@ pub trait HashReaderDetector {
 }
 
 impl Reader for crate::HashReader {}
+impl Reader for crate::ExactLengthReader {}
 impl Reader for crate::HardLimitReader {}
 impl Reader for crate::EtagReader {}
 impl<R> Reader for crate::LimitReader<R> where R: Reader {}
