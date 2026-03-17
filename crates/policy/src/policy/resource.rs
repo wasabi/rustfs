@@ -210,6 +210,9 @@ impl TryFrom<&str> for Resource {
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
         let resource = if value.starts_with(Self::S3_PREFIX) {
             Resource::S3(value.strip_prefix(Self::S3_PREFIX).unwrap().into())
+        } else if value == "*" {
+            // AWS IAM allows "Resource": "*" as shorthand for all resources
+            Resource::S3("*".into())
         } else {
             return Err(IamError::InvalidResource("unknown".into(), value.into()).into());
         };

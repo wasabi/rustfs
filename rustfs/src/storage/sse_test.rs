@@ -213,7 +213,7 @@ mod tests {
 
         // Step 2: Later, decrypt the DEK (simulating GET operation)
         let decrypted_plaintext_key = provider
-            .decrypt_sse_dek(&encrypted_dek, kms_key_id)
+            .decrypt_sse_dek(&encrypted_dek, kms_key_id, None)
             .await
             .expect("Failed to decrypt DEK");
 

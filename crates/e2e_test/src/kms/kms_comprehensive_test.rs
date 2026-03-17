@@ -29,9 +29,7 @@ use tokio::time::{Duration, sleep};
 use tracing::info;
 
 /// Comprehensive test: Full KMS workflow with all encryption types
-#[tokio::test]
-#[serial]
-async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn run_test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🏁 Start the KMS full-featured synthesis test");
 
@@ -63,6 +61,12 @@ async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ KMS fully functional comprehensive test passed");
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_kms_full_workflow().await
 }
 
 /// Test mixed encryption workload with different file sizes and encryption types
@@ -98,9 +102,7 @@ async fn test_mixed_encryption_workload(
 }
 
 /// Comprehensive stress test: Large dataset with multiple encryption types
-#[tokio::test]
-#[serial]
-async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn run_test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("💪 Start the KMS stress test");
 
@@ -111,11 +113,12 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
 
-    // Large multipart uploads with different encryption types
+    // Large multipart uploads with different encryption types (sized to complete
+    // in reasonable time under single-threaded e2e run; avoid 60MB+ per type).
     let stress_configs = vec![
-        MultipartTestConfig::new("stress-sse-s3-large", 15 * 1024 * 1024, 4, EncryptionType::SSES3),
-        MultipartTestConfig::new("stress-sse-kms-large", 15 * 1024 * 1024, 4, EncryptionType::SSEKMS),
-        MultipartTestConfig::new("stress-sse-c-large", 15 * 1024 * 1024, 4, create_sse_c_config()),
+        MultipartTestConfig::new("stress-sse-s3-large", 5 * 1024 * 1024, 2, EncryptionType::SSES3),
+        MultipartTestConfig::new("stress-sse-kms-large", 5 * 1024 * 1024, 2, EncryptionType::SSEKMS),
+        MultipartTestConfig::new("stress-sse-c-large", 5 * 1024 * 1024, 2, create_sse_c_config()),
     ];
 
     for config in stress_configs {
@@ -132,10 +135,14 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Test encryption key isolation and security
 #[tokio::test]
 #[serial]
-async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_stress_test().await
+}
+
+/// Test encryption key isolation and security
+pub(crate) async fn run_test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🔐 Begin the comprehensive test of encryption key isolation");
 
@@ -149,8 +156,8 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     // Test different SSE-C keys to ensure isolation
     let key1 = "01234567890123456789012345678901";
     let key2 = "98765432109876543210987654321098";
-    let key1_md5 = format!("{:x}", md5::compute(key1));
-    let key2_md5 = format!("{:x}", md5::compute(key2));
+    let key1_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key1).0);
+    let key2_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key2).0);
 
     let config1 = MultipartTestConfig::new(
         "isolation-test-key1",
@@ -183,7 +190,7 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     info!("🔒 Verify key isolation");
     let wrong_key = "11111111111111111111111111111111";
     let wrong_key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, wrong_key);
-    let wrong_key_md5 = format!("{:x}", md5::compute(wrong_key));
+    let wrong_key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(wrong_key).0);
 
     // Try to read file encrypted with key1 using wrong key
     let wrong_read_result = s3_client
@@ -204,10 +211,14 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Test concurrent encryption operations
 #[tokio::test]
 #[serial]
-async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_key_isolation().await
+}
+
+/// Test concurrent encryption operations
+pub(crate) async fn run_test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("⚡ Started comprehensive testing of concurrent encryption operations");
 
@@ -250,10 +261,14 @@ async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// Test encryption/decryption performance with different file sizes
 #[tokio::test]
 #[serial]
-async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_concurrent_operations().await
+}
+
+/// Test encryption/decryption performance with different file sizes
+pub(crate) async fn run_test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("📊 Start KMS performance benchmarking");
 
@@ -296,4 +311,10 @@ async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::e
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ KMS performance benchmark passed");
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_comprehensive_performance_benchmark().await
 }

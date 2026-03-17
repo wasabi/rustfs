@@ -31,6 +31,7 @@ const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 /// Custom test environment that doesn't automatically stop servers
 pub struct PolicyTestEnvironment {
     pub temp_dir: String,
+    #[allow(dead_code)]
     pub address: String,
     pub url: String,
     pub access_key: String,
@@ -69,6 +70,7 @@ impl PolicyTestEnvironment {
     }
 
     /// Wait for RustFS server to be ready by checking TCP connectivity
+    #[allow(dead_code)]
     pub async fn wait_for_server_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Waiting for RustFS server to be ready on {}", self.address);
 

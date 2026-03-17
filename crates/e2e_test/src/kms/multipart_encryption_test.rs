@@ -27,9 +27,7 @@ use serial_test::serial;
 use tracing::{debug, info};
 
 /// Step 1: Test the basic single-file encryption function (ensure that SSE-S3 works properly in non-sharded scenarios)
-#[tokio::test]
-#[serial]
-async fn test_step1_basic_single_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn run_test_step1_basic_single_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Step 1: Test the basic single-file encryption function");
 
@@ -83,10 +81,15 @@ async fn test_step1_basic_single_file_encryption() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Step 2: Test the unencrypted shard upload (make sure the shard upload base is working properly)
 #[tokio::test]
 #[serial]
-async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_step1_basic_single_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_step1_basic_single_file_encryption().await
+}
+
+/// Step 2: Test the unencrypted shard upload (make sure the shard upload base is working properly)
+pub(crate) async fn run_test_step2_basic_multipart_upload_without_encryption()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Step 2: Test unencrypted shard uploads");
 
@@ -182,10 +185,14 @@ async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Bo
     Ok(())
 }
 
-/// Step 3: Test Shard Upload + SSE-S3 Encryption (Focus Test)
 #[tokio::test]
 #[serial]
-async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_step2_basic_multipart_upload_without_encryption().await
+}
+
+/// Step 3: Test Shard Upload + SSE-S3 Encryption (Focus Test)
+pub(crate) async fn run_test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Step 3: Test Shard Upload + SSE-S3 Encryption");
 
@@ -306,10 +313,15 @@ async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Step 4: test larger multipart uploads (streaming encryption)
 #[tokio::test]
 #[serial]
-async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_step3_multipart_upload_with_sse_s3().await
+}
+
+/// Step 4: test larger multipart uploads (streaming encryption)
+pub(crate) async fn run_test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
     info!("🧪 Step 4: test large-file multipart encryption");
 
@@ -432,10 +444,14 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
     Ok(())
 }
 
-/// Step 5: test multipart uploads for every encryption mode
 #[tokio::test]
 #[serial]
-async fn test_step5_all_encryption_types_multipart() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_step4_large_multipart_upload_with_encryption().await
+}
+
+/// Step 5: test multipart uploads for every encryption mode
+pub(crate) async fn run_test_step5_all_encryption_types_multipart() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Step 5: test multipart uploads for every encryption mode");
 
@@ -481,6 +497,12 @@ async fn test_step5_all_encryption_types_multipart() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[tokio::test]
+#[serial]
+async fn test_step5_all_encryption_types_multipart() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_step5_all_encryption_types_multipart().await
+}
+
 #[derive(Debug)]
 enum EncryptionType {
     SSEKMS,
@@ -504,7 +526,7 @@ async fn test_multipart_encryption_type(
     let (sse_c_key, sse_c_md5) = if matches!(encryption_type, EncryptionType::SSEC) {
         let key = "01234567890123456789012345678901";
         let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
-        let key_md5 = format!("{:x}", md5::compute(key));
+        let key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key).0);
         (Some(key_b64), Some(key_md5))
     } else {
         (None, None)

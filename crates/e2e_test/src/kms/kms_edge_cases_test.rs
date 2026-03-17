@@ -32,9 +32,7 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 /// Test encryption of zero-byte files (empty files)
-#[tokio::test]
-#[serial]
-async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn run_test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS encryption with zero-byte files");
 
@@ -72,7 +70,7 @@ async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::
     info!("📤 Testing SSE-C with zero-byte file");
     let test_key = "01234567890123456789012345678901";
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let test_key_md5 = format!("{:x}", compute(test_key));
+    let test_key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, compute(test_key).0);
     let object_key_c = "zero-byte-sse-c";
 
     let _put_response_c = s3_client
@@ -105,10 +103,14 @@ async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Test encryption of single-byte files
 #[tokio::test]
 #[serial]
-async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_zero_byte_file_encryption().await
+}
+
+/// Test encryption of single-byte files
+pub(crate) async fn run_test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS encryption with single-byte files");
 
@@ -166,7 +168,7 @@ async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error
     info!("📤 Testing SSE-C with single-byte file");
     let test_key = "01234567890123456789012345678901";
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let test_key_md5 = format!("{:x}", compute(test_key));
+    let test_key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, compute(test_key).0);
     let object_key_c = "single-byte-sse-c";
 
     s3_client
@@ -198,10 +200,14 @@ async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-/// Test multipart upload boundary conditions (minimum 5MB part size)
 #[tokio::test]
 #[serial]
-async fn test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_single_byte_file_encryption().await
+}
+
+/// Test multipart upload boundary conditions (minimum 5MB part size)
+pub(crate) async fn run_test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS multipart upload boundary conditions");
 
@@ -274,10 +280,14 @@ async fn test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Test invalid key scenarios and error handling
 #[tokio::test]
 #[serial]
-async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_multipart_boundary_conditions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_multipart_boundary_conditions().await
+}
+
+/// Test invalid key scenarios and error handling
+pub(crate) async fn run_test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS invalid key scenarios and error handling");
 
@@ -294,7 +304,7 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
     info!("🔍 Testing invalid SSE-C key length");
     let invalid_short_key = "short"; // Too short
     let invalid_key_b64 = base64::engine::general_purpose::STANDARD.encode(invalid_short_key);
-    let invalid_key_md5 = format!("{:x}", compute(invalid_short_key));
+    let invalid_key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, compute(invalid_short_key).0);
 
     let invalid_key_result = s3_client
         .put_object()
@@ -334,7 +344,7 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
     info!("🔍 Testing access to SSE-C object without key");
 
     // First upload a valid SSE-C object
-    let valid_key_md5 = format!("{:x}", compute(valid_key));
+    let valid_key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, compute(valid_key).0);
     s3_client
         .put_object()
         .bucket(TEST_BUCKET)
@@ -362,10 +372,14 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Test concurrent encryption operations
 #[tokio::test]
 #[serial]
-async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_invalid_key_scenarios().await
+}
+
+/// Test concurrent encryption operations
+pub(crate) async fn run_test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS concurrent encryption operations");
 
@@ -421,7 +435,7 @@ async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Erro
                     // SSE-C
                     let key = format!("testkey{i:026}"); // 32-byte key
                     let key_b64 = base64::engine::general_purpose::STANDARD.encode(&key);
-                    let key_md5 = format!("{:x}", compute(&key));
+                    let key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, compute(key.as_bytes()).0);
 
                     client
                         .put_object()
@@ -470,10 +484,14 @@ async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Test key validation and security properties
 #[tokio::test]
 #[serial]
-async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_concurrent_encryption().await
+}
+
+/// Test key validation and security properties
+pub(crate) async fn run_test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS key validation and security properties");
 
@@ -493,8 +511,8 @@ async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Er
 
     let key1_b64 = base64::engine::general_purpose::STANDARD.encode(key1);
     let key2_b64 = base64::engine::general_purpose::STANDARD.encode(key2);
-    let key1_md5 = format!("{:x}", compute(key1));
-    let key2_md5 = format!("{:x}", compute(key2));
+    let key1_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, compute(key1).0);
+    let key2_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, compute(key2).0);
 
     // Upload same data with different keys
     s3_client
@@ -570,4 +588,10 @@ async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Er
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ Key validation and security test completed successfully");
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_kms_key_validation_security().await
 }

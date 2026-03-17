@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::init_logging;
+use crate::common::{RustFSTestEnvironment, init_logging};
 use crate::policy::test_env::PolicyTestEnvironment;
 use serial_test::serial;
 use std::time::Instant;
@@ -120,20 +120,25 @@ impl PolicyTestSuite {
         let start_time = Instant::now();
         let mut results = Vec::new();
 
-        // Create test environment
-        let env = match PolicyTestEnvironment::with_address("127.0.0.1:9000").await {
-            Ok(env) => env,
+        // Spawn RustFS server and create policy test environment bound to it
+        let mut rustfs_env = match RustFSTestEnvironment::new().await {
+            Ok(e) => e,
             Err(e) => {
-                error!("Failed to create test environment: {}", e);
+                error!("Failed to create RustFS test environment: {}", e);
                 return vec![TestResult::failure("env_creation".into(), e.to_string())];
             }
         };
-
-        // Wait for server to be ready
-        if env.wait_for_server_ready().await.is_err() {
-            error!("Server is not ready");
-            return vec![TestResult::failure("server_check".into(), "Server not ready".into())];
+        if let Err(e) = rustfs_env.start_rustfs_server(vec![]).await {
+            error!("Failed to start RustFS server: {}", e);
+            return vec![TestResult::failure("server_start".into(), e.to_string())];
         }
+        let env = match PolicyTestEnvironment::with_address(&rustfs_env.address).await {
+            Ok(env) => env,
+            Err(e) => {
+                error!("Failed to create policy test environment: {}", e);
+                return vec![TestResult::failure("policy_env".into(), e.to_string())];
+            }
+        };
 
         // Filter tests
         let tests_to_run: Vec<&TestDefinition> = self
@@ -229,7 +234,6 @@ impl PolicyTestSuite {
 /// Test suite
 #[tokio::test]
 #[serial]
-#[ignore = "Connects to existing rustfs server"]
 async fn test_policy_critical_suite() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = TestSuiteConfig {
         include_critical_only: true,

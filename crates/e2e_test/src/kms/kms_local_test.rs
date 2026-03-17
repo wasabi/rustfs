@@ -24,9 +24,8 @@ use crate::common::{TEST_BUCKET, init_logging};
 use serial_test::serial;
 use tracing::{error, info};
 
-#[tokio::test]
-#[serial]
-async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Async test body; callable from both #[tokio::test] and the unified runner.
+pub(crate) async fn run_test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting Local KMS End-to-End Test");
 
@@ -109,7 +108,12 @@ async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + S
 
 #[tokio::test]
 #[serial]
-async fn test_local_kms_key_isolation() {
+async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_test_local_kms_end_to_end().await
+}
+
+/// Async test body; callable from both #[tokio::test] and the unified runner.
+pub(crate) async fn run_test_local_kms_key_isolation() {
     init_logging();
     info!("Starting Local KMS Key Isolation Test");
 
@@ -117,13 +121,11 @@ async fn test_local_kms_key_isolation() {
         .await
         .expect("Failed to create LocalKMS test environment");
 
-    // Start RustFS with Local KMS backend (KMS should be auto-started with --kms-backend local)
     let default_key_id = kms_env
         .start_rustfs_for_local_kms()
         .await
         .expect("Failed to start RustFS with Local KMS");
 
-    // Wait a moment for RustFS to fully start up and initialize KMS
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     info!("RustFS started with KMS auto-configuration, default_key_id: {}", default_key_id);
@@ -135,18 +137,16 @@ async fn test_local_kms_key_isolation() {
         .await
         .expect("Failed to create test bucket");
 
-    // Test that different SSE-C keys create isolated encrypted objects
     let key1 = "01234567890123456789012345678901";
     let key2 = "98765432109876543210987654321098";
     let key1_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key1);
     let key2_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key2);
-    let key1_md5 = format!("{:x}", md5::compute(key1));
-    let key2_md5 = format!("{:x}", md5::compute(key2));
+    let key1_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key1).0);
+    let key2_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(key2).0);
 
     let data1 = b"Data encrypted with key 1";
     let data2 = b"Data encrypted with key 2";
 
-    // Upload two objects with different SSE-C keys
     s3_client
         .put_object()
         .bucket(TEST_BUCKET)
@@ -171,7 +171,6 @@ async fn test_local_kms_key_isolation() {
         .await
         .expect("Failed to upload object2");
 
-    // Verify each object can only be decrypted with its own key
     let get1 = s3_client
         .get_object()
         .bucket(TEST_BUCKET)
@@ -186,7 +185,6 @@ async fn test_local_kms_key_isolation() {
     let retrieved_data1 = get1.body.collect().await.expect("Failed to read object1 body").into_bytes();
     assert_eq!(retrieved_data1.as_ref(), data1);
 
-    // Try to access object1 with key2 - should fail
     let wrong_key_result = s3_client
         .get_object()
         .bucket(TEST_BUCKET)
@@ -206,6 +204,12 @@ async fn test_local_kms_key_isolation() {
         .expect("Failed to delete test bucket");
 
     info!("Local KMS Key Isolation Test completed successfully");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_local_kms_key_isolation() {
+    run_test_local_kms_key_isolation().await
 }
 
 #[tokio::test]
@@ -291,9 +295,8 @@ async fn test_local_kms_large_file() {
     info!("Local KMS Large File Test completed successfully");
 }
 
-#[tokio::test]
-#[serial]
-async fn test_local_kms_multipart_upload() {
+/// Async test body; callable from both #[tokio::test] and the unified runner.
+pub(crate) async fn run_test_local_kms_multipart_upload() {
     init_logging();
     info!("Starting Local KMS Multipart Upload Test");
 
@@ -301,13 +304,11 @@ async fn test_local_kms_multipart_upload() {
         .await
         .expect("Failed to create LocalKMS test environment");
 
-    // Start RustFS with Local KMS backend
     let default_key_id = kms_env
         .start_rustfs_for_local_kms()
         .await
         .expect("Failed to start RustFS with Local KMS");
 
-    // Wait for KMS initialization
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     info!("RustFS started with KMS auto-configuration, default_key_id: {}", default_key_id);
@@ -319,33 +320,21 @@ async fn test_local_kms_multipart_upload() {
         .await
         .expect("Failed to create test bucket");
 
-    // Test multipart upload with different encryption types
-
-    // Test 1: Multipart upload with SSE-S3 (focus on this first)
     info!("Testing multipart upload with SSE-S3");
     test_multipart_upload_with_sse_s3(&s3_client, TEST_BUCKET)
         .await
         .expect("SSE-S3 multipart upload test failed");
 
-    // Test 2: Multipart upload with SSE-KMS
     info!("Testing multipart upload with SSE-KMS");
     test_multipart_upload_with_sse_kms(&s3_client, TEST_BUCKET)
         .await
         .expect("SSE-KMS multipart upload test failed");
 
-    // Test 3: Multipart upload with SSE-C
     info!("Testing multipart upload with SSE-C");
     test_multipart_upload_with_sse_c(&s3_client, TEST_BUCKET)
         .await
         .expect("SSE-C multipart upload test failed");
 
-    // Test 4: Large multipart upload (test streaming encryption with multiple blocks)
-    // TODO: Re-enable after fixing streaming encryption issues with large files
-    // info!("Testing large multipart upload with streaming encryption");
-    // test_large_multipart_upload(&s3_client, TEST_BUCKET).await
-    //     .expect("Large multipart upload test failed");
-
-    // Clean up
     kms_env
         .base_env
         .delete_test_bucket(TEST_BUCKET)
@@ -353,6 +342,12 @@ async fn test_local_kms_multipart_upload() {
         .expect("Failed to delete test bucket");
 
     info!("Local KMS Multipart Upload Test completed successfully");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_local_kms_multipart_upload() {
+    run_test_local_kms_multipart_upload().await
 }
 
 /// Test multipart upload with SSE-S3 encryption
@@ -559,10 +554,10 @@ async fn test_multipart_upload_with_sse_c(
     let total_parts = 2;
     let total_size = part_size * total_parts;
 
-    // SSE-C encryption key
+    // SSE-C encryption key; MD5 header must be Base64-encoded digest per S3 spec
     let encryption_key = "01234567890123456789012345678901";
     let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, encryption_key);
-    let key_md5 = format!("{:x}", md5::compute(encryption_key));
+    let key_md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, md5::compute(encryption_key).0);
 
     // Generate test data
     let test_data: Vec<u8> = (0..total_size).map(|i| ((i * 3) % 256) as u8).collect();

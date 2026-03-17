@@ -26,7 +26,7 @@ use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_ha
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, put_opts,
+    filter_object_metadata_with_options, get_content_sha256_with_query, get_opts, put_opts,
 };
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{acl, restore, select};
@@ -520,9 +520,13 @@ impl DefaultObjectUsecase {
 
         Self::spawn_cache_invalidation(bucket.clone(), key.clone(), raw_version.clone());
 
-        // Per S3 spec: only return VersionId when versioning is Enabled (not Suspended or default)
-        let put_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
-            raw_version
+        // Per S3 spec: return VersionId when versioning is Enabled or Suspended; use "null" for null version.
+        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+        let suspended = BucketVersioningSys::prefix_suspended(&bucket, &key).await;
+        let put_version = if versioned {
+            raw_version.map(|v| if v == Uuid::nil().to_string() { "null".to_string() } else { v })
+        } else if suspended {
+            Some("null".to_string())
         } else {
             None
         };
@@ -1212,13 +1216,19 @@ impl DefaultObjectUsecase {
             req.input.sse_customer_key.is_some()
         );
 
+        // For completed multipart with exactly one part, use part_number=1 so decryption uses the
+        // derived part 1 nonce. For simple PUT (one part, non-composite etag) use None = base nonce.
+        let decryption_part_number =
+            (info.parts.len() == 1 && info.user_defined.contains_key("x-rustfs-encryption-key") && info.is_multipart())
+                .then_some(1);
+
         let decryption_request = DecryptionRequest {
             bucket: &bucket,
             key: &key,
             metadata: &info.user_defined,
             sse_customer_key: req.input.sse_customer_key.as_ref(),
             sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
-            part_number: None,
+            part_number: decryption_part_number,
             parts: &info.parts,
         };
 
@@ -1333,13 +1343,37 @@ impl DefaultObjectUsecase {
                 response_content_length as usize,
             )))
         } else if encryption_applied {
-            // For encrypted objects (SSE-C or managed SSE), avoid bytes_stream length limiting
-            // because DecryptReader may need to consume the full encrypted stream.
-            info!(
-                "Encrypted object: Using unlimited stream for decryption with buffer size {}",
-                optimal_buffer_size
-            );
-            Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
+            // Preload small-to-medium encrypted bodies so decryption is validated before sending;
+            // avoids "error from user's Body stream" / IncompleteMessage when DecryptReader fails mid-stream.
+            // Covers typical 1-part multipart objects (e.g. 1MB–5MB) to fix IncompleteBody on Phase 4 and KMS boundary tests.
+            const ENCRYPTED_GET_PRELOAD_THRESHOLD: i64 = 8 * 1024 * 1024; // 8MB
+            if response_content_length > 0 && response_content_length <= ENCRYPTED_GET_PRELOAD_THRESHOLD {
+                let mut buf = Vec::with_capacity(response_content_length as usize);
+                if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                    error!("Failed to read decrypted object body: {}", e);
+                    return Err(ApiError::from(StorageError::other(format!("Decryption failed: {e}"))).into());
+                }
+                if buf.len() != response_content_length as usize {
+                    error!("Decrypted size mismatch: expected {} got {}", response_content_length, buf.len());
+                    return Err(ApiError::from(StorageError::other(format!(
+                        "Decryption size mismatch: expected {}, got {}",
+                        response_content_length,
+                        buf.len()
+                    )))
+                    .into());
+                }
+                let mem_reader = InMemoryAsyncReader::new(buf);
+                Some(StreamingBlob::wrap(bytes_stream(
+                    ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
+                    response_content_length as usize,
+                )))
+            } else {
+                // Use bytes_stream so the body is length-limited to response_content_length
+                Some(StreamingBlob::wrap(bytes_stream(
+                    ReaderStream::with_capacity(final_stream, optimal_buffer_size),
+                    response_content_length as usize,
+                )))
+            }
         } else {
             let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
 
@@ -1445,6 +1479,12 @@ impl DefaultObjectUsecase {
             None
         };
 
+        // Per S3 semantics, do not expose ssekms_key_id for SSE-S3 (AES256).
+        let ssekms_key_id_for_response = server_side_encryption
+            .as_ref()
+            .filter(|s| s.as_str() != "AES256")
+            .and_then(|_| ssekms_key_id.clone());
+
         let output = GetObjectOutput {
             body,
             content_length: Some(response_content_length),
@@ -1454,11 +1494,11 @@ impl DefaultObjectUsecase {
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: filter_object_metadata(&info.user_defined),
+            metadata: filter_object_metadata_with_options(&info.user_defined, true),
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
-            ssekms_key_id,
+            ssekms_key_id: ssekms_key_id_for_response,
             checksum_crc32,
             checksum_crc32c,
             checksum_sha1,
@@ -2992,7 +3032,7 @@ impl DefaultObjectUsecase {
             expires,
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: filter_object_metadata(&metadata_map),
+            metadata: filter_object_metadata_with_options(&metadata_map, true),
             version_id: info.version_id.map(|v| v.to_string()),
             server_side_encryption,
             sse_customer_algorithm,

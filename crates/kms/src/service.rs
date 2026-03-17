@@ -15,11 +15,11 @@
 //! Object encryption service for S3-compatible encryption
 
 use crate::encryption::ciphers::{create_cipher, generate_iv};
+use crate::encryption::zoned_now_utc;
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
 use base64::Engine;
-use jiff::Zoned;
 use rand::random;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -215,9 +215,19 @@ impl ObjectEncryptionService {
     /// DataKey with decrypted key
     ///
     pub async fn decrypt_data_key(&self, encrypted_key: &[u8], _context: &ObjectEncryptionContext) -> Result<DataKey> {
+        self.decrypt_data_key_with_context(encrypted_key, None).await
+    }
+
+    /// Decrypt a data key, optionally with encryption context from stored metadata
+    /// so the backend can verify context matches the envelope.
+    pub async fn decrypt_data_key_with_context(
+        &self,
+        encrypted_key: &[u8],
+        encryption_context: Option<&HashMap<String, String>>,
+    ) -> Result<DataKey> {
         let decrypt_request = DecryptRequest {
             ciphertext: encrypted_key.to_vec(),
-            encryption_context: HashMap::new(),
+            encryption_context: encryption_context.cloned().unwrap_or_default(),
             grant_tokens: Vec::new(),
         };
 
@@ -342,7 +352,7 @@ impl ObjectEncryptionService {
             iv,
             tag: Some(tag),
             encryption_context: context,
-            encrypted_at: Zoned::now(),
+            encrypted_at: zoned_now_utc(),
             original_size,
             encrypted_data_key: data_key.ciphertext_blob,
         };
@@ -485,7 +495,7 @@ impl ObjectEncryptionService {
             iv,
             tag: Some(tag),
             encryption_context: context,
-            encrypted_at: Zoned::now(),
+            encrypted_at: zoned_now_utc(),
             original_size,
             encrypted_data_key: Vec::new(), // Empty for SSE-C
         };
@@ -604,8 +614,7 @@ impl ObjectEncryptionService {
             headers.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
         } else if metadata.algorithm == "AES256" {
             headers.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
-            // For SSE-S3, we still need to store the key ID for internal use
-            headers.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id.clone());
+            // Do not store KMS key ID for SSE-S3 (AES256) per S3 semantics; decryption falls back to default key.
         } else {
             headers.insert("x-amz-server-side-encryption".to_string(), "aws:kms".to_string());
             headers.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id.clone());
@@ -655,6 +664,8 @@ impl ObjectEncryptionService {
             "sse-c".to_string()
         } else if let Some(kms_key_id) = headers.get("x-amz-server-side-encryption-aws-kms-key-id") {
             kms_key_id.clone()
+        } else if algorithm == "AES256" {
+            "default".to_string()
         } else {
             return Err(KmsError::validation_error("Missing key ID"));
         };
@@ -663,7 +674,7 @@ impl ObjectEncryptionService {
             .get("x-rustfs-encryption-iv")
             .ok_or_else(|| KmsError::validation_error("Missing IV header"))?;
         let iv = base64::engine::general_purpose::STANDARD
-            .decode(iv)
+            .decode(iv.trim())
             .map_err(|e| KmsError::validation_error(format!("Invalid IV: {e}")))?;
 
         let tag = if let Some(tag_str) = headers.get("x-rustfs-encryption-tag") {
@@ -678,7 +689,7 @@ impl ObjectEncryptionService {
 
         let encrypted_data_key = if let Some(key_str) = headers.get("x-rustfs-encryption-key") {
             base64::engine::general_purpose::STANDARD
-                .decode(key_str)
+                .decode(key_str.trim())
                 .map_err(|e| KmsError::validation_error(format!("Invalid encrypted key: {e}")))?
         } else {
             Vec::new() // Empty for SSE-C
@@ -698,7 +709,7 @@ impl ObjectEncryptionService {
             iv,
             tag,
             encryption_context,
-            encrypted_at: Zoned::now(),
+            encrypted_at: zoned_now_utc(),
             original_size: 0, // Not available from headers
             encrypted_data_key,
         })
@@ -812,20 +823,21 @@ mod tests {
             iv: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             tag: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             encryption_context: HashMap::from([("bucket".to_string(), "test-bucket".to_string())]),
-            encrypted_at: Zoned::now(),
+            encrypted_at: zoned_now_utc(),
             original_size: 100,
             encrypted_data_key: vec![1, 2, 3, 4],
         };
 
-        // Convert to headers
+        // Convert to headers (AES256/SSE-S3: key ID is not stored per S3 semantics)
         let headers = service.metadata_to_headers(&metadata);
         assert!(headers.contains_key("x-amz-server-side-encryption"));
         assert!(headers.contains_key("x-rustfs-encryption-iv"));
+        assert!(!headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
 
-        // Convert back to metadata
+        // Convert back to metadata; key_id falls back to "default" when header is omitted for AES256
         let parsed_metadata = service.headers_to_metadata(&headers).expect("Failed to parse headers");
         assert_eq!(parsed_metadata.algorithm, metadata.algorithm);
-        assert_eq!(parsed_metadata.key_id, metadata.key_id);
+        assert_eq!(parsed_metadata.key_id, "default");
         assert_eq!(parsed_metadata.iv, metadata.iv);
         assert_eq!(parsed_metadata.tag, metadata.tag);
     }

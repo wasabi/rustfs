@@ -892,7 +892,9 @@ impl LocalDisk {
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
-            .await
+            .await?;
+        get_global_file_cache().invalidate(&file_path).await;
+        Ok(())
     }
     // write_all_internal do write file
     async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {

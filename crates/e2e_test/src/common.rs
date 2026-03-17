@@ -23,6 +23,8 @@
 
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Once;
@@ -44,22 +46,32 @@ pub fn workspace_root() -> PathBuf {
     path
 }
 
+/// Path to the rustfs binary under target (debug or release).
+fn default_rustfs_binary_path() -> PathBuf {
+    let mut path = workspace_root();
+    path.push("target");
+    let profile_dir = if cfg!(debug_assertions) { "debug" } else { "release" };
+    path.push(profile_dir);
+    path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    path
+}
+
 /// Resolve the RustFS binary relative to the workspace.
-/// Always builds the binary to ensure it's up to date.
+/// Uses CARGO_BIN_EXE_rustfs if set (cargo already built it). Otherwise builds rustfs
+/// once and only once per process so e2e tests share a single binary.
 pub fn rustfs_binary_path() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
         return PathBuf::from(path);
     }
 
-    // Always build the binary to ensure it's up to date
-    info!("Building RustFS binary to ensure it's up to date...");
-    build_rustfs_binary();
+    let binary_path = default_rustfs_binary_path();
 
-    let mut binary_path = workspace_root();
-    binary_path.push("target");
-    let profile_dir = if cfg!(debug_assertions) { "debug" } else { "release" };
-    binary_path.push(profile_dir);
-    binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    // Always build once and only once per process so we use a single, consistent binary.
+    static BUILD_ONCE: Once = Once::new();
+    BUILD_ONCE.call_once(|| {
+        info!("Building RustFS binary once at {:?}...", binary_path);
+        build_rustfs_binary();
+    });
 
     info!("Using RustFS binary at {:?}", binary_path);
     binary_path
@@ -199,6 +211,15 @@ impl RustFSTestEnvironment {
 
     /// Start RustFS server with basic configuration
     pub async fn start_rustfs_server(&mut self, extra_args: Vec<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_with_env(extra_args, &[]).await
+    }
+
+    /// Start RustFS server with optional environment variables (e.g. for scanner speed).
+    pub async fn start_rustfs_server_with_env(
+        &mut self,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.cleanup_existing_processes().await?;
 
         let mut args = vec![
@@ -210,16 +231,44 @@ impl RustFSTestEnvironment {
             &self.secret_key,
         ];
 
-        // Add extra arguments
         args.extend(extra_args);
-
-        // Add temp directory as the last argument
         args.push(&self.temp_dir);
 
         info!("Starting RustFS server with args: {:?}", args);
 
         let binary_path = rustfs_binary_path();
-        let process = Command::new(&binary_path).args(&args).spawn()?;
+        if !binary_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "RustFS binary not found at {:?}. Build it from workspace root with: cargo build --bin rustfs",
+                    binary_path
+                ),
+            )
+            .into());
+        }
+        let mut cmd = Command::new(&binary_path);
+        cmd.args(&args);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        // Run server in its own process group so it does not receive signals
+        // sent to the test runner (e.g. SIGTERM), which could cause mid-test shutdown.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let process = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "RustFS binary not found at {:?}. Build it from workspace root with: cargo build --bin rustfs",
+                        binary_path
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
 
         self.process = Some(process);
 
@@ -333,7 +382,19 @@ pub async fn execute_awscurl(
 
     info!("Executing awscurl: {} {}", method, url);
     let awscurl_path = awscurl_binary_path();
-    let output = Command::new(&awscurl_path).args(&args).output()?;
+    let output = Command::new(&awscurl_path).args(&args).output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "awscurl not found at {:?}. Install it (e.g. pip install awscurl) or set AWSCURL_PATH to the binary.",
+                    awscurl_path
+                ),
+            )
+        } else {
+            e
+        }
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

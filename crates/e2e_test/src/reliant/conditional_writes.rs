@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -7,19 +8,19 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use serial_test::serial;
-use std::error::Error;
 
-const ENDPOINT: &str = "http://localhost:9000";
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 const ACCESS_KEY: &str = "rustfsadmin";
 const SECRET_KEY: &str = "rustfsadmin";
 const BUCKET: &str = "api-test";
 
-async fn create_aws_s3_client() -> Result<Client, Box<dyn Error>> {
+async fn create_aws_s3_client(endpoint_url: &str) -> Result<Client, BoxError> {
     let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
     let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region_provider)
         .credentials_provider(Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "static"))
-        .endpoint_url(ENDPOINT)
+        .endpoint_url(endpoint_url)
         .load()
         .await;
 
@@ -33,7 +34,7 @@ async fn create_aws_s3_client() -> Result<Client, Box<dyn Error>> {
 }
 
 /// Setup test bucket, creating it if it doesn't exist
-async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn setup_test_bucket(client: &Client) -> Result<(), BoxError> {
     match client.create_bucket().bucket(BUCKET).send().await {
         Ok(_) => {}
         Err(SdkError::ServiceError(e)) => {
@@ -61,7 +62,7 @@ fn generate_test_data(size: usize) -> Vec<u8> {
 }
 
 /// Upload an object and return its ETag
-async fn upload_object_with_metadata(client: &Client, bucket: &str, key: &str, data: &[u8]) -> Result<String, Box<dyn Error>> {
+async fn upload_object_with_metadata(client: &Client, bucket: &str, key: &str, data: &[u8]) -> Result<String, BoxError> {
     let response = client
         .put_object()
         .bucket(bucket)
@@ -90,9 +91,11 @@ fn generate_test_key(prefix: &str) -> String {
 
 #[tokio::test]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_conditional_put_okay() -> Result<(), Box<dyn std::error::Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_conditional_put_okay() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
 
     let test_key = generate_test_key("conditional-put-ok");
@@ -133,9 +136,11 @@ async fn test_conditional_put_okay() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_conditional_put_failed() -> Result<(), Box<dyn std::error::Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_conditional_put_failed() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
 
     let test_key = generate_test_key("conditional-put-failed");
@@ -196,9 +201,11 @@ async fn test_conditional_put_failed() -> Result<(), Box<dyn std::error::Error>>
 
 #[tokio::test]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_conditional_put_when_object_does_not_exist() -> Result<(), Box<dyn std::error::Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_conditional_put_when_object_does_not_exist() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
 
     let key = "some_key";
@@ -241,9 +248,11 @@ async fn test_conditional_put_when_object_does_not_exist() -> Result<(), Box<dyn
 
 #[tokio::test]
 #[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_conditional_multi_part_upload() -> Result<(), Box<dyn std::error::Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_conditional_multi_part_upload() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = create_aws_s3_client(&env.url).await?;
     setup_test_bucket(&client).await?;
 
     let test_key = generate_test_key("multipart-upload-ok");

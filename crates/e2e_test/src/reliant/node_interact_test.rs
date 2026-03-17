@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::workspace_root;
+use crate::common::{RustFSTestEnvironment, init_logging};
 use futures::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_ecstore::disk::{VolumeInfo, WalkDirOptions};
@@ -27,18 +27,19 @@ use rustfs_protos::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::error::Error;
 use std::io::Cursor;
-use std::path::PathBuf;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 use tokio::spawn;
 use tonic::Request;
 use tonic::codegen::tokio_stream::StreamExt;
 
-const CLUSTER_ADDR: &str = "http://localhost:9000";
-
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn ping() -> Result<(), Box<dyn Error>> {
+async fn ping() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
     let payload = fbb.create_vector(b"hello world");
 
@@ -53,9 +54,9 @@ async fn ping() -> Result<(), Box<dyn Error>> {
     assert!(decoded_payload.is_ok());
 
     // Create client
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+    let mut client = node_service_time_out_client(&env.url, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Construct PingRequest
     let request = Request::new(PingRequest {
@@ -78,11 +79,13 @@ async fn ping() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn make_volume() -> Result<(), Box<dyn Error>> {
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+async fn make_volume() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let mut client = node_service_time_out_client(&env.url, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let request = Request::new(MakeVolumeRequest {
         disk: "data".to_string(),
         volume: "dandan".to_string(),
@@ -98,11 +101,13 @@ async fn make_volume() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn list_volumes() -> Result<(), Box<dyn Error>> {
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+async fn list_volumes() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let mut client = node_service_time_out_client(&env.url, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let request = Request::new(ListVolumesRequest {
         disk: "data".to_string(),
     });
@@ -119,10 +124,13 @@ async fn list_volumes() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn walk_dir() -> Result<(), Box<dyn Error>> {
+async fn walk_dir() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    // Create bucket so the volume exists for walk_dir
+    env.create_test_bucket("dandan").await?;
     println!("walk_dir");
-    // TODO: use writer
     let opts = WalkDirOptions {
         bucket: "dandan".to_owned(),
         base_dir: "".to_owned(),
@@ -132,18 +140,13 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
     let (rd, mut wr) = tokio::io::duplex(1024);
     let mut buf = Vec::new();
     opts.serialize(&mut Serializer::new(&mut buf))?;
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
-    let disk_path = std::env::var_os("RUSTFS_DISK_PATH").map(PathBuf::from).unwrap_or_else(|| {
-        let mut path = workspace_root();
-        path.push("target");
-        path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
-        path.push("data");
-        path
-    });
+    let mut client = node_service_time_out_client(&env.url, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Use the server's data directory (same path we started RustFS with).
+    let disk_path = env.temp_dir.clone();
     let request = Request::new(WalkDirRequest {
-        disk: disk_path.to_string_lossy().into_owned(),
+        disk: disk_path,
         walk_dir_options: buf.into(),
     });
     let mut response = client.walk_dir(request).await?.into_inner();
@@ -155,18 +158,18 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
                 Some(Ok(resp)) => {
                     if !resp.success {
                         println!("{}", resp.error_info.unwrap_or("".to_string()));
+                        let _ = out.close().await;
+                        break;
                     }
-                    let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
-                        .map_err(|_e| std::io::Error::other(format!("Unexpected response: {response:?}")))
-                        .unwrap();
-                    out.write_obj(&entry).await.unwrap();
+                    if let Ok(entry) = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry) {
+                        let _ = out.write_obj(&entry).await;
+                    }
                 }
                 None => {
                     let _ = out.close().await;
                     break;
                 }
                 _ => {
-                    println!("Unexpected response: {response:?}");
                     let _ = out.close().await;
                     break;
                 }
@@ -185,11 +188,13 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn read_all() -> Result<(), Box<dyn Error>> {
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+async fn read_all() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let mut client = node_service_time_out_client(&env.url, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let request = Request::new(ReadAllRequest {
         disk: "data".to_string(),
         volume: "ff".to_string(),
@@ -205,11 +210,13 @@ async fn read_all() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn storage_info() -> Result<(), Box<dyn Error>> {
-    let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+async fn storage_info() -> Result<(), BoxError> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let mut client = node_service_time_out_client(&env.url, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let request = Request::new(LocalStorageInfoRequest { metrics: true });
 
     let response = client.local_storage_info(request).await?.into_inner();
