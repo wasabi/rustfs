@@ -41,9 +41,18 @@ inputs:
     required: false
     default: ""
 
+  configure-cargo-jobs:
+    description: "Set CARGO_BUILD_JOBS from CPU and available memory"
+    required: false
+    default: "true"
+
 runs:
   using: "composite"
   steps:
+    - name: Configure Cargo build parallelism
+      if: inputs.configure-cargo-jobs == 'true'
+      uses: ./.github/actions/cargo-build-jobs
+
     - name: Install system dependencies (Ubuntu)
       if: runner.os == 'Linux'
       shell: bash
