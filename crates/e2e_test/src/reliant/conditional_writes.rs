@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use crate::common::external_rustfs_http_url;
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -8,8 +9,6 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use serial_test::serial;
 use std::error::Error;
-
-const ENDPOINT: &str = "http://localhost:9000";
 const ACCESS_KEY: &str = "rustfsadmin";
 const SECRET_KEY: &str = "rustfsadmin";
 const BUCKET: &str = "api-test";
@@ -19,7 +18,7 @@ async fn create_aws_s3_client() -> Result<Client, Box<dyn Error>> {
     let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region_provider)
         .credentials_provider(Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "static"))
-        .endpoint_url(ENDPOINT)
+        .endpoint_url(external_rustfs_http_url())
         .load()
         .await;
 

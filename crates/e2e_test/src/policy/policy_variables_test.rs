@@ -14,7 +14,7 @@
 
 //! Tests for AWS IAM policy variables with single-value, multi-value, and nested scenarios
 
-use crate::common::{awscurl_put, init_logging};
+use crate::common::{awscurl_put, external_rustfs_socket_addr, init_logging};
 use crate::policy::test_env::PolicyTestEnvironment;
 use aws_sdk_s3::primitives::ByteStream;
 use serial_test::serial;
@@ -133,7 +133,7 @@ pub async fn test_aws_policy_variables_single_value_impl() -> Result<(), Box<dyn
     init_logging();
     info!("Starting AWS policy variables single-value test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let env = PolicyTestEnvironment::with_address(&external_rustfs_socket_addr()).await?;
 
     test_aws_policy_variables_single_value_impl_with_env(&env).await
 }
@@ -286,7 +286,7 @@ pub async fn test_aws_policy_variables_multi_value_impl() -> Result<(), Box<dyn 
     init_logging();
     info!("Starting AWS policy variables multi-value test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let env = PolicyTestEnvironment::with_address(&external_rustfs_socket_addr()).await?;
 
     test_aws_policy_variables_multi_value_impl_with_env(&env).await
 }
@@ -412,7 +412,7 @@ pub async fn test_aws_policy_variables_concatenation_impl() -> Result<(), Box<dy
     init_logging();
     info!("Starting AWS policy variables concatenation test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let env = PolicyTestEnvironment::with_address(&external_rustfs_socket_addr()).await?;
 
     test_aws_policy_variables_concatenation_impl_with_env(&env).await
 }
@@ -502,7 +502,7 @@ pub async fn test_aws_policy_variables_nested_impl() -> Result<(), Box<dyn std::
     init_logging();
     info!("Starting AWS policy variables nested test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let env = PolicyTestEnvironment::with_address(&external_rustfs_socket_addr()).await?;
 
     test_aws_policy_variables_nested_impl_with_env(&env).await
 }
@@ -520,7 +520,7 @@ pub async fn test_aws_policy_variables_sts_impl() -> Result<(), Box<dyn std::err
     init_logging();
     info!("Starting AWS policy variables STS test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let env = PolicyTestEnvironment::with_address(&external_rustfs_socket_addr()).await?;
 
     test_aws_policy_variables_sts_impl_with_env(&env).await
 }
@@ -716,7 +716,7 @@ pub async fn test_aws_policy_variables_deny_impl() -> Result<(), Box<dyn std::er
     init_logging();
     info!("Starting AWS policy variables deny test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let env = PolicyTestEnvironment::with_address(&external_rustfs_socket_addr()).await?;
 
     test_aws_policy_variables_deny_impl_with_env(&env).await
 }

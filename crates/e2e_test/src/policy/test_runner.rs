@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::init_logging;
+use crate::common::{external_rustfs_socket_addr, init_logging};
 use crate::policy::test_env::PolicyTestEnvironment;
 use serial_test::serial;
 use std::time::Instant;
@@ -121,7 +121,7 @@ impl PolicyTestSuite {
         let mut results = Vec::new();
 
         // Create test environment
-        let env = match PolicyTestEnvironment::with_address("127.0.0.1:9000").await {
+        let env = match PolicyTestEnvironment::with_address(&external_rustfs_socket_addr()).await {
             Ok(env) => env,
             Err(e) => {
                 error!("Failed to create test environment: {}", e);
