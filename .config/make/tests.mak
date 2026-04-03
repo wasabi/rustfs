@@ -15,7 +15,7 @@ test: core-deps test-deps ## Run all tests
 
 .PHONY: e2e-server
 e2e-server: ## Run e2e-server tests
-	sh $(shell pwd)/scripts/run.sh
+	bash $(shell pwd)/scripts/run.sh
 
 .PHONY: probe-e2e
 probe-e2e: ## Probe e2e tests

@@ -238,6 +238,7 @@ jobs:
 
       - name: Run implemented s3-tests
         run: |
+          export S3_PORT="$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")"
           DEPLOY_MODE=binary \
           RUSTFS_BINARY=./target/debug/rustfs \
           TEST_MODE=single \

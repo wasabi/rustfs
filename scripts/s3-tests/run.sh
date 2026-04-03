@@ -708,7 +708,7 @@ log_info "Using template: ${TEMPLATE_PATH}"
 log_info "Generating config: ${CONF_OUTPUT_PATH}"
 
 # Export all required variables for envsubst
-export S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_ALT_ACCESS_KEY S3_ALT_SECRET_KEY
+export S3_HOST S3_PORT S3_ACCESS_KEY S3_SECRET_KEY S3_ALT_ACCESS_KEY S3_ALT_SECRET_KEY
 envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
     log_error "Failed to generate s3tests config"
     exit 1
