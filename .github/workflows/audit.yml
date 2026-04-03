@@ -46,6 +46,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Configure Cargo build parallelism
+        uses: ./.github/actions/cargo-build-jobs
+
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
         with:

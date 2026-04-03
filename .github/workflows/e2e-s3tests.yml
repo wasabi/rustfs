@@ -101,9 +101,11 @@ jobs:
 
       - name: Start single RustFS
         run: |
+          S3_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")
+          echo "S3_PORT=${S3_PORT}" >> "$GITHUB_ENV"
           docker run -d --name rustfs-single \
             --network rustfs-net \
-            -p 9000:9000 \
+            -p "${S3_PORT}:9000" \
             -e RUSTFS_ADDRESS=0.0.0.0:9000 \
             -e RUSTFS_ACCESS_KEY=$S3_ACCESS_KEY \
             -e RUSTFS_SECRET_KEY=$S3_SECRET_KEY \
@@ -114,7 +116,7 @@ jobs:
       - name: Wait for RustFS ready
         run: |
           for i in {1..60}; do
-            if curl -sf http://127.0.0.1:9000/health >/dev/null 2>&1; then
+            if curl -sf "http://127.0.0.1:${S3_PORT}/health" >/dev/null 2>&1; then
               echo "RustFS is ready"
               exit 0
             fi
@@ -135,6 +137,7 @@ jobs:
       - name: Generate s3tests config
         run: |
           export S3_HOST=127.0.0.1
+          export S3_PORT="${S3_PORT}"
           envsubst < .github/s3tests/s3tests.conf > s3tests.conf
 
       - name: Provision s3-tests alt user (required by suite)
@@ -148,7 +151,7 @@ jobs:
             -X PUT \
             -H 'Content-Type: application/json' \
             -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled","policy":"readwrite"}' \
-            "http://127.0.0.1:9000/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
+            "http://127.0.0.1:${S3_PORT}/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
 
           # Explicitly attach built-in policy via policy mapping.
           # s3-tests relies on alt client being able to ListBuckets during setup cleanup.
@@ -158,7 +161,7 @@ jobs:
             --access_key "${S3_ACCESS_KEY}" \
             --secret_key "${S3_SECRET_KEY}" \
             -X PUT \
-            "http://127.0.0.1:9000/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ALT_ACCESS_KEY}&isGroup=false"
+            "http://127.0.0.1:${S3_PORT}/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ALT_ACCESS_KEY}&isGroup=false"
 
           # Sanity check: alt user can list buckets (should not be AccessDenied).
           awscurl \
@@ -167,7 +170,7 @@ jobs:
             --access_key "${S3_ALT_ACCESS_KEY}" \
             --secret_key "${S3_ALT_SECRET_KEY}" \
             -X GET \
-            "http://127.0.0.1:9000/" >/dev/null
+            "http://127.0.0.1:${S3_PORT}/" >/dev/null
 
       - name: Prepare s3-tests
         run: |
@@ -255,9 +258,14 @@ jobs:
             -t rustfs-ci \
             -f Dockerfile.source .
 
+      - name: Pick S3 host port for load balancer
+        run: |
+          S3_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")
+          echo "S3_PORT=${S3_PORT}" >> "$GITHUB_ENV"
+
       - name: Prepare cluster compose
         run: |
-          cat > compose.yml <<'EOF'
+          cat > compose.yml <<EOF
           services:
             rustfs1:
               image: rustfs-ci
@@ -308,7 +316,7 @@ jobs:
               hostname: lb
               networks: [rustfs-net]
               ports:
-                - "9000:9000"
+                - "${S3_PORT}:9000"
               volumes:
                 - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
           networks:
@@ -346,7 +354,7 @@ jobs:
       - name: Wait for LB ready
         run: |
           for i in {1..90}; do
-            if curl -sf http://127.0.0.1:9000/health >/dev/null 2>&1; then
+            if curl -sf "http://127.0.0.1:${S3_PORT}/health" >/dev/null 2>&1; then
               echo "Load balancer is ready"
               exit 0
             fi
@@ -359,6 +367,7 @@ jobs:
       - name: Generate s3tests config
         run: |
           export S3_HOST=127.0.0.1
+          export S3_PORT="${S3_PORT}"
           envsubst < .github/s3tests/s3tests.conf > s3tests.conf
 
       - name: Provision s3-tests alt user (required by suite)
@@ -371,7 +380,7 @@ jobs:
             -X PUT \
             -H 'Content-Type: application/json' \
             -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled","policy":"readwrite"}' \
-            "http://127.0.0.1:9000/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
+            "http://127.0.0.1:${S3_PORT}/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
 
           awscurl \
             --service s3 \
@@ -379,7 +388,7 @@ jobs:
             --access_key "${S3_ACCESS_KEY}" \
             --secret_key "${S3_SECRET_KEY}" \
             -X PUT \
-            "http://127.0.0.1:9000/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ALT_ACCESS_KEY}&isGroup=false"
+            "http://127.0.0.1:${S3_PORT}/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ALT_ACCESS_KEY}&isGroup=false"
 
           awscurl \
             --service s3 \
@@ -387,7 +396,7 @@ jobs:
             --access_key "${S3_ALT_ACCESS_KEY}" \
             --secret_key "${S3_ALT_SECRET_KEY}" \
             -X GET \
-            "http://127.0.0.1:9000/" >/dev/null
+            "http://127.0.0.1:${S3_PORT}/" >/dev/null
 
       - name: Prepare s3-tests
         run: |

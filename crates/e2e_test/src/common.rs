@@ -20,6 +20,15 @@
 //! - AWS S3 client creation and configuration
 //! - Basic health checks and server readiness detection
 //! - Common test constants and utilities
+//!
+//! ## Shared self-hosted runners
+//!
+//! - `RUSTFS_E2E_EXTERNAL_ADDR`: `host:port` for tests that expect a **pre-started** RustFS (policy
+//!   suite, `scripts/run_e2e_tests.sh`). Default `127.0.0.1:9000`.
+//! - `RUSTFS_E2E_EXTERNAL_URL`: optional full base URL (`http://host:port`) for reliant tests;
+//!   default is `http://` + [`external_rustfs_socket_addr`].
+//! - `RUSTFS_E2E_KILL_EXISTING`: set to `1`/`true`/`yes` to run `pkill` before spawning test
+//!   servers. **Off by default** so a long-lived RustFS on `:9000` is not killed.
 
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
@@ -37,6 +46,23 @@ use uuid::Uuid;
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
+
+/// `host:port` for tests that attach to a RustFS started outside the test process.
+pub fn external_rustfs_socket_addr() -> String {
+    std::env::var("RUSTFS_E2E_EXTERNAL_ADDR").unwrap_or_else(|_| "127.0.0.1:9000".to_string())
+}
+
+/// HTTP endpoint for ignored reliant tests (external RustFS).
+pub fn external_rustfs_http_url() -> String {
+    std::env::var("RUSTFS_E2E_EXTERNAL_URL").unwrap_or_else(|_| format!("http://{}", external_rustfs_socket_addr()))
+}
+
+fn kill_existing_rustfs_processes_enabled() -> bool {
+    matches!(
+        std::env::var("RUSTFS_E2E_KILL_EXISTING").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
 pub fn workspace_root() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop(); // e2e_test
@@ -181,9 +207,14 @@ impl RustFSTestEnvironment {
         Ok(port)
     }
 
-    /// Kill any existing RustFS processes
+    /// Kill any existing RustFS processes (only if `RUSTFS_E2E_KILL_EXISTING` is set).
     pub async fn cleanup_existing_processes(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Cleaning up any existing RustFS processes");
+        if !kill_existing_rustfs_processes_enabled() {
+            info!("Skipping pkill of RustFS (set RUSTFS_E2E_KILL_EXISTING=1 to enable)");
+            return Ok(());
+        }
+
+        info!("Cleaning up any existing RustFS processes (RUSTFS_E2E_KILL_EXISTING is set)");
         let binary_path = rustfs_binary_path();
         let binary_name = binary_path.to_string_lossy();
         let output = Command::new("pkill").args(["-f", &binary_name]).output();

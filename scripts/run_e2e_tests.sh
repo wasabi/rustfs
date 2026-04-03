@@ -21,6 +21,20 @@ RUSTFS_PID=""
 TEST_FILTER=""
 TEST_TYPE="all"
 
+# Free TCP port for this script's RustFS (avoids clashing with another instance on :9000).
+pick_rustfs_http_port() {
+    if [ -n "${RUSTFS_E2E_HTTP_PORT:-}" ]; then
+        echo "$RUSTFS_E2E_HTTP_PORT"
+        return
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()"
+    else
+        echo "[WARNING] python3 not found; using port 19001 (set RUSTFS_E2E_HTTP_PORT to pick explicitly)" >&2
+        echo "19001"
+    fi
+}
+
 # Function to print colored output
 print_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -48,7 +62,11 @@ Options:
     -t, --test <pattern>    Run specific test(s) matching pattern
     -f, --file <file>       Run all tests in specific file (e.g., sql, basic)
     -a, --all               Run all e2e tests (default)
-    
+
+Environment:
+    RUSTFS_E2E_HTTP_PORT    Listen port for RustFS (default: ephemeral via python3, else 19001)
+    RUSTFS_E2E_EXTERNAL_ADDR  host:port for policy / external tests (set automatically from the port above)
+
 Examples:
     $0                                          # Run all e2e tests
     $0 -t test_select_object_content_csv_basic  # Run specific test
@@ -136,7 +154,7 @@ start_rustfs() {
     cd "$TARGET_DIR"
     RUSTFS_ACCESS_KEY=rustfsadmin RUSTFS_SECRET_KEY=rustfsadmin \
     RUSTFS_OBS_LOG_DIRECTORY="$TARGET_DIR/logs" \
-    ./rustfs --address :9000 "$DATA_DIR" > rustfs.log 2>&1 &
+    ./rustfs --address ":${RUSTFS_HTTP_PORT}" "$DATA_DIR" > rustfs.log 2>&1 &
     RUSTFS_PID=$!
     
     print_info "RustFS started with PID: $RUSTFS_PID"
@@ -159,21 +177,21 @@ start_rustfs() {
         fi
         
         # Try simple HTTP connection first (most reliable)
-        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:9000/" >/dev/null 2>&1; then
+        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:${RUSTFS_HTTP_PORT}/" >/dev/null 2>&1; then
             print_success "RustFS is ready!"
             return 0
         fi
         
         # Try health endpoint if available
-        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:9000/health" >/dev/null 2>&1; then
+        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:${RUSTFS_HTTP_PORT}/health" >/dev/null 2>&1; then
             print_success "RustFS is ready!"
             return 0
         fi
         
         # Try port connectivity check (faster than HTTP)
-        if nc -z localhost 9000 2>/dev/null; then
-            print_info "Port 9000 is open, verifying HTTP response..."
-            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:9000/" >/dev/null 2>&1; then
+        if nc -z localhost "${RUSTFS_HTTP_PORT}" 2>/dev/null; then
+            print_info "Port ${RUSTFS_HTTP_PORT} is open, verifying HTTP response..."
+            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:${RUSTFS_HTTP_PORT}/" >/dev/null 2>&1; then
                 print_success "RustFS is ready!"
                 return 0
             fi
@@ -193,12 +211,12 @@ start_rustfs() {
         
         # Quick final attempts with shorter timeouts
         for i in 1 2 3; do
-            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:9000/" >/dev/null 2>&1; then
+            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:${RUSTFS_HTTP_PORT}/" >/dev/null 2>&1; then
                 print_success "RustFS is now ready!"
                 return 0
             fi
-            if nc -z localhost 9000 2>/dev/null; then
-                print_info "Port 9000 is accessible, continuing with tests..."
+            if nc -z localhost "${RUSTFS_HTTP_PORT}" 2>/dev/null; then
+                print_info "Port ${RUSTFS_HTTP_PORT} is accessible, continuing with tests..."
                 return 0
             fi
             sleep 1
@@ -288,6 +306,11 @@ main() {
     
     # Build RustFS
     build_rustfs
+
+    RUSTFS_HTTP_PORT="$(pick_rustfs_http_port)"
+    export RUSTFS_HTTP_PORT
+    export RUSTFS_E2E_EXTERNAL_ADDR="127.0.0.1:${RUSTFS_HTTP_PORT}"
+    print_info "RustFS test port: ${RUSTFS_HTTP_PORT} (RUSTFS_E2E_EXTERNAL_ADDR=${RUSTFS_E2E_EXTERNAL_ADDR})"
     
     # Start RustFS
     if ! start_rustfs; then

@@ -5,6 +5,20 @@
 
 set -e
 
+# Default rustc parallelism when not set (e.g. invoking this script without make).
+ensure_cargo_build_jobs() {
+    if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
+        return 0
+    fi
+    local repo_root
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local compute="${repo_root}/scripts/ci/compute-cargo-build-jobs.sh"
+    if [[ -f "$compute" ]]; then
+        CARGO_BUILD_JOBS="$(bash "$compute" --value-only 2>/dev/null || echo 2)"
+        export CARGO_BUILD_JOBS
+    fi
+}
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -587,6 +601,8 @@ main() {
         print_message $RED "❌ No Cargo.toml found. Are you in a Rust project directory?"
         exit 1
     fi
+
+    ensure_cargo_build_jobs
 
     # Override platform if specified
     if [ -n "$CUSTOM_PLATFORM" ]; then

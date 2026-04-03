@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::workspace_root;
+use crate::common::{external_rustfs_http_url, workspace_root};
 use futures::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_ecstore::disk::{VolumeInfo, WalkDirOptions};
@@ -34,8 +34,6 @@ use tokio::spawn;
 use tonic::Request;
 use tonic::codegen::tokio_stream::StreamExt;
 
-const CLUSTER_ADDR: &str = "http://localhost:9000";
-
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn ping() -> Result<(), Box<dyn Error>> {
@@ -52,10 +50,10 @@ async fn ping() -> Result<(), Box<dyn Error>> {
     let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
     assert!(decoded_payload.is_ok());
 
+    let cluster_addr = external_rustfs_http_url();
     // Create client
     let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+        node_service_time_out_client(&cluster_addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor())).await?;
 
     // Construct PingRequest
     let request = Request::new(PingRequest {
@@ -80,9 +78,9 @@ async fn ping() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn make_volume() -> Result<(), Box<dyn Error>> {
+    let cluster_addr = external_rustfs_http_url();
     let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+        node_service_time_out_client(&cluster_addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor())).await?;
     let request = Request::new(MakeVolumeRequest {
         disk: "data".to_string(),
         volume: "dandan".to_string(),
@@ -100,9 +98,9 @@ async fn make_volume() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn list_volumes() -> Result<(), Box<dyn Error>> {
+    let cluster_addr = external_rustfs_http_url();
     let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+        node_service_time_out_client(&cluster_addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor())).await?;
     let request = Request::new(ListVolumesRequest {
         disk: "data".to_string(),
     });
@@ -132,9 +130,9 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
     let (rd, mut wr) = tokio::io::duplex(1024);
     let mut buf = Vec::new();
     opts.serialize(&mut Serializer::new(&mut buf))?;
+    let cluster_addr = external_rustfs_http_url();
     let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+        node_service_time_out_client(&cluster_addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor())).await?;
     let disk_path = std::env::var_os("RUSTFS_DISK_PATH").map(PathBuf::from).unwrap_or_else(|| {
         let mut path = workspace_root();
         path.push("target");
@@ -187,9 +185,9 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn read_all() -> Result<(), Box<dyn Error>> {
+    let cluster_addr = external_rustfs_http_url();
     let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+        node_service_time_out_client(&cluster_addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor())).await?;
     let request = Request::new(ReadAllRequest {
         disk: "data".to_string(),
         volume: "ff".to_string(),
@@ -207,9 +205,9 @@ async fn read_all() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn storage_info() -> Result<(), Box<dyn Error>> {
+    let cluster_addr = external_rustfs_http_url();
     let mut client =
-        node_service_time_out_client(&CLUSTER_ADDR.to_string(), TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await?;
+        node_service_time_out_client(&cluster_addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor())).await?;
     let request = Request::new(LocalStorageInfoRequest { metrics: true });
 
     let response = client.local_storage_info(request).await?.into_inner();

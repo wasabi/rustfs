@@ -48,6 +48,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Configure Cargo / Nix build parallelism
+        uses: ./.github/actions/cargo-build-jobs
+
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
@@ -65,12 +68,12 @@ jobs:
         run: |
           echo "Checking flake structure and evaluation..."
           nix flake show
-          nix flake check --print-build-logs
+          nix flake check --max-jobs "$CARGO_BUILD_JOBS" --print-build-logs
 
       - name: Build RustFS
         run: |
           echo "Building the default package..."
-          nix build .#default --print-build-logs
+          nix build .#default --max-jobs "$CARGO_BUILD_JOBS" --print-build-logs
 
       - name: Test Binary
         run: |

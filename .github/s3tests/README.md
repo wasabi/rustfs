@@ -8,8 +8,8 @@ The `s3tests.conf` file is based on the official `s3tests.conf.SAMPLE` from the 
 
 ### Key Configuration Points
 
-- **Host**: Set via `${S3_HOST}` environment variable (e.g., `rustfs-single` for single-node, `lb` for multi-node)
-- **Port**: 9000 (standard RustFS port)
+- **Host**: Set via `${S3_HOST}` environment variable (e.g., `127.0.0.1` on the runner, `rustfs-single` inside `rustfs-net`)
+- **Port**: Set via `${S3_PORT}` (host port; use `9000` when publishing `:9000`, or an ephemeral port when avoiding conflicts on shared runners)
 - **Credentials**: Uses `${S3_ACCESS_KEY}` and `${S3_SECRET_KEY}` from workflow environment
 - **TLS**: Disabled (`is_secure = False`)
 
@@ -62,6 +62,7 @@ docker run -d --name rustfs-single \
 
 # Generate config
 export S3_HOST=rustfs-single
+export S3_PORT=9000
 envsubst < .github/s3tests/s3tests.conf > /tmp/s3tests.conf
 
 # Run tests
