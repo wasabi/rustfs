@@ -44,6 +44,32 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # Workflow env cannot use runner context; set parallelism here so cargo respects CARGO_BUILD_JOBS.
+    # labs-large runners get 40 jobs; all others keep the workflow default (2).
+    - name: Set CARGO_BUILD_JOBS from runner (labs-large → 40)
+      shell: bash
+      env:
+        RUNNER_JSON: ${{ toJson(runner) }}
+      run: |
+        set -euo pipefail
+        jobs=2
+        if [[ "${RUNNER_JSON}" == *labs-large* ]]; then
+          jobs=40
+        elif [[ "${RUNNER_LABELS:-}" == *labs-large* ]]; then
+          jobs=40
+        else
+          for f in "${RUNNER_HOME:-}/.runner" "${HOME}/actions-runner/.runner" "/home/runner/actions-runner/.runner"; do
+            [ -n "${f:-}" ] || continue
+            [ -f "$f" ] || continue
+            if grep -q 'labs-large' "$f" 2>/dev/null; then
+              jobs=40
+              break
+            fi
+          done
+        fi
+        echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+        echo "Set CARGO_BUILD_JOBS=$jobs"
+
     - name: Install system dependencies (Ubuntu)
       if: runner.os == 'Linux'
       shell: bash
