@@ -33,7 +33,9 @@ current_dir=$(pwd)
 echo "Current directory: $current_dir"
 
 # mkdir -p ./target/volume/test
-mkdir -p ./target/volume/test{1..4}
+# Note: this script may be invoked as `sh scripts/run.sh` (e.g. make e2e-server).
+# POSIX sh does not expand bash-style {1..4}; create each path explicitly.
+mkdir -p ./target/volume/test1 ./target/volume/test2 ./target/volume/test3 ./target/volume/test4
 
 
 if [ -z "$RUST_LOG" ]; then
