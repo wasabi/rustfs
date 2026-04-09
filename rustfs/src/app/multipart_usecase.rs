@@ -15,13 +15,15 @@
 //! Multipart application use-case contracts.
 
 use crate::app::context::{AppContext, get_global_app_context};
+use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
 use crate::error::ApiError;
+use crate::storage::access::has_bypass_governance_header;
 use crate::storage::concurrency::get_concurrency_manager;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
-    complete_multipart_upload_opts, copy_src_opts, extract_metadata, get_content_sha256_with_query, parse_copy_source_range,
-    put_opts,
+    complete_multipart_upload_opts, copy_src_opts, extract_metadata, get_content_sha256_with_query, get_opts,
+    parse_copy_source_range, put_opts,
 };
 use crate::storage::s3_api::multipart::build_list_parts_output;
 use crate::storage::*;
@@ -34,6 +36,7 @@ use rustfs_ecstore::bucket::{
     metadata_sys,
     quota::QuotaOperation,
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
+    versioning_sys::BucketVersioningSys,
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::is_compressible;
@@ -43,7 +46,7 @@ use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
 use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
-use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
+use rustfs_rio::{CompressReader, HashReader};
 use rustfs_s3_common::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -52,6 +55,7 @@ use rustfs_utils::http::{
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING},
 };
 use s3s::dto::*;
+use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -99,6 +103,13 @@ fn normalize_complete_multipart_parts(parts: Vec<CompletePart>) -> S3Result<Vec<
 
     validate_complete_multipart_parts(&deduped_reversed)?;
     Ok(deduped_reversed)
+}
+
+fn has_complete_multipart_object_lock_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(X_AMZ_OBJECT_LOCK_MODE)
+        || headers.contains_key(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE)
+        || headers.contains_key(X_AMZ_OBJECT_LOCK_LEGAL_HOLD)
+        || has_bypass_governance_header(headers)
 }
 
 fn encode_s3_path(path: &str) -> String {
@@ -286,11 +297,28 @@ impl DefaultMultipartUsecase {
 
         let uploaded_parts = normalize_complete_multipart_parts(uploaded_parts_vec)?;
 
-        // TODO: check object lock
+        if has_complete_multipart_object_lock_headers(&req.headers) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "CompleteMultipartUpload does not accept object lock or governance bypass headers.".to_string(),
+            ));
+        }
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        let current_opts = get_opts(&bucket, &key, None, None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+        match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+            Err(err) => {
+                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    return Err(ApiError::from(err).into());
+                }
+            }
+        }
 
         // TDD: Get multipart info to extract encryption configuration before completing
         info!(
@@ -317,10 +345,13 @@ impl DefaultMultipartUsecase {
             server_side_encryption
         );
 
-        let ssekms_key_id = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .cloned();
+        let ssekms_key_id = match server_side_encryption.as_ref() {
+            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => multipart_info
+                .user_defined
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .cloned(),
+            _ => None,
+        };
 
         info!(
             "TDD: Extracted encryption info - SSE: {:?}, KMS Key: {:?}",
@@ -369,7 +400,12 @@ impl DefaultMultipartUsecase {
         let manager = get_concurrency_manager();
         let mpu_bucket = bucket.clone();
         let mpu_key = key.clone();
-        let mpu_version = obj_info.version_id.map(|v| v.to_string());
+        let raw_mpu_version = obj_info.version_id.map(|v| v.to_string());
+        let mpu_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            raw_mpu_version.clone()
+        } else {
+            None
+        };
         let mpu_version_clone = mpu_version.clone();
         let mpu_version_for_event = mpu_version.clone();
         tokio::spawn(async move {
@@ -483,7 +519,9 @@ impl DefaultMultipartUsecase {
             let _ = context.object_store();
         }
 
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::CreateMultipartUpload);
+        let helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedCreateMultipartUpload, S3Operation::CreateMultipartUpload)
+                .suppress_event();
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -494,8 +532,19 @@ impl DefaultMultipartUsecase {
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
+            object_lock_legal_hold_status,
+            object_lock_mode,
+            object_lock_retain_until_date,
             ..
         } = req.input.clone();
+
+        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
+        let ssekms_key_id = ssekms_key_id.or_else(|| {
+            req.headers
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned)
+        });
 
         // Validate storage class if provided
         if let Some(ref storage_class) = storage_class
@@ -512,6 +561,17 @@ impl DefaultMultipartUsecase {
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
+        }
+
+        if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
+            &bucket,
+            object_lock_legal_hold_status,
+            object_lock_mode,
+            object_lock_retain_until_date,
+        )
+        .await?
+        {
+            metadata.extend(object_lock_metadata);
         }
 
         let encryption_request = PrepareEncryptionRequest {
@@ -546,6 +606,18 @@ impl DefaultMultipartUsecase {
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
+
+        let current_opts: ObjectOptions = get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+        match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+            Err(err) => {
+                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    return Err(ApiError::from(err).into());
+                }
+            }
+        }
 
         let checksum_type = rustfs_rio::ChecksumType::from_header(&req.headers);
         if checksum_type.is(rustfs_rio::ChecksumType::INVALID) {
@@ -660,8 +732,6 @@ impl DefaultMultipartUsecase {
 
         let is_compressible = rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
-
         let actual_size = size;
 
         let mut md5hex = if let Some(base64_md5) = input.content_md5 {
@@ -675,21 +745,27 @@ impl DefaultMultipartUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        if is_compressible {
-            let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+        let mut reader = if is_compressible {
+            let mut hrd = HashReader::from_stream(body, size, actual_size, md5hex.take(), sha256hex.take(), false)
+                .map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
-            let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
-            reader = Box::new(compress_reader);
             size = HashReader::SIZE_PRESERVE_LAYER;
-            md5hex = None;
-            sha256hex = None;
-        }
-
-        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+            HashReader::from_reader(
+                CompressReader::new(hrd, CompressionAlgorithm::default()),
+                size,
+                actual_size,
+                None,
+                None,
+                false,
+            )
+            .map_err(ApiError::from)?
+        } else {
+            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+        };
 
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
             return Err(ApiError::from(err).into());
@@ -710,10 +786,13 @@ impl DefaultMultipartUsecase {
                         .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
                 })
                 .transpose()?;
-            let key_id = fi
-                .user_defined
-                .get("x-amz-server-side-encryption-aws-kms-key-id")
-                .map(|s| s.to_string());
+            let key_id = match sse.as_ref() {
+                Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => fi
+                    .user_defined
+                    .get("x-amz-server-side-encryption-aws-kms-key-id")
+                    .map(|s| s.to_string()),
+                _ => None,
+            };
             (sse, key_id)
         };
         let part_key = fi.user_defined.get("x-rustfs-encryption-key").cloned();
@@ -740,8 +819,9 @@ impl DefaultMultipartUsecase {
                 let requested_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
+                reader =
+                    HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                        .map_err(ApiError::from)?;
 
                 fi.user_defined.extend(material.metadata);
 
@@ -1037,8 +1117,6 @@ impl DefaultMultipartUsecase {
 
         let is_compressible = rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(src_stream));
-
         let src_decryption_request = DecryptionRequest {
             bucket: &src_bucket,
             key: &src_key,
@@ -1047,25 +1125,77 @@ impl DefaultMultipartUsecase {
             sse_customer_key_md5: copy_source_sse_customer_key_md5.as_ref(),
             part_number: None,
             parts: &src_info.parts,
+            etag: src_info.etag.as_deref(),
         };
-
-        if let Some(material) = sse_decryption(src_decryption_request).await? {
-            reader = material.wrap_single_reader(reader);
-            if let Some(original) = material.original_size {
-                src_info.actual_size = original;
-            }
-        }
 
         let actual_size = length;
         let mut size = length;
 
-        if is_compressible {
-            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            size = HashReader::SIZE_PRESERVE_LAYER;
-        }
+        let mut reader = match sse_decryption(src_decryption_request).await? {
+            Some(material) => {
+                if let Some(original) = material.original_size {
+                    src_info.actual_size = original;
+                }
 
-        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                if material.is_multipart {
+                    let (decrypted_stream, plaintext_size) =
+                        material.wrap_reader(src_stream, size).await.map_err(ApiError::from)?;
+                    size = plaintext_size;
+
+                    if is_compressible {
+                        let hrd = HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                        size = HashReader::SIZE_PRESERVE_LAYER;
+                        HashReader::from_reader(
+                            CompressReader::new(hrd, CompressionAlgorithm::default()),
+                            size,
+                            actual_size,
+                            None,
+                            None,
+                            false,
+                        )
+                        .map_err(ApiError::from)?
+                    } else {
+                        HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+                    }
+                } else if is_compressible {
+                    let hrd =
+                        HashReader::from_stream(material.wrap_single_reader(src_stream), size, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                    size = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        size,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(material.wrap_single_reader(src_stream), size, actual_size, None, None, false)
+                        .map_err(ApiError::from)?
+                }
+            }
+            None => {
+                if is_compressible {
+                    let hrd =
+                        HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                    size = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        size,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+                }
+            }
+        };
 
         let server_side_encryption = mp_info
             .user_defined
@@ -1075,10 +1205,13 @@ impl DefaultMultipartUsecase {
                     .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
             })
             .transpose()?;
-        let ssekms_key_id = mp_info
-            .user_defined
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .map(|s| s.to_string());
+        let ssekms_key_id = match server_side_encryption.as_ref() {
+            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => mp_info
+                .user_defined
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .map(|s| s.to_string()),
+            _ => None,
+        };
         let part_key = mp_info.user_defined.get("x-rustfs-encryption-key").cloned();
         let part_nonce = mp_info.user_defined.get("x-rustfs-encryption-iv").cloned();
         let encryption_request = EncryptionRequest {
@@ -1103,8 +1236,9 @@ impl DefaultMultipartUsecase {
                 let requested_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
+                reader =
+                    HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                        .map_err(ApiError::from)?;
 
                 mp_info.user_defined.extend(material.metadata);
 
@@ -1318,6 +1452,36 @@ mod tests {
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].part_num, 1);
         assert_eq!(normalized[0].etag.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn execute_complete_multipart_upload_rejects_object_lock_headers() {
+        let multipart_upload = CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                part_number: Some(1),
+                ..Default::default()
+            }]),
+        };
+
+        for (header_name, header_value) in [
+            ("x-amz-object-lock-mode", "GOVERNANCE"),
+            ("x-amz-object-lock-retain-until-date", "2030-01-01T00:00:00Z"),
+            ("x-amz-object-lock-legal-hold", "ON"),
+            ("x-amz-bypass-governance-retention", "true"),
+        ] {
+            let input = CompleteMultipartUploadInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .multipart_upload(Some(multipart_upload.clone()))
+                .build()
+                .unwrap();
+            let mut req = build_request(input, Method::POST);
+            req.headers.insert(header_name, HeaderValue::from_str(header_value).unwrap());
+
+            let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest, "header {header_name} should be rejected");
+        }
     }
 
     #[tokio::test]

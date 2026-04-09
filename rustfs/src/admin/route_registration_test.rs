@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::admin::{
-    handlers::{bucket_meta, heal, health, kms, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user},
+    handlers::{
+        bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts, system,
+        tier, user,
+    },
     router::{AdminOperation, S3Router},
 };
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
@@ -36,23 +39,29 @@ fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
     );
 }
 
+fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
+    health::register_health_route(router).expect("register health route");
+    sts::register_admin_auth_route(router).expect("register sts route");
+    user::register_user_route(router).expect("register user route");
+    system::register_system_route(router).expect("register system route");
+    pools::register_pool_route(router).expect("register pool route");
+    rebalance::register_rebalance_route(router).expect("register rebalance route");
+    heal::register_heal_route(router).expect("register heal route");
+    tier::register_tier_route(router).expect("register tier route");
+    quota::register_quota_route(router).expect("register quota route");
+    bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
+    replication::register_replication_route(router).expect("register replication route");
+    site_replication::register_site_replication_route(router).expect("register site replication route");
+    profile_admin::register_profiling_route(router).expect("register profile route");
+    kms::register_kms_route(router).expect("register kms route");
+    oidc::register_oidc_route(router).expect("register oidc route");
+}
+
 #[test]
 fn test_register_routes_cover_representative_admin_paths() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
 
-    health::register_health_route(&mut router).expect("register health route");
-    sts::register_admin_auth_route(&mut router).expect("register sts route");
-    user::register_user_route(&mut router).expect("register user route");
-    system::register_system_route(&mut router).expect("register system route");
-    pools::register_pool_route(&mut router).expect("register pool route");
-    rebalance::register_rebalance_route(&mut router).expect("register rebalance route");
-    heal::register_heal_route(&mut router).expect("register heal route");
-    tier::register_tier_route(&mut router).expect("register tier route");
-    quota::register_quota_route(&mut router).expect("register quota route");
-    bucket_meta::register_bucket_meta_route(&mut router).expect("register bucket meta route");
-    replication::register_replication_route(&mut router).expect("register replication route");
-    profile_admin::register_profiling_route(&mut router).expect("register profile route");
-    kms::register_kms_route(&mut router).expect("register kms route");
+    register_admin_routes(&mut router);
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
     assert_route(&router, Method::GET, HEALTH_READY_PATH);
@@ -92,11 +101,13 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/pools/list"));
     assert_route(&router, Method::POST, &admin_path("/v3/rebalance/start"));
     assert_route(&router, Method::GET, &admin_path("/v3/rebalance/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/heal/"));
     assert_route(&router, Method::POST, &admin_path("/v3/heal/test-bucket"));
     assert_route(&router, Method::POST, &admin_path("/v3/heal/test-bucket/prefix"));
     assert_route(&router, Method::POST, &admin_path("/v3/background-heal/status"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/tier"));
+    assert_route(&router, Method::GET, &admin_path("/v3/tier/HOT"));
     assert_route(&router, Method::POST, &admin_path("/v3/tier/clear"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-bucket-quota"));
     assert_route(&router, Method::GET, &admin_path("/v3/get-bucket-quota"));
@@ -104,16 +115,46 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/quota-stats/test-bucket"));
 
     assert_route(&router, Method::GET, &admin_path("/export-bucket-metadata"));
+    assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));
     assert_route(&router, Method::PUT, &admin_path("/import-bucket-metadata"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/import-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-remote-targets"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-remote-target"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/add"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/remove"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/info"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/metainfo"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/site-replication/devnull"));
+    assert_route(&router, Method::POST, &admin_path("/v3/site-replication/netperf"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/join"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-ops"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/iam-item"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-meta"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/peer/idp-settings"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/edit"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/edit"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/remove"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/resync/op"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/state/edit"));
     assert_route(&router, Method::GET, &admin_path("/debug/pprof/profile"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/kms/create-key"));
+    assert_route(&router, Method::POST, &admin_path("/v3/kms/key/create"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/configure"));
+    assert_route(&router, Method::GET, &admin_path("/v3/kms/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/kms/status"));
+    assert_route(&router, Method::GET, &admin_path("/v3/kms/key/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys/test-key"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/providers"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/config"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/oidc/config/default"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/oidc/config/default"));
+    assert_route(&router, Method::POST, &admin_path("/v3/oidc/validate"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/authorize/default"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/callback/default"));
 
     assert!(
         !router.contains_route(Method::GET, "/rustfs/rpc/read_file_stream"),
@@ -125,13 +166,7 @@ fn test_register_routes_cover_representative_admin_paths() {
 fn test_admin_alias_paths_match_existing_admin_routes() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
 
-    health::register_health_route(&mut router).expect("register health route");
-    sts::register_admin_auth_route(&mut router).expect("register sts route");
-    user::register_user_route(&mut router).expect("register user route");
-    system::register_system_route(&mut router).expect("register system route");
-    pools::register_pool_route(&mut router).expect("register pool route");
-    rebalance::register_rebalance_route(&mut router).expect("register rebalance route");
-    quota::register_quota_route(&mut router).expect("register quota route");
+    register_admin_routes(&mut router);
 
     for (method, path) in [
         (Method::GET, compat_admin_alias_path("/v3/is-admin")),
@@ -145,10 +180,35 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::PUT, compat_admin_alias_path("/v3/set-policy")),
         (Method::PUT, compat_admin_alias_path("/v3/set-bucket-quota")),
         (Method::GET, compat_admin_alias_path("/v3/get-bucket-quota")),
+        (Method::POST, compat_admin_alias_path("/v3/heal/")),
+        (Method::POST, compat_admin_alias_path("/v3/heal/test-bucket")),
+        (Method::POST, compat_admin_alias_path("/v3/heal/test-bucket/prefix")),
+        (Method::POST, compat_admin_alias_path("/v3/background-heal/status")),
+        (Method::GET, compat_admin_alias_path("/v3/tier/HOT")),
+        (Method::GET, compat_admin_alias_path("/v3/export-bucket-metadata")),
+        (Method::PUT, compat_admin_alias_path("/v3/import-bucket-metadata")),
         (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/attach")),
         (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/detach")),
         (Method::GET, compat_admin_alias_path("/v3/idp/builtin/policy-entities")),
         (Method::POST, compat_admin_alias_path("/v3/rebalance/start")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/providers")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/authorize/default")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/callback/default")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/config")),
+        (Method::PUT, compat_admin_alias_path("/v3/oidc/config/default")),
+        (Method::PUT, compat_admin_alias_path("/v3/site-replication/add")),
+        (Method::GET, compat_admin_alias_path("/v3/site-replication/info")),
+        (Method::GET, compat_admin_alias_path("/v3/site-replication/status")),
+        (Method::PUT, compat_admin_alias_path("/v3/site-replication/peer/join")),
+        (Method::GET, compat_admin_alias_path("/export-bucket-metadata")),
+        (Method::GET, compat_admin_alias_path("/v3/export-bucket-metadata")),
+        (Method::PUT, compat_admin_alias_path("/import-bucket-metadata")),
+        (Method::PUT, compat_admin_alias_path("/v3/import-bucket-metadata")),
+        (Method::POST, compat_admin_alias_path("/v3/kms/key/create")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/keys/test-key")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/status")),
+        (Method::POST, compat_admin_alias_path("/v3/kms/status")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/key/status")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),

@@ -14,6 +14,7 @@
 
 pub(crate) mod app;
 pub(crate) mod body_limits;
+pub(crate) mod capacity;
 pub(crate) mod compress;
 pub(crate) mod console;
 pub(crate) mod env;
@@ -29,3 +30,4 @@ pub(crate) mod scanner;
 pub(crate) mod targets;
 pub(crate) mod tls;
 pub(crate) mod workload;
+pub(crate) mod zero_copy;

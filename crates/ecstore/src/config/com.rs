@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{Config, GLOBAL_STORAGE_CLASS, storageclass};
+use crate::config::{Config, GLOBAL_STORAGE_CLASS, KVS, oidc, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
-use rustfs_config::{DEFAULT_DELIMITER, RUSTFS_REGION};
+use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
+use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -181,6 +182,85 @@ fn parse_inline_block_value(value: &Value) -> Option<String> {
     }
 }
 
+fn parse_oidc_scalar_value(key: &str, value: &Value) -> Option<String> {
+    match value {
+        Value::String(v) => Some(v.trim().to_string()),
+        Value::Bool(v) if key == ENABLE_KEY || key == OIDC_REDIRECT_URI_DYNAMIC => Some(if *v {
+            EnableState::On.to_string()
+        } else {
+            EnableState::Off.to_string()
+        }),
+        Value::Bool(v) => Some(v.to_string()),
+        Value::Number(v) => Some(v.to_string()),
+        Value::Array(values) if key == rustfs_config::oidc::OIDC_SCOPES => {
+            let scopes = values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            Some(scopes)
+        }
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+fn decode_oidc_provider_object(provider: &Map<String, Value>) -> KVS {
+    let mut kvs = oidc::DEFAULT_IDENTITY_OPENID_KVS.clone();
+
+    for (key, value) in provider {
+        if !IDENTITY_OPENID_KEYS.contains(&key.as_str()) || key == COMMENT_KEY {
+            continue;
+        }
+
+        if let Some(parsed) = parse_oidc_scalar_value(key, value) {
+            kvs.insert(key.clone(), parsed);
+        }
+    }
+
+    kvs
+}
+
+fn apply_external_oidc_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
+    let oidc_root = root.get("openid").or_else(|| root.get(IDENTITY_OPENID_SUB_SYS));
+    let Some(Value::Object(oidc_obj)) = oidc_root else {
+        return false;
+    };
+
+    if oidc_obj.is_empty() {
+        return false;
+    }
+
+    let subsystem = cfg.0.entry(IDENTITY_OPENID_SUB_SYS.to_string()).or_default();
+    let mut applied = false;
+
+    for (raw_instance, provider) in oidc_obj {
+        let instance_key = if raw_instance == "default" {
+            DEFAULT_DELIMITER.to_string()
+        } else {
+            raw_instance.to_string()
+        };
+
+        match provider {
+            Value::Object(provider_obj) => {
+                subsystem.insert(instance_key, decode_oidc_provider_object(provider_obj));
+                applied = true;
+            }
+            Value::Array(_) => {
+                if let Ok(kvs) = serde_json::from_value::<KVS>(provider.clone()) {
+                    subsystem.insert(instance_key, kvs);
+                    applied = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    applied
+}
+
 fn apply_external_storage_class_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
     let sc = root.get("storageclass").or_else(|| root.get("storage_class"));
     let Some(Value::Object(sc_obj)) = sc else {
@@ -224,8 +304,9 @@ fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
 
     let mut cfg = Config::new();
     let has_storage = apply_external_storage_class_map(&mut cfg, &root);
+    let has_oidc = apply_external_oidc_map(&mut cfg, &root);
     let has_header = root.contains_key("version") || root.contains_key("region") || root.contains_key("credential");
-    if !has_storage && !has_header {
+    if !has_storage && !has_oidc && !has_header {
         return Err(Error::other("unrecognized external server config shape"));
     }
     Ok(cfg)
@@ -255,6 +336,119 @@ fn build_storageclass_object(cfg: &Config) -> Map<String, Value> {
     sc_obj
 }
 
+fn build_oidc_provider_object(kvs: &KVS) -> Map<String, Value> {
+    let mut provider = Map::new();
+
+    for kv in &kvs.0 {
+        if kv.key == COMMENT_KEY || (kv.hidden_if_empty && kv.value.trim().is_empty()) {
+            continue;
+        }
+
+        if kv.value.trim().is_empty() {
+            continue;
+        }
+
+        if kv.key == ENABLE_KEY || kv.key == OIDC_REDIRECT_URI_DYNAMIC {
+            let enabled = kv
+                .value
+                .parse::<EnableState>()
+                .map(|state| state.is_enabled())
+                .unwrap_or(false);
+            provider.insert(kv.key.clone(), Value::Bool(enabled));
+            continue;
+        }
+
+        if kv.key == rustfs_config::oidc::OIDC_SCOPES {
+            let scopes = kv
+                .value
+                .split(',')
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(|scope| Value::String(scope.to_string()))
+                .collect::<Vec<_>>();
+            provider.insert(kv.key.clone(), Value::Array(scopes));
+            continue;
+        }
+
+        provider.insert(kv.key.clone(), Value::String(kv.value.clone()));
+    }
+
+    provider
+}
+
+fn build_oidc_object(cfg: &Config) -> Map<String, Value> {
+    let Some(subsystem) = cfg.0.get(IDENTITY_OPENID_SUB_SYS) else {
+        return Map::new();
+    };
+
+    let mut providers = subsystem.iter().collect::<Vec<_>>();
+    providers.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+
+    let mut oidc_obj = Map::new();
+    for (instance_key, kvs) in providers {
+        if kvs
+            .lookup(rustfs_config::oidc::OIDC_CONFIG_URL)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            continue;
+        }
+
+        let provider = build_oidc_provider_object(kvs);
+        if provider.is_empty() {
+            continue;
+        }
+
+        let external_key = if instance_key == DEFAULT_DELIMITER {
+            "default".to_string()
+        } else {
+            instance_key.clone()
+        };
+        oidc_obj.insert(external_key, Value::Object(provider));
+    }
+
+    oidc_obj
+}
+
+fn build_semantic_oidc_object(cfg: &Config) -> Map<String, Value> {
+    let Some(subsystem) = cfg.0.get(IDENTITY_OPENID_SUB_SYS) else {
+        return Map::new();
+    };
+
+    let mut providers = subsystem.iter().collect::<Vec<_>>();
+    providers.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+
+    let mut oidc_obj = Map::new();
+    for (instance_key, kvs) in providers {
+        let mut normalized = oidc::DEFAULT_IDENTITY_OPENID_KVS.clone();
+        normalized.extend(kvs.clone());
+
+        if normalized
+            .lookup(rustfs_config::oidc::OIDC_CONFIG_URL)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            continue;
+        }
+
+        let provider = build_oidc_provider_object(&normalized);
+        if provider.is_empty() {
+            continue;
+        }
+
+        let external_key = if instance_key == DEFAULT_DELIMITER {
+            "default".to_string()
+        } else {
+            instance_key.clone()
+        };
+        oidc_obj.insert(external_key, Value::Object(provider));
+    }
+
+    oidc_obj
+}
+
 fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut root = seed.and_then(parse_object_seed).unwrap_or_default();
 
@@ -275,6 +469,15 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
     root.insert("storageclass".to_string(), Value::Object(sc_obj));
     root.remove("storage_class");
 
+    let oidc_obj = build_oidc_object(cfg);
+    if oidc_obj.is_empty() {
+        root.remove("openid");
+        root.remove(IDENTITY_OPENID_SUB_SYS);
+    } else {
+        root.insert("openid".to_string(), Value::Object(oidc_obj));
+        root.remove(IDENTITY_OPENID_SUB_SYS);
+    }
+
     Ok(serde_json::to_vec(&Value::Object(root))?)
 }
 
@@ -292,6 +495,7 @@ fn is_standard_object_server_config(data: &[u8]) -> bool {
 
 fn configs_semantically_equal(lhs: &Config, rhs: &Config) -> bool {
     build_storageclass_object(lhs) == build_storageclass_object(rhs)
+        && build_semantic_oidc_object(lhs) == build_semantic_oidc_object(rhs)
 }
 
 fn is_object_not_found(err: &Error) -> bool {
@@ -506,10 +710,540 @@ async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: 
 mod tests {
     use super::{
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
-        storage_class_kvs_mut,
+        read_config_with_metadata, storage_class_kvs_mut,
     };
-    use crate::config::Config;
+    use crate::config::{Config, oidc};
+    use crate::disk::endpoint::Endpoint;
+    use crate::endpoints::SetupType;
+    use crate::error::{Error, Result};
+    use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
+    use crate::set_disk::SetDisks;
+    use crate::store_api::{
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
+        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, WalkOptions,
+    };
+    use http::HeaderMap;
+    use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
+    use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
+    use rustfs_filemeta::FileInfo;
+    use rustfs_lock::client::LockClient;
+    use rustfs_lock::client::local::LocalClient;
+    use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
     use serde_json::Value;
+    use serial_test::serial;
+    use std::collections::HashMap;
+    use std::fmt::{Debug, Formatter};
+    use std::io::Cursor;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use time::OffsetDateTime;
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug, Default)]
+    struct FailingClient;
+
+    #[async_trait::async_trait]
+    impl LockClient for FailingClient {
+        async fn acquire_lock(&self, _request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
+            Err(LockError::internal("simulated offline client"))
+        }
+
+        async fn release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn force_release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            false
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    struct GuardedCursor {
+        inner: Cursor<Vec<u8>>,
+        _guard: Option<rustfs_lock::NamespaceLockGuard>,
+    }
+
+    impl AsyncRead for GuardedCursor {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    struct LockingConfigStorage {
+        set_disks: Arc<SetDisks>,
+        data: Vec<u8>,
+    }
+
+    impl Debug for LockingConfigStorage {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("LockingConfigStorage").finish()
+        }
+    }
+
+    struct SetupTypeGuard {
+        previous: SetupType,
+    }
+
+    impl SetupTypeGuard {
+        async fn switch_to(next: SetupType) -> Self {
+            let previous = current_setup_type().await;
+            update_erasure_type(next).await;
+            Self { previous }
+        }
+    }
+
+    impl Drop for SetupTypeGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    update_erasure_type(previous).await;
+                });
+            });
+        }
+    }
+
+    async fn current_setup_type() -> SetupType {
+        if is_dist_erasure().await {
+            SetupType::DistErasure
+        } else if is_erasure_sd().await {
+            SetupType::ErasureSD
+        } else if is_erasure().await {
+            SetupType::Erasure
+        } else {
+            SetupType::Unknown
+        }
+    }
+
+    impl LockingConfigStorage {
+        async fn new(lockers: Vec<Arc<dyn LockClient>>, data: Vec<u8>) -> Self {
+            let endpoints = vec![
+                Endpoint::try_from("http://127.0.0.1:9000/data").expect("first endpoint should parse"),
+                Endpoint::try_from("http://127.0.0.1:9001/data").expect("second endpoint should parse"),
+            ];
+
+            let set_disks = SetDisks::new(
+                "config-test-owner".to_string(),
+                Arc::new(RwLock::new(vec![None, None])),
+                2,
+                1,
+                0,
+                0,
+                endpoints,
+                crate::disk::format::FormatV3::new(1, 2),
+                lockers,
+            )
+            .await;
+
+            Self { set_disks, data }
+        }
+
+        fn object_info(&self, bucket: &str, object: &str) -> ObjectInfo {
+            ObjectInfo {
+                bucket: bucket.to_string(),
+                name: object.to_string(),
+                storage_class: None,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                size: self.data.len() as i64,
+                actual_size: self.data.len() as i64,
+                is_dir: false,
+                user_defined: HashMap::new(),
+                parity_blocks: 0,
+                data_blocks: 0,
+                version_id: None,
+                delete_marker: false,
+                transitioned_object: Default::default(),
+                restore_ongoing: false,
+                restore_expires: None,
+                user_tags: String::new(),
+                parts: Vec::new(),
+                is_latest: true,
+                content_type: Some("application/json".to_string()),
+                content_encoding: None,
+                expires: None,
+                num_versions: 1,
+                successor_mod_time: None,
+                put_object_reader: None,
+                etag: None,
+                inlined: false,
+                metadata_only: false,
+                version_only: false,
+                replication_status_internal: None,
+                replication_status: Default::default(),
+                version_purge_status_internal: None,
+                version_purge_status: Default::default(),
+                replication_decision: String::new(),
+                checksum: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectIO for LockingConfigStorage {
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            _range: Option<HTTPRangeSpec>,
+            _h: HeaderMap,
+            opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            let guard = if opts.no_lock {
+                None
+            } else {
+                Some(
+                    self.set_disks
+                        .new_ns_lock(bucket, object)
+                        .await?
+                        .get_read_lock(std::time::Duration::from_millis(100))
+                        .await
+                        .map_err(|err| Error::other(format!("lock failed: {err}")))?,
+                )
+            };
+
+            Ok(GetObjectReader {
+                stream: Box::new(GuardedCursor {
+                    inner: Cursor::new(self.data.clone()),
+                    _guard: guard,
+                }),
+                object_info: self.object_info(bucket, object),
+            })
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BucketOperations for LockingConfigStorage {
+        async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+            panic!("unused in test")
+        }
+
+        async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+            panic!("unused in test")
+        }
+
+        async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectOperations for LockingConfigStorage {
+        async fn get_object_info(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn verify_object_integrity(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn copy_object(
+            &self,
+            _src_bucket: &str,
+            _src_object: &str,
+            _dst_bucket: &str,
+            _dst_object: &str,
+            _src_info: &mut ObjectInfo,
+            _src_opts: &ObjectOptions,
+            _dst_opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn delete_object_version(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _fi: &FileInfo,
+            _force_del_marker: bool,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn delete_object(&self, _bucket: &str, _object: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn delete_objects(
+            &self,
+            _bucket: &str,
+            _objects: Vec<ObjectToDelete>,
+            _opts: ObjectOptions,
+        ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+            panic!("unused in test")
+        }
+
+        async fn put_object_metadata(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn get_object_tags(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<String> {
+            panic!("unused in test")
+        }
+
+        async fn put_object_tags(&self, _bucket: &str, _object: &str, _tags: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn delete_object_tags(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn add_partial(&self, _bucket: &str, _object: &str, _version_id: &str) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn transition_object(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn restore_transitioned_object(self: Arc<Self>, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ListOperations for LockingConfigStorage {
+        async fn list_objects_v2(
+            self: Arc<Self>,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+            _fetch_owner: bool,
+            _start_after: Option<String>,
+            _incl_deleted: bool,
+        ) -> Result<ListObjectsV2Info> {
+            panic!("unused in test")
+        }
+
+        async fn list_object_versions(
+            self: Arc<Self>,
+            _bucket: &str,
+            _prefix: &str,
+            _marker: Option<String>,
+            _version_marker: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+        ) -> Result<ListObjectVersionsInfo> {
+            panic!("unused in test")
+        }
+
+        async fn walk(
+            self: Arc<Self>,
+            _rx: CancellationToken,
+            _bucket: &str,
+            _prefix: &str,
+            _result: tokio::sync::mpsc::Sender<crate::store_api::ObjectInfoOrErr>,
+            _opts: WalkOptions,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartOperations for LockingConfigStorage {
+        async fn list_multipart_uploads(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _key_marker: Option<String>,
+            _upload_id_marker: Option<String>,
+            _delimiter: Option<String>,
+            _max_uploads: usize,
+        ) -> Result<ListMultipartsInfo> {
+            panic!("unused in test")
+        }
+
+        async fn new_multipart_upload(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &ObjectOptions,
+        ) -> Result<MultipartUploadResult> {
+            panic!("unused in test")
+        }
+
+        async fn copy_object_part(
+            &self,
+            _src_bucket: &str,
+            _src_object: &str,
+            _dst_bucket: &str,
+            _dst_object: &str,
+            _upload_id: &str,
+            _part_id: usize,
+            _start_offset: i64,
+            _length: i64,
+            _src_info: &ObjectInfo,
+            _src_opts: &ObjectOptions,
+            _dst_opts: &ObjectOptions,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn put_object_part(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _part_id: usize,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<PartInfo> {
+            panic!("unused in test")
+        }
+
+        async fn get_multipart_info(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _opts: &ObjectOptions,
+        ) -> Result<MultipartInfo> {
+            panic!("unused in test")
+        }
+
+        async fn list_object_parts(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _part_number_marker: Option<usize>,
+            _max_parts: usize,
+            _opts: &ObjectOptions,
+        ) -> Result<crate::store_api::ListPartsInfo> {
+            panic!("unused in test")
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _opts: &ObjectOptions,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn complete_multipart_upload(
+            self: Arc<Self>,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _uploaded_parts: Vec<CompletePart>,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HealOperations for LockingConfigStorage {
+        async fn heal_format(&self, _dry_run: bool) -> Result<(rustfs_madmin::heal_commands::HealResultItem, Option<Error>)> {
+            panic!("unused in test")
+        }
+
+        async fn heal_bucket(
+            &self,
+            _bucket: &str,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> Result<rustfs_madmin::heal_commands::HealResultItem> {
+            panic!("unused in test")
+        }
+
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _version_id: &str,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> Result<(rustfs_madmin::heal_commands::HealResultItem, Option<Error>)> {
+            panic!("unused in test")
+        }
+
+        async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
+            panic!("unused in test")
+        }
+
+        async fn check_abandoned_parts(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageAPI for LockingConfigStorage {
+        async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<rustfs_lock::NamespaceLockWrapper> {
+            self.set_disks.new_ns_lock(bucket, object).await
+        }
+
+        async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
+            panic!("unused in test")
+        }
+
+        async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
+            panic!("unused in test")
+        }
+
+        async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+            panic!("unused in test")
+        }
+
+        async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<crate::disk::DiskStore>>> {
+            panic!("unused in test")
+        }
+
+        fn set_drive_counts(&self) -> Vec<usize> {
+            panic!("unused in test")
+        }
+    }
 
     #[test]
     fn test_decode_server_config_accepts_legacy_hidden_if_empty_alias() {
@@ -551,6 +1285,54 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_server_config_reads_openid_providers() {
+        let input = r#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1"},
+          "openid":{
+            "default":{
+              "enable":true,
+              "config_url":"https://example.com/.well-known/openid-configuration",
+              "client_id":"console",
+              "client_secret":"secret-value",
+              "scopes":["openid","profile","email"],
+              "redirect_uri_dynamic":true,
+              "display_name":"Default Provider"
+            },
+            "smoke":{
+              "enable":false,
+              "config_url":"https://issuer.example.com/.well-known/openid-configuration",
+              "client_id":"smoke-client",
+              "scopes":["openid"],
+              "redirect_uri_dynamic":false
+            }
+          }
+        }"#;
+
+        let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
+
+        let default_kvs = cfg
+            .get_value(IDENTITY_OPENID_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("default oidc provider should exist");
+        assert_eq!(
+            default_kvs.get(rustfs_config::oidc::OIDC_CONFIG_URL),
+            "https://example.com/.well-known/openid-configuration"
+        );
+        assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_CLIENT_ID), "console");
+        assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_SCOPES), "openid,profile,email");
+        assert_eq!(default_kvs.get(ENABLE_KEY), EnableState::On.to_string());
+
+        let smoke_kvs = cfg
+            .get_value(IDENTITY_OPENID_SUB_SYS, "smoke")
+            .expect("named oidc provider should exist");
+        assert_eq!(smoke_kvs.get(rustfs_config::oidc::OIDC_CLIENT_ID), "smoke-client");
+        assert_eq!(
+            smoke_kvs.get(rustfs_config::oidc::OIDC_REDIRECT_URI_DYNAMIC),
+            EnableState::Off.to_string()
+        );
+    }
+
+    #[test]
     fn test_encode_server_config_writes_external_object_shape() {
         let mut cfg = Config::new();
         let kvs = storage_class_kvs_mut(&mut cfg);
@@ -562,6 +1344,48 @@ mod tests {
         assert!(v.get("version").is_some(), "external object should have version");
         assert!(v.get("storageclass").is_some(), "external object should have storageclass");
         assert!(v.get("storage_class").is_none(), "should not write rustfs map shape");
+    }
+
+    #[test]
+    fn test_encode_server_config_writes_openid_object_shape() {
+        let mut cfg = Config::new();
+        let mut oidc_section = std::collections::HashMap::new();
+        let mut default_provider = oidc::DEFAULT_IDENTITY_OPENID_KVS.clone();
+        default_provider.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        default_provider.insert(
+            rustfs_config::oidc::OIDC_CONFIG_URL.to_string(),
+            "https://example.com/.well-known/openid-configuration".to_string(),
+        );
+        default_provider.insert(rustfs_config::oidc::OIDC_CLIENT_ID.to_string(), "console".to_string());
+        default_provider.insert(rustfs_config::oidc::OIDC_SCOPES.to_string(), "openid,profile,email".to_string());
+        oidc_section.insert(DEFAULT_DELIMITER.to_string(), default_provider);
+        cfg.0.insert(IDENTITY_OPENID_SUB_SYS.to_string(), oidc_section);
+
+        let out = encode_server_config_blob(&cfg, None).expect("encode should succeed");
+        let v: Value = serde_json::from_slice(&out).expect("output should be json");
+        let openid = v
+            .get("openid")
+            .and_then(Value::as_object)
+            .expect("output should include openid object");
+        let default_provider = openid
+            .get("default")
+            .and_then(Value::as_object)
+            .expect("default provider should be encoded");
+
+        assert_eq!(
+            default_provider
+                .get(rustfs_config::oidc::OIDC_CLIENT_ID)
+                .and_then(Value::as_str),
+            Some("console")
+        );
+        assert_eq!(
+            default_provider
+                .get(rustfs_config::oidc::OIDC_SCOPES)
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["openid", "profile", "email"])
+        );
+        assert_eq!(default_provider.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
     }
 
     #[test]
@@ -580,5 +1404,59 @@ mod tests {
         let lhs = decode_server_config_blob(external).expect("decode external");
         let rhs = decode_server_config_blob(legacy).expect("decode legacy");
         assert!(configs_semantically_equal(&lhs, &rhs));
+    }
+
+    #[test]
+    fn test_configs_semantically_equal_accounts_for_openid() {
+        let external = br#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1","optimize":"availability"},
+          "openid":{
+            "default":{
+              "enable":true,
+              "config_url":"https://example.com/.well-known/openid-configuration",
+              "client_id":"console",
+              "scopes":["openid","profile","email"],
+              "redirect_uri_dynamic":true
+            }
+          }
+        }"#;
+        let legacy = br#"{
+          "storage_class":{"_":[
+            {"key":"standard","value":"EC:2"},
+            {"key":"rrs","value":"EC:1"},
+            {"key":"optimize","value":"availability"}
+          ]},
+          "identity_openid":{"_":[
+            {"key":"enable","value":"on"},
+            {"key":"config_url","value":"https://example.com/.well-known/openid-configuration"},
+            {"key":"client_id","value":"console"},
+            {"key":"scopes","value":"openid,profile,email"},
+            {"key":"redirect_uri_dynamic","value":"on"}
+          ]}
+        }"#;
+
+        let lhs = decode_server_config_blob(external).expect("decode external");
+        let rhs = decode_server_config_blob(legacy).expect("decode legacy");
+        assert!(configs_semantically_equal(&lhs, &rhs));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_read_config_with_metadata_succeeds_with_one_healthy_locker_in_two_node_dist_setup() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let healthy_client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        let failing_client: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let storage = Arc::new(LockingConfigStorage::new(vec![healthy_client, failing_client], br#"{"ok":true}"#.to_vec()).await);
+
+        let (data, object_info) = read_config_with_metadata(storage, "config/test.json", &ObjectOptions::default())
+            .await
+            .expect("config read should succeed with one healthy locker");
+
+        assert_eq!(data, br#"{"ok":true}"#.to_vec());
+        assert_eq!(object_info.bucket, crate::disk::RUSTFS_META_BUCKET);
+        assert_eq!(object_info.name, "config/test.json");
     }
 }

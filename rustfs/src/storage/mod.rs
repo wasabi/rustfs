@@ -21,7 +21,6 @@ pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod lock_optimizer;
 pub mod options;
-pub(crate) mod readers;
 pub mod rpc;
 pub(crate) mod s3_api;
 mod sse;
@@ -36,6 +35,8 @@ mod ecfs_extend;
 #[cfg(test)]
 mod ecfs_test;
 pub(crate) mod head_prefix;
+#[cfg(test)]
+mod multi_factor_scheduler_integration_test;
 #[cfg(test)]
 mod sse_test;
 

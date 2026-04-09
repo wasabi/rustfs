@@ -40,6 +40,10 @@ mod quota_test;
 #[cfg(test)]
 mod bucket_policy_check_test;
 
+/// IAM / bucket / STS session policy with `s3:ExistingObjectTag` conditions (E2E).
+#[cfg(test)]
+mod existing_object_tag_policy_test;
+
 // Regression tests for Issue #2036: anonymous access with PublicAccessBlock
 #[cfg(test)]
 mod anonymous_access_test;
@@ -71,6 +75,14 @@ mod delete_objects_versioning_test;
 #[cfg(test)]
 mod list_object_versions_regression_test;
 
+// versions&metadata=true extension regression test
+#[cfg(test)]
+mod list_object_versions_metadata_extension_test;
+
+// list-type=2&metadata=true extension regression test
+#[cfg(test)]
+mod list_objects_v2_metadata_extension_test;
+
 #[cfg(test)]
 mod protocols;
 
@@ -88,3 +100,22 @@ mod checksum_upload_test;
 // Group deletion tests
 #[cfg(test)]
 mod group_delete_test;
+
+// S3 dummy-compat bucket API tests
+#[cfg(test)]
+mod bucket_logging_test;
+
+// Multipart control API auth regression tests
+#[cfg(test)]
+mod multipart_auth_test;
+
+// Object lambda end-to-end regression tests
+#[cfg(test)]
+mod object_lambda_test;
+
+// Replication extension end-to-end regression tests
+#[cfg(test)]
+mod replication_extension_test;
+
+#[cfg(test)]
+mod snowball_auto_extract_test;

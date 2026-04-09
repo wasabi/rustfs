@@ -23,8 +23,8 @@
 //!
 //! ### Unified API
 //! The module provides two core functions that automatically route to the correct encryption method:
-//! - `apply_encryption()` - Unified encryption entry point
-//! - `apply_decryption()` - Unified decryption entry point
+//! - `sse_encryption()` - Unified encryption entry point
+//! - `sse_decryption()` - Unified decryption entry point
 //!
 //! ### Managed SSE (SSE-S3 / SSE-KMS)
 //! - Keys are managed by the server-side KMS service
@@ -52,8 +52,8 @@
 //!     part_number: None,
 //! };
 //!
-//! if let Some(material) = apply_encryption(request).await? {
-//!     reader = material.wrap_reader(reader)?;
+//! if let Some(material) = sse_encryption(request).await? {
+//!     reader = material.wrap_reader(reader);
 //!     metadata.extend(material.metadata);
 //! }
 //!
@@ -67,8 +67,10 @@
 //!     part_number: None,
 //! };
 //!
-//! if let Some(material) = apply_decryption(request).await? {
-//!     reader = material.wrap_reader(reader)?;
+//! if let Some(material) = sse_decryption(request).await? {
+//!     let (decrypted_reader, plaintext_size) = material.wrap_reader(reader, actual_size).await?;
+//!     reader = decrypted_reader;
+//!     content_size = plaintext_size;
 //! }
 //! ```
 
@@ -87,17 +89,17 @@ use rustfs_kms::{
     service_manager::get_global_encryption_service,
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
-use rustfs_rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, WarpReader};
+use rustfs_rio::{DecryptReader, DynReader, EncryptReader, HardLimitReader, ReadStream, boxed_reader, wrap_reader};
 use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use tokio::io::AsyncRead;
 use tracing::{debug, error};
 
+const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
+
 use crate::error::ApiError;
-use crate::storage::readers::InMemoryAsyncReader;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::error::Error;
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
@@ -160,6 +162,15 @@ async fn prepare_sse_configuration(
     ssekms_key_id: Option<SSEKMSKeyId>,
 ) -> Result<Option<SseConfiguration>, ApiError> {
     if let Some(server_side_encryption) = server_side_encryption.clone()
+        && server_side_encryption.as_str() == ServerSideEncryption::AES256
+    {
+        return Ok(Some(SseConfiguration {
+            effective_sse: server_side_encryption,
+            effective_kms_key_id: None,
+        }));
+    }
+
+    if let Some(server_side_encryption) = server_side_encryption.clone()
         && let Some(ssekms_key_id) = ssekms_key_id
     {
         return Ok(Some(SseConfiguration {
@@ -192,7 +203,7 @@ async fn prepare_sse_configuration(
 
         debug!("effective_sse={:?} (original={:?})", effective_sse, server_side_encryption);
 
-        let effective_kms_key_id = ssekms_key_id.or_else(|| {
+        let effective_kms_key_id = resolve_effective_kms_key_id(effective_sse.as_ref(), ssekms_key_id, || {
             bucket_sse_config.rules.first().and_then(|rule| {
                 rule.apply_server_side_encryption_by_default
                     .as_ref()
@@ -224,6 +235,21 @@ async fn prepare_sse_configuration(
     } else {
         Ok(None)
     }
+}
+
+fn resolve_effective_kms_key_id<F>(
+    effective_sse: Option<&ServerSideEncryption>,
+    requested_kms_key_id: Option<SSEKMSKeyId>,
+    bucket_default_kms_key_id: F,
+) -> Option<SSEKMSKeyId>
+where
+    F: FnOnce() -> Option<SSEKMSKeyId>,
+{
+    if effective_sse.is_none_or(|sse| sse.as_str() != ServerSideEncryption::AWS_KMS) {
+        return requested_kms_key_id;
+    }
+
+    requested_kms_key_id.or_else(bucket_default_kms_key_id)
 }
 
 #[derive(Debug, Clone)]
@@ -524,6 +550,8 @@ pub struct DecryptionRequest<'a> {
     pub part_number: Option<usize>,
     /// Parts information for multipart objects
     pub parts: &'a [ObjectPartInfo],
+    /// Object-level ETag, used to distinguish multipart objects from single-part objects.
+    pub etag: Option<&'a str>,
 }
 
 /// Unified encryption material returned by `apply_encryption()`
@@ -568,6 +596,14 @@ pub struct DecryptionMaterial {
     pub parts: Vec<ObjectPartInfo>,
 }
 
+fn is_multipart_object(etag: Option<&str>, parts: &[ObjectPartInfo]) -> bool {
+    if parts.len() > 1 {
+        return true;
+    }
+
+    etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)
+}
+
 /// Type of encryption used
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SSEType {
@@ -583,7 +619,7 @@ impl EncryptionMaterial {
     /// Wrap a reader with encryption
     pub fn wrap_reader<R>(&self, reader: R) -> Box<EncryptReader<R>>
     where
-        R: Reader + 'static,
+        R: rustfs_rio::ReadStream + 'static,
     {
         Box::new(EncryptReader::new(reader, self.key_bytes, self.nonce))
     }
@@ -594,42 +630,40 @@ impl DecryptionMaterial {
     /// For multipart objects, use `wrap_multipart_stream` instead
     pub fn wrap_single_reader<R>(&self, reader: R) -> Box<DecryptReader<R>>
     where
-        R: Reader + 'static,
+        R: rustfs_rio::ReadStream + 'static,
     {
         Box::new(DecryptReader::new(reader, self.key_bytes, self.nonce))
     }
 
     /// Wrap a stream with multipart decryption
     /// Returns the decrypted reader and the total plaintext size
-    pub async fn wrap_multipart_stream(
-        &self,
-        encrypted_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-    ) -> Result<(Box<dyn Reader>, i64), StorageError> {
+    pub async fn wrap_multipart_stream<R>(&self, encrypted_stream: R) -> Result<(DynReader, i64), StorageError>
+    where
+        R: ReadStream + 'static,
+    {
         decrypt_multipart_managed_stream(encrypted_stream, &self.parts, self.key_bytes, self.nonce).await
     }
 
     /// Unified method to wrap stream with decryption and hard limit
     /// Handles both single-part and multipart objects, applies decryption and size limiting
-    /// Accepts AsyncRead stream (from object storage) and returns (decrypted_reader, plaintext_size)
-    pub async fn wrap_reader(
-        self,
-        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-        actual_size: i64,
-    ) -> Result<(Box<dyn Reader>, i64), StorageError> {
-        let (mut final_stream, response_content_length): (Box<dyn Reader>, i64) = if self.is_multipart {
+    /// Accepts a readable stream (from object storage) and returns (decrypted_reader, plaintext_size)
+    pub async fn wrap_reader<R>(self, stream: R, actual_size: i64) -> Result<(DynReader, i64), StorageError>
+    where
+        R: ReadStream + 'static,
+    {
+        let (mut final_stream, response_content_length): (DynReader, i64) = if self.is_multipart {
             // Multipart decryption
             let (decrypted_reader, plain_size) = self.wrap_multipart_stream(stream).await?;
             (decrypted_reader, plain_size)
         } else {
-            // Single-part decryption - wrap AsyncRead into Reader first
-            let warp_reader = WarpReader::new(stream);
-            let decrypt_reader = self.wrap_single_reader(warp_reader);
+            // Single-part decryption keeps Reader capabilities via the generic wrapper helper.
+            let decrypt_reader = self.wrap_single_reader(wrap_reader(stream));
             let plain_size = self.original_size.unwrap_or(actual_size);
             (decrypt_reader, plain_size)
         };
 
         // Add hard limit reader to prevent over-reading
-        // final_stream is already Box<dyn Reader>, no need to wrap with WarpReader
+        // final_stream is already a DynReader, no need to wrap with WarpReader
         let limit_reader = HardLimitReader::new(final_stream, response_content_length);
         final_stream = Box::new(limit_reader);
 
@@ -675,8 +709,8 @@ impl DecryptionMaterial {
 ///     part_number: None,
 /// };
 ///
-/// if let Some(material) = apply_encryption(request).await? {
-///     reader = material.wrap_reader(reader)?;
+/// if let Some(material) = sse_encryption(request).await? {
+///     reader = material.wrap_reader(reader);
 ///     metadata.extend(material.metadata);
 /// }
 /// ```
@@ -810,12 +844,14 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
 ///     part_number: None,
 /// };
 ///
-/// if let Some(material) = apply_decryption(request).await? {
-///     reader = material.wrap_reader(reader)?;
+/// if let Some(material) = sse_decryption(request).await? {
+///     let (decrypted_reader, plaintext_size) = material.wrap_reader(reader, actual_size).await?;
+///     reader = decrypted_reader;
+///     content_size = plaintext_size;
 /// }
 /// ```
 pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
-    let is_multipart = request.parts.len() > 1;
+    let is_multipart = is_multipart_object(request.etag, request.parts);
 
     // Check for SSE-C encryption
     if request
@@ -1021,7 +1057,7 @@ async fn apply_managed_encryption_material(
         context = context.with_size(content_size as u64);
     }
 
-    // Determine KMS key ID to use
+    // Determine KMS key ID to use for internal key wrapping.
     let mut kms_key_candidate = kms_key_id.clone().map(|s| s.to_string());
     if kms_key_candidate.is_none() {
         // Try to get default key from KMS service (if available)
@@ -1030,11 +1066,17 @@ async fn apply_managed_encryption_material(
         }
     }
 
-    let kms_key_to_use = kms_key_candidate.clone().ok_or_else(|| {
-        ApiError::from(StorageError::other(
-            "No KMS key available for managed server-side encryption (required for SSE-KMS)",
-        ))
-    })?;
+    let kms_key_to_use = match (encryption_type, kms_key_candidate.clone()) {
+        (SSEType::SseS3, Some(kms_key_id)) => kms_key_id,
+        (SSEType::SseS3, None) => "default".to_string(),
+        (SSEType::SseKms, Some(kms_key_id)) => kms_key_id,
+        (SSEType::SseKms, None) => {
+            return Err(ApiError::from(StorageError::other(
+                "No KMS key available for managed server-side encryption (required for SSE-KMS)",
+            )));
+        }
+        _ => unreachable!("managed SSE branch only supports SSE-S3 or SSE-KMS"),
+    };
 
     let provider = get_sse_dek_provider().await?;
 
@@ -1074,7 +1116,7 @@ async fn apply_managed_encryption_material(
         (data_key, encrypted_data_key)
     };
 
-    let algorithm = DEFAULT_SSE_ALGORITHM.to_string();
+    let algorithm = server_side_encryption.as_str().to_string();
 
     let encryption_metadata = EncryptionMetadata {
         algorithm: algorithm.clone(),
@@ -1103,12 +1145,14 @@ async fn apply_managed_encryption_material(
         metadata.insert("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(&encryption_metadata.iv));
         metadata.insert("x-rustfs-encryption-algorithm".to_string(), encryption_metadata.algorithm.clone());
         metadata.insert("x-amz-server-side-encryption".to_string(), server_side_encryption.as_str().to_string());
-
-        // if kms_key is changed, we need to update the metadata
-        if kms_key_id.is_none() {
-            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
-        }
     }
+
+    if matches!(encryption_type, SSEType::SseKms) {
+        metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
+    } else {
+        metadata.remove("x-amz-server-side-encryption-aws-kms-key-id");
+    }
+    metadata.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), kms_key_to_use.clone());
 
     metadata.insert(
         "x-rustfs-encryption-original-size".to_string(),
@@ -1118,7 +1162,7 @@ async fn apply_managed_encryption_material(
     Ok(EncryptionMaterial {
         sse_type: encryption_type,
         server_side_encryption,
-        kms_key_id: Some(kms_key_to_use),
+        kms_key_id: matches!(encryption_type, SSEType::SseKms).then_some(kms_key_to_use),
         algorithm,
 
         key_bytes: data_key.plaintext_key,
@@ -1182,7 +1226,8 @@ async fn apply_managed_decryption_material(
 
     // Extract KMS key ID from metadata (optional, used for provider context)
     let kms_key_id = metadata
-        .get("x-amz-server-side-encryption-aws-kms-key-id")
+        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
+        .or_else(|| metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
         .cloned()
         .unwrap_or_else(|| "default".to_string());
 
@@ -1597,49 +1642,43 @@ pub fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>)
 // Multipart Encryption Support
 // ============================================================================
 
-/// Derive a unique nonce for each part in a multipart upload
-///
-/// Uses the base nonce and increments the counter portion by part number.
-/// This ensures each part has a unique nonce while maintaining determinism.
 pub fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
-    let mut nonce = base;
-    let current = u32::from_be_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]);
-    let incremented = current.wrapping_add(part_number as u32);
-    nonce[8..12].copy_from_slice(&incremented.to_be_bytes());
-    nonce
+    derive_nonce_offset(base, 4, part_number)
 }
 
-pub(crate) async fn decrypt_multipart_managed_stream(
-    mut encrypted_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+#[cfg(test)]
+fn derive_legacy_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
+    derive_nonce_offset(base, 8, part_number)
+}
+
+fn derive_nonce_offset(mut base: [u8; 12], start: usize, offset: usize) -> [u8; 12] {
+    let current = u32::from_be_bytes([base[start], base[start + 1], base[start + 2], base[start + 3]]);
+    let incremented = current.wrapping_add(offset as u32);
+    base[start..start + 4].copy_from_slice(&incremented.to_be_bytes());
+    base
+}
+
+pub(crate) async fn decrypt_multipart_managed_stream<R>(
+    encrypted_stream: R,
     parts: &[ObjectPartInfo],
     key_bytes: [u8; 32],
     base_nonce: [u8; 12],
-) -> Result<(Box<dyn Reader>, i64), StorageError> {
-    let total_plain_capacity: usize = parts.iter().map(|part| part.actual_size.max(0) as usize).sum();
+) -> Result<(DynReader, i64), StorageError>
+where
+    R: ReadStream + 'static,
+{
+    let total_plain_size = parts
+        .iter()
+        .map(|part| {
+            if part.actual_size > 0 {
+                part.actual_size
+            } else {
+                part.size as i64
+            }
+        })
+        .sum();
 
-    let mut plaintext = Vec::with_capacity(total_plain_capacity);
-
-    for part in parts {
-        if part.size == 0 {
-            continue;
-        }
-
-        let mut encrypted_part = vec![0u8; part.size];
-        tokio::io::AsyncReadExt::read_exact(&mut encrypted_stream, &mut encrypted_part)
-            .await
-            .map_err(|e| StorageError::other(format!("failed to read encrypted multipart segment {}: {}", part.number, e)))?;
-
-        let part_nonce = derive_part_nonce(base_nonce, part.number);
-        let cursor = std::io::Cursor::new(encrypted_part);
-        let mut decrypt_reader = DecryptReader::new(WarpReader::new(cursor), key_bytes, part_nonce);
-
-        tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut plaintext)
-            .await
-            .map_err(|e| StorageError::other(format!("failed to decrypt multipart segment {}: {}", part.number, e)))?;
-    }
-
-    let total_plain_size = plaintext.len() as i64;
-    let reader = Box::new(WarpReader::new(InMemoryAsyncReader::new(plaintext))) as Box<dyn Reader>;
+    let reader = boxed_reader(DecryptReader::new_multipart(wrap_reader(encrypted_stream), key_bytes, base_nonce));
 
     Ok((reader, total_plain_size))
 }
@@ -1906,13 +1945,139 @@ mod tests {
         let part1 = derive_part_nonce(base, 1);
         let part2 = derive_part_nonce(base, 2);
 
-        // First 8 bytes should be unchanged
-        assert_eq!(&base[..8], &part1[..8]);
-        assert_eq!(&base[..8], &part2[..8]);
+        assert_eq!(&base[..4], &part1[..4]);
+        assert_eq!(&base[8..], &part1[8..]);
+        assert_ne!(&base[4..8], &part1[4..8]);
+        assert_ne!(&part1[4..8], &part2[4..8]);
+    }
 
-        // Last 4 bytes should be incremented
-        assert_ne!(&base[8..], &part1[8..]);
-        assert_ne!(&part1[8..], &part2[8..]);
+    #[tokio::test]
+    async fn test_decrypt_multipart_managed_stream_accepts_legacy_part_nonce_layout() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        let key_bytes = [7u8; 32];
+        let base_nonce = [3u8; 12];
+
+        let part_one_plaintext = vec![0x11; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 19];
+        let part_two_plaintext = vec![0x22; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 37];
+
+        let part_one_nonce = derive_legacy_part_nonce(base_nonce, 1);
+        let part_two_nonce = derive_legacy_part_nonce(base_nonce, 2);
+
+        let first_part = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_one_plaintext.clone()), key_bytes, part_one_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+        let second_part = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_two_plaintext.clone()), key_bytes, part_two_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+
+        let mut encrypted_stream = Vec::with_capacity(first_part.len() + second_part.len());
+        encrypted_stream.extend_from_slice(&first_part);
+        encrypted_stream.extend_from_slice(&second_part);
+
+        let parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                size: first_part.len(),
+                actual_size: part_one_plaintext.len() as i64,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                size: second_part.len(),
+                actual_size: part_two_plaintext.len() as i64,
+                ..Default::default()
+            },
+        ];
+
+        let (mut decrypted_reader, plaintext_size) =
+            decrypt_multipart_managed_stream(Cursor::new(encrypted_stream), &parts, key_bytes, base_nonce)
+                .await
+                .unwrap();
+
+        let mut decrypted = Vec::new();
+        decrypted_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        let mut expected = part_one_plaintext;
+        expected.extend_from_slice(&part_two_plaintext);
+
+        assert_eq!(plaintext_size, expected.len() as i64);
+        assert_eq!(decrypted, expected);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_multipart_managed_stream_supports_current_nonce_layout() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        let key_bytes = [9u8; 32];
+        let base_nonce = [5u8; 12];
+
+        let part_one_plaintext = vec![0x33; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 11];
+        let part_two_plaintext = vec![0x44; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE * 2 + 7];
+        let part_one_nonce = derive_part_nonce(base_nonce, 1);
+        let part_two_nonce = derive_part_nonce(base_nonce, 2);
+
+        let first_part = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_one_plaintext.clone()), key_bytes, part_one_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+        let second_part = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_two_plaintext.clone()), key_bytes, part_two_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+
+        let mut encrypted_stream = Vec::with_capacity(first_part.len() + second_part.len());
+        encrypted_stream.extend_from_slice(&first_part);
+        encrypted_stream.extend_from_slice(&second_part);
+
+        let parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                size: first_part.len(),
+                actual_size: part_one_plaintext.len() as i64,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                size: second_part.len(),
+                actual_size: part_two_plaintext.len() as i64,
+                ..Default::default()
+            },
+        ];
+
+        let (mut decrypted_reader, plaintext_size) =
+            decrypt_multipart_managed_stream(Cursor::new(encrypted_stream), &parts, key_bytes, base_nonce)
+                .await
+                .unwrap();
+
+        let mut decrypted = Vec::new();
+        decrypted_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        let mut expected = part_one_plaintext;
+        expected.extend_from_slice(&part_two_plaintext);
+
+        assert_eq!(plaintext_size, expected.len() as i64);
+        assert_eq!(decrypted, expected);
     }
 
     #[test]
@@ -2180,6 +2345,80 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_effective_kms_key_id_ignores_bucket_default_for_explicit_sse_s3() {
+        let effective_sse = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
+
+        let kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), None, || Some("bucket-default".to_string()));
+
+        assert_eq!(kms_key_id, None);
+    }
+
+    #[test]
+    fn test_resolve_effective_kms_key_id_uses_bucket_default_for_sse_kms() {
+        let effective_sse = ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS);
+
+        let kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), None, || Some("bucket-default".to_string()));
+
+        assert_eq!(kms_key_id.as_deref(), Some("bucket-default"));
+    }
+
+    #[tokio::test]
+    async fn test_sse_encryption_persists_aws_kms_header_for_kms_objects() {
+        let request = EncryptionRequest {
+            bucket: "test-bucket",
+            key: "test-key",
+            server_side_encryption: Some("aws:kms".to_string().into()),
+            ssekms_key_id: Some("test-key".to_string()),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 1024,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let material = sse_encryption(request).await.expect("kms encryption should succeed");
+        let metadata = material.expect("managed kms encryption should return material").metadata;
+
+        assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"));
+        assert_eq!(
+            metadata
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .map(String::as_str),
+            Some("test-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_encryption_omits_kms_header_for_sse_s3_objects() {
+        let request = EncryptionRequest {
+            bucket: "test-bucket",
+            key: "test-key",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 1024,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let material = sse_encryption(request).await.expect("sse-s3 encryption should succeed");
+        let material = material.expect("managed sse-s3 encryption should return material");
+
+        assert_eq!(material.kms_key_id, None);
+        assert_eq!(material.metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
+        assert!(!material.metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
+        assert_eq!(
+            material.metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str),
+            Some("default")
+        );
+    }
+
+    #[test]
     fn test_strip_managed_encryption_metadata() {
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption".to_string(), "aws:kms".to_string());
@@ -2191,6 +2430,32 @@ mod tests {
         assert!(!metadata.contains_key("x-amz-server-side-encryption"));
         assert!(!metadata.contains_key("x-rustfs-encryption-key"));
         assert!(metadata.contains_key("content-type"));
+    }
+
+    #[test]
+    fn test_is_multipart_object_treats_single_part_multipart_etag_as_multipart() {
+        let metadata = HashMap::from([("etag".to_string(), "0123456789abcdef0123456789abcdef-1".to_string())]);
+        let parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 128,
+            actual_size: 64,
+            ..Default::default()
+        }];
+
+        assert!(is_multipart_object(metadata.get("etag").map(String::as_str), &parts));
+    }
+
+    #[test]
+    fn test_is_multipart_object_keeps_regular_single_part_object_as_non_multipart() {
+        let metadata = HashMap::from([("etag".to_string(), "0123456789abcdef0123456789abcdef".to_string())]);
+        let parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 128,
+            actual_size: 64,
+            ..Default::default()
+        }];
+
+        assert!(!is_multipart_object(metadata.get("etag").map(String::as_str), &parts));
     }
 
     #[test]
@@ -2291,8 +2556,8 @@ mod tests {
         println!("Original plaintext: {:?}", String::from_utf8_lossy(plaintext));
         println!("Plaintext length: {} bytes", plaintext.len());
 
-        // 4. Encrypt with EncryptReader (wrap Cursor with WarpReader)
-        let plaintext_reader = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // 4. Encrypt with EncryptReader.
+        let plaintext_reader = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader = EncryptReader::new(plaintext_reader, data_key.plaintext_key, data_key.nonce);
 
         // Read encrypted data
@@ -2315,8 +2580,8 @@ mod tests {
             "Encrypted data should be different from plaintext"
         );
 
-        // 5. Decrypt with DecryptReader (wrap Cursor with WarpReader)
-        let encrypted_reader = WarpReader::new(Cursor::new(encrypted_data));
+        // 5. Decrypt with DecryptReader.
+        let encrypted_reader = Cursor::new(encrypted_data);
         let mut decrypt_reader = DecryptReader::new(encrypted_reader, data_key.plaintext_key, data_key.nonce);
 
         // Read decrypted data
@@ -2357,8 +2622,8 @@ mod tests {
         let plaintext: Vec<u8> = (0..plaintext_size).map(|i| (i % 256) as u8).collect();
         println!("Testing with {} bytes of data", plaintext.len());
 
-        // Encrypt (wrap with WarpReader)
-        let plaintext_reader = WarpReader::new(Cursor::new(plaintext.clone()));
+        // Encrypt.
+        let plaintext_reader = Cursor::new(plaintext.clone());
         let mut encrypt_reader = EncryptReader::new(plaintext_reader, data_key.plaintext_key, data_key.nonce);
 
         let mut encrypted_data = Vec::new();
@@ -2369,8 +2634,8 @@ mod tests {
 
         println!("Encrypted {} bytes to {} bytes", plaintext.len(), encrypted_data.len());
 
-        // Decrypt (wrap with WarpReader)
-        let encrypted_reader = WarpReader::new(Cursor::new(encrypted_data));
+        // Decrypt.
+        let encrypted_reader = Cursor::new(encrypted_data);
         let mut decrypt_reader = DecryptReader::new(encrypted_reader, data_key.plaintext_key, data_key.nonce);
 
         let mut decrypted_data = Vec::new();
@@ -2415,14 +2680,14 @@ mod tests {
         // Same plaintext
         let plaintext = b"Same plaintext";
 
-        // Encrypt with first key (wrap with WarpReader)
-        let reader1 = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Encrypt with first key.
+        let reader1 = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader1 = EncryptReader::new(reader1, data_key1.plaintext_key, data_key1.nonce);
         let mut encrypted1 = Vec::new();
         encrypt_reader1.read_to_end(&mut encrypted1).await.unwrap();
 
-        // Encrypt with second key (wrap with WarpReader)
-        let reader2 = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Encrypt with second key.
+        let reader2 = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader2 = EncryptReader::new(reader2, data_key2.plaintext_key, data_key2.nonce);
         let mut encrypted2 = Vec::new();
         encrypt_reader2.read_to_end(&mut encrypted2).await.unwrap();
@@ -2475,14 +2740,14 @@ mod tests {
         // 5. Use decrypted key to encrypt/decrypt data
         let plaintext = b"Test data with decrypted DEK";
 
-        // Encrypt with original key (wrap with WarpReader)
-        let reader = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Encrypt with original key.
+        let reader = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader = EncryptReader::new(reader, original_plaintext_key, original_nonce);
         let mut encrypted_data = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted_data).await.unwrap();
 
-        // Decrypt with recovered key (simulating GET operation) (wrap with WarpReader)
-        let reader = WarpReader::new(Cursor::new(encrypted_data));
+        // Decrypt with recovered key (simulating GET operation).
+        let reader = Cursor::new(encrypted_data);
         let mut decrypt_reader = DecryptReader::new(
             reader,
             decrypted_plaintext_key,

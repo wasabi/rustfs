@@ -79,10 +79,13 @@ use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_lock::local_lock::LocalLock;
 use rustfs_lock::{FastLockGuard, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
+use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 use rustfs_s3_common::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
+use rustfs_utils::http::headers::{
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
+};
 use rustfs_utils::http::{
     SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
     contains_key_str, get_header_map, get_str, insert_str, remove_header_map,
@@ -93,7 +96,7 @@ use rustfs_utils::{
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
 use rustfs_workers::workers::Workers;
-use s3s::header::X_AMZ_RESTORE;
+use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem::{self};
@@ -242,6 +245,19 @@ fn build_tiered_decommission_file_info(
     updated.erasure = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives).erasure;
 
     (updated, write_quorum)
+}
+
+fn resolve_tiered_decommission_write_quorum_result(
+    errs: &[Option<DiskError>],
+    write_quorum: usize,
+    bucket: &str,
+    object: &str,
+) -> Result<()> {
+    if let Some(err) = reduce_write_quorum_errs(errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+        return Err(to_object_err(err.into(), vec![bucket, object]));
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -699,6 +715,11 @@ impl ObjectIO for SetDisks {
         }
 
         let mut user_defined = opts.user_defined.clone();
+        if let Some(eval_metadata) = &opts.eval_metadata {
+            for (key, value) in eval_metadata {
+                user_defined.insert(key.clone(), value.clone());
+            }
+        }
 
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
@@ -804,7 +825,7 @@ impl ObjectIO for SetDisks {
 
         let stream = mem::replace(
             &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
+            HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
         let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
@@ -1067,7 +1088,7 @@ impl ObjectOperations for SetDisks {
 
         let (mut metas, errs) = {
             if let Some(vid) = &src_opts.version_id {
-                Self::read_all_fileinfo(&disks, "", src_bucket, src_object, vid, true, false).await?
+                Self::read_all_fileinfo(&disks, "", src_bucket, src_object, vid, true, false, false).await?
             } else {
                 Self::read_all_xl(&disks, src_bucket, src_object, true, false).await
             }
@@ -1190,10 +1211,7 @@ impl ObjectOperations for SetDisks {
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            return Err(err.into());
-        }
-        Ok(())
+        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
     }
 
     #[tracing::instrument(skip(self))]
@@ -1669,7 +1687,7 @@ impl ObjectOperations for SetDisks {
 
         let (metas, errs) = {
             if let Some(version_id) = &opts.version_id {
-                Self::read_all_fileinfo(&disks, "", bucket, object, version_id.to_string().as_str(), false, false).await?
+                Self::read_all_fileinfo(&disks, "", bucket, object, version_id.to_string().as_str(), false, false, false).await?
             } else {
                 Self::read_all_xl(&disks, bucket, object, false, false).await
             }
@@ -1807,6 +1825,27 @@ impl ObjectOperations for SetDisks {
         let dest_obj = dest_obj.unwrap();
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let mut transition_meta = oi.user_defined.clone();
+        transition_meta.insert("name".to_string(), object.to_string());
+
+        if let Some(content_type) = oi.content_type.as_ref().filter(|value| !value.is_empty()) {
+            transition_meta.insert(CONTENT_TYPE.to_ascii_lowercase(), content_type.clone());
+        }
+
+        for header in [
+            CONTENT_ENCODING,
+            CONTENT_LANGUAGE,
+            CONTENT_DISPOSITION,
+            CACHE_CONTROL,
+            EXPIRES,
+            X_AMZ_OBJECT_LOCK_MODE.as_str(),
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(),
+            X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(),
+        ] {
+            if let Some(value) = fi.metadata.lookup(header).filter(|value| !value.is_empty()) {
+                transition_meta.insert(header.to_ascii_lowercase(), value.to_string());
+            }
+        }
 
         let (pr, mut pw) = tokio::io::duplex(fi.erasure.block_size);
         let reader = ReaderImpl::ObjectBody(GetObjectReader {
@@ -1840,13 +1879,7 @@ impl ObjectOperations for SetDisks {
             };
         });
 
-        let rv = tgt_client
-            .put_with_meta(&dest_obj, reader, fi.size, {
-                let mut m = HashMap::<String, String>::new();
-                m.insert("name".to_string(), object.to_string());
-                m
-            })
-            .await;
+        let rv = tgt_client.put_with_meta(&dest_obj, reader, fi.size, transition_meta).await;
         if let Err(err) = rv {
             return Err(StorageError::Io(err));
         }
@@ -1855,12 +1888,19 @@ impl ObjectOperations for SetDisks {
         fi.transitioned_objname = dest_obj;
         fi.transition_tier = opts.transition.tier.clone();
         fi.transition_version_id = if rv.is_empty() { None } else { Some(Uuid::parse_str(&rv)?) };
-        let mut event_name = EventName::ObjectTransitionComplete.as_str();
+        let event_name = EventName::LifecycleTransition.as_str();
+        let mut should_notify_transition = true;
 
         let disks = self.get_disks(0, 0).await?;
 
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
-            event_name = EventName::ObjectTransitionFailed.as_str();
+            should_notify_transition = false;
+            warn!(
+                bucket = bucket,
+                object = object,
+                error = ?err,
+                "transition completed on remote tier but source cleanup failed; skipping external lifecycle transition notification"
+            );
         }
 
         for disk in disks.iter() {
@@ -1871,15 +1911,17 @@ impl ObjectOperations for SetDisks {
             break;
         }
 
-        let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        send_event(EventArgs {
-            event_name: event_name.to_string(),
-            bucket_name: bucket.to_string(),
-            object: obj_info,
-            user_agent: "Internal: [ILM-Transition]".to_string(),
-            host: GLOBAL_LocalNodeName.to_string(),
-            ..Default::default()
-        });
+        if should_notify_transition {
+            let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+            send_event(EventArgs {
+                event_name: event_name.to_string(),
+                bucket_name: bucket.to_string(),
+                object: obj_info,
+                user_agent: "Internal: [ILM-Transition]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+        }
         //let tags = opts.lifecycle_audit_event.tags();
         //auditLogLifecycle(ctx, objInfo, ILMTransition, tags, traceFn)
         Ok(())
@@ -1925,19 +1967,21 @@ impl ObjectOperations for SetDisks {
             }
             let gr = gr.unwrap();
             let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::new(
-                Box::new(WarpReader::new(reader)),
-                gr.object_info.size,
-                gr.object_info.size,
-                None,
-                None,
-                false,
-            )?;
+            let hash_reader = HashReader::from_stream(reader, gr.object_info.size, gr.object_info.size, None, None, false)?;
             let mut p_reader = PutObjReader::new(hash_reader);
-            return if let Err(err) = self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
-                set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await
-            } else {
-                Ok(())
+            return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
+                Ok(restored_info) => {
+                    send_event(EventArgs {
+                        event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+                        bucket_name: bucket.to_string(),
+                        object: restored_info,
+                        user_agent: "Internal: [Restore-Completed]".to_string(),
+                        host: GLOBAL_LocalNodeName.to_string(),
+                        ..Default::default()
+                    });
+                    Ok(())
+                }
+                Err(err) => set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await,
             };
         }
 
@@ -1991,14 +2035,7 @@ impl ObjectOperations for SetDisks {
                 }
             };
             let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::new(
-                Box::new(WarpReader::new(reader)),
-                part_info.actual_size,
-                part_info.actual_size,
-                None,
-                None,
-                false,
-            )?;
+            let hash_reader = HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
             let mut p_reader = PutObjReader::new(hash_reader);
             let p_info = self_
                 .clone()
@@ -2028,7 +2065,7 @@ impl ObjectOperations for SetDisks {
                 checksum_crc64nvme: None,
             });
         }
-        if let Err(err) = self_
+        let restored_info = match self_
             .clone()
             .complete_multipart_upload(
                 bucket,
@@ -2042,8 +2079,17 @@ impl ObjectOperations for SetDisks {
             )
             .await
         {
-            return set_restore_header_fn(&mut oi, Some(err)).await;
-        }
+            Ok(info) => info,
+            Err(err) => return set_restore_header_fn(&mut oi, Some(err)).await,
+        };
+        send_event(EventArgs {
+            event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+            bucket_name: bucket.to_string(),
+            object: restored_info,
+            user_agent: "Internal: [Restore-Completed]".to_string(),
+            host: GLOBAL_LocalNodeName.to_string(),
+            ..Default::default()
+        });
         Ok(())
     }
 
@@ -2141,11 +2187,7 @@ impl SetDisks {
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            return Err(to_object_err(err.into(), vec![bucket, object]));
-        }
-
-        Ok(())
+        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
     }
 }
 
@@ -2299,7 +2341,7 @@ impl MultipartOperations for SetDisks {
 
         let stream = mem::replace(
             &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
+            HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
         let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
@@ -3265,7 +3307,7 @@ impl HealOperations for SetDisks {
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
-        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false).await?;
+        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
         if DiskError::is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
@@ -3955,11 +3997,115 @@ mod tests {
     use super::*;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
+    use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
+    use crate::endpoints::SetupType;
+    use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::store_api::{CompletePart, ObjectInfo};
     use rustfs_filemeta::ErasureInfo;
+    use rustfs_lock::client::local::LocalClient;
+    use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
+    use serial_test::serial;
     use std::collections::HashMap;
     use time::OffsetDateTime;
+
+    #[derive(Debug, Default)]
+    struct FailingClient;
+
+    #[async_trait::async_trait]
+    impl LockClient for FailingClient {
+        async fn acquire_lock(&self, _request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
+            Err(LockError::internal("simulated offline client"))
+        }
+
+        async fn release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn force_release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            false
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    async fn make_test_set_disks(lockers: Vec<Arc<dyn LockClient>>) -> Arc<SetDisks> {
+        let endpoints = vec![
+            Endpoint::try_from("http://127.0.0.1:9000/data").expect("first endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9001/data").expect("second endpoint should parse"),
+        ];
+
+        SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![None, None])),
+            2,
+            1,
+            0,
+            0,
+            endpoints,
+            FormatV3::new(1, 2),
+            lockers,
+        )
+        .await
+    }
+
+    struct SetupTypeGuard {
+        previous: SetupType,
+    }
+
+    impl SetupTypeGuard {
+        async fn switch_to(next: SetupType) -> Self {
+            let previous = current_setup_type().await;
+            update_erasure_type(next).await;
+            Self { previous }
+        }
+    }
+
+    impl Drop for SetupTypeGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    update_erasure_type(previous).await;
+                });
+            });
+        }
+    }
+
+    async fn current_setup_type() -> SetupType {
+        if is_dist_erasure().await {
+            SetupType::DistErasure
+        } else if is_erasure_sd().await {
+            SetupType::ErasureSD
+        } else if is_erasure().await {
+            SetupType::Erasure
+        } else {
+            SetupType::Unknown
+        }
+    }
 
     #[test]
     fn disk_health_entry_returns_cached_value_within_ttl() {
@@ -4081,6 +4227,55 @@ mod tests {
         let result3 = SetDisks::get_multipart_sha_dir("bucket1", "object1");
         let result4 = SetDisks::get_multipart_sha_dir("bucket2", "object2");
         assert_ne!(result3, result4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_new_ns_lock_distributed_read_succeeds_with_two_lockers_one_offline() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let healthy_client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        let failing_client: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let set_disks = make_test_set_disks(vec![healthy_client, failing_client]).await;
+
+        let guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_read_lock(Duration::from_millis(100))
+            .await
+            .expect("read lock should succeed with one healthy locker");
+
+        match guard {
+            NamespaceLockGuard::Standard(_) => {}
+            NamespaceLockGuard::Fast(_) => panic!("Expected distributed guard for dist-erasure"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_new_ns_lock_distributed_write_fails_with_two_lockers_one_offline() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let healthy_client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        let failing_client: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let set_disks = make_test_set_disks(vec![healthy_client, failing_client]).await;
+
+        let err = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_millis(100))
+            .await
+            .expect_err("write lock should fail with one healthy locker");
+
+        let err_str = err.to_string().to_lowercase();
+        assert!(
+            err_str.contains("quorum") || err_str.contains("not reached"),
+            "expected quorum error, got: {err}"
+        );
     }
 
     #[test]
@@ -4449,6 +4644,31 @@ mod tests {
         assert_eq!(updated.erasure.parity_blocks, 4);
         assert_eq!(write_quorum, 12);
         assert_ne!(updated.erasure.distribution, original.erasure.distribution);
+    }
+
+    #[test]
+    fn test_resolve_tiered_decommission_write_quorum_result_allows_successful_quorum() {
+        let errs = vec![None, None, Some(DiskError::DiskNotFound), None];
+
+        let result = resolve_tiered_decommission_write_quorum_result(&errs, 3, "bucket", "object");
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_tiered_decommission_write_quorum_result_wraps_object_context() {
+        let errs = vec![
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = resolve_tiered_decommission_write_quorum_result(&errs, 3, "bucket", "object").expect_err("expected error");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("bucket"), "{rendered}");
+        assert!(rendered.contains("object"), "{rendered}");
     }
 
     #[test]

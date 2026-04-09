@@ -25,6 +25,8 @@ use openidconnect::{
     PkceCodeVerifier, RedirectUrl, Scope,
 };
 use rustfs_config::oidc::*;
+use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
+use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_config};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -101,7 +103,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 // ---- Public types (unchanged API) ----
 
 /// Parsed configuration for a single OIDC provider.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OidcProviderConfig {
     pub id: String,
     pub enabled: bool,
@@ -118,6 +120,26 @@ pub struct OidcProviderConfig {
     pub groups_claim: String,
     pub email_claim: String,
     pub username_claim: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OidcProviderConfigSource {
+    Env,
+    Persisted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedOidcProviderConfig {
+    pub config: OidcProviderConfig,
+    pub source: OidcProviderConfigSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OidcProviderValidationResult {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: Option<String>,
 }
 
 /// Summary info about a provider, returned to the console.
@@ -170,11 +192,12 @@ impl OidcSys {
     /// Parse environment variables and discover all configured OIDC providers.
     pub async fn new() -> Result<Self, String> {
         let http_client = ReqwestHttpClient(reqwest::Client::new());
-        let parsed_configs = Self::parse_env_configs();
+        let parsed_configs = load_effective_oidc_provider_configs(get_global_server_config().as_ref());
         let mut configs = HashMap::new();
         let mut provider_states = HashMap::new();
 
-        for config in parsed_configs {
+        for sourced_config in parsed_configs {
+            let config = sourced_config.config;
             if !config.enabled {
                 info!("OIDC provider '{}' is disabled, skipping", config.id);
                 continue;
@@ -620,6 +643,33 @@ impl OidcSys {
         configs
     }
 
+    fn parse_persisted_configs(cfg: &ServerConfig) -> Vec<OidcProviderConfig> {
+        let Some(subsystem) = cfg.0.get(IDENTITY_OPENID_SUB_SYS) else {
+            return Vec::new();
+        };
+
+        let mut configs = Vec::new();
+        let mut provider_ids: Vec<String> = subsystem.keys().cloned().collect();
+        provider_ids.sort();
+
+        for raw_id in provider_ids {
+            let Some(kvs) = subsystem.get(&raw_id) else {
+                continue;
+            };
+
+            let id = if raw_id == DEFAULT_DELIMITER {
+                "default"
+            } else {
+                raw_id.as_str()
+            };
+            if let Some(config) = Self::parse_single_persisted_provider(kvs, id) {
+                configs.push(config);
+            }
+        }
+
+        configs
+    }
+
     /// Parse a single provider's config from env vars with the given suffix.
     fn parse_single_provider(env_suffix: &str, id: &str) -> Option<OidcProviderConfig> {
         let get_env = |base: &str| -> String { std::env::var(format!("{base}{env_suffix}")).unwrap_or_default() };
@@ -716,24 +766,164 @@ impl OidcSys {
         })
     }
 
+    fn parse_single_persisted_provider(kvs: &KVS, id: &str) -> Option<OidcProviderConfig> {
+        let config_url = kvs.get(OIDC_CONFIG_URL);
+        if config_url.is_empty() {
+            return None;
+        }
+
+        let enabled = kvs
+            .lookup(ENABLE_KEY)
+            .unwrap_or_else(|| EnableState::Off.to_string())
+            .parse::<EnableState>()
+            .map(|s| s.is_enabled())
+            .unwrap_or(false);
+
+        let scopes_str = kvs.get(OIDC_SCOPES);
+        let scopes = if scopes_str.is_empty() {
+            OIDC_DEFAULT_SCOPES.split(',').map(String::from).collect()
+        } else {
+            scopes_str.split(',').map(|s| s.trim().to_string()).collect()
+        };
+
+        let redirect_uri_dynamic = kvs
+            .lookup(OIDC_REDIRECT_URI_DYNAMIC)
+            .unwrap_or_else(|| EnableState::On.to_string())
+            .parse::<EnableState>()
+            .map(|s| s.is_enabled())
+            .unwrap_or(true);
+
+        let claim_name = kvs
+            .lookup(OIDC_CLAIM_NAME)
+            .unwrap_or_else(|| OIDC_DEFAULT_CLAIM_NAME.to_string());
+        let groups_claim = kvs
+            .lookup(OIDC_GROUPS_CLAIM)
+            .unwrap_or_else(|| OIDC_DEFAULT_GROUPS_CLAIM.to_string());
+        let email_claim = kvs
+            .lookup(OIDC_EMAIL_CLAIM)
+            .unwrap_or_else(|| OIDC_DEFAULT_EMAIL_CLAIM.to_string());
+        let username_claim = kvs
+            .lookup(OIDC_USERNAME_CLAIM)
+            .unwrap_or_else(|| OIDC_DEFAULT_USERNAME_CLAIM.to_string());
+        let display_name = kvs.lookup(OIDC_DISPLAY_NAME).unwrap_or_else(|| id.to_string());
+        let redirect_uri = kvs.lookup(OIDC_REDIRECT_URI).filter(|v| !v.is_empty());
+        let client_secret = kvs.lookup(OIDC_CLIENT_SECRET).filter(|v| !v.is_empty());
+
+        Some(OidcProviderConfig {
+            id: id.to_string(),
+            enabled,
+            config_url,
+            client_id: kvs.get(OIDC_CLIENT_ID),
+            client_secret,
+            scopes,
+            redirect_uri,
+            redirect_uri_dynamic,
+            claim_name,
+            claim_prefix: kvs.get(OIDC_CLAIM_PREFIX),
+            role_policy: kvs.get(OIDC_ROLE_POLICY),
+            display_name,
+            groups_claim,
+            email_claim,
+            username_claim,
+        })
+    }
+
     /// Perform OIDC discovery for a provider.
     /// `discover_async` fetches the discovery document and JWKS in one step.
     async fn discover_provider(config: &OidcProviderConfig, http_client: &ReqwestHttpClient) -> Result<ProviderState, String> {
         // The openidconnect crate expects the issuer URL (base), not the
         // .well-known/openid-configuration URL.
-        let issuer_str = normalize_config_url(&config.config_url)?;
+        let base_issuer = normalize_config_url(&config.config_url)?;
+        let candidates = issuer_candidates(&base_issuer);
+        let mut last_errors = Vec::new();
 
-        let issuer_url = IssuerUrl::new(issuer_str).map_err(|e| format!("invalid issuer URL: {e}"))?;
+        for candidate_issuer in candidates.iter() {
+            let issuer_url = IssuerUrl::new(candidate_issuer.clone()).map_err(|e| format!("invalid issuer URL: {e}"))?;
 
-        let metadata = CoreProviderMetadata::discover_async(issuer_url, http_client)
-            .await
-            .map_err(|e| format!("discovery failed: {e}"))?;
+            match CoreProviderMetadata::discover_async(issuer_url, http_client)
+                .await
+                .map_err(|e| format!("discovery failed: {e}"))
+            {
+                Ok(metadata) => {
+                    return Ok(ProviderState {
+                        metadata,
+                        discovered_at: Instant::now(),
+                    });
+                }
+                Err(error) => {
+                    last_errors.push(format!("issuer '{candidate_issuer}': {error}"));
+                    warn!(
+                        "OIDC provider '{}' discovery attempt failed for issuer '{}': {}",
+                        config.id, candidate_issuer, error
+                    );
+                }
+            }
+        }
 
-        Ok(ProviderState {
-            metadata,
-            discovered_at: Instant::now(),
-        })
+        Err(format!(
+            "discovery failed for all issuer variants {:?}: {}",
+            candidates,
+            last_errors.join("; ")
+        ))
     }
+}
+
+pub fn load_oidc_provider_configs_from_env() -> Vec<OidcProviderConfig> {
+    OidcSys::parse_env_configs()
+}
+
+pub fn load_oidc_provider_configs_from_server_config(cfg: &ServerConfig) -> Vec<OidcProviderConfig> {
+    OidcSys::parse_persisted_configs(cfg)
+}
+
+pub fn merge_oidc_provider_configs(
+    env_configs: Vec<OidcProviderConfig>,
+    persisted_configs: Vec<OidcProviderConfig>,
+) -> Vec<SourcedOidcProviderConfig> {
+    let mut effective = HashMap::new();
+
+    for config in persisted_configs {
+        effective.insert(
+            config.id.clone(),
+            SourcedOidcProviderConfig {
+                config,
+                source: OidcProviderConfigSource::Persisted,
+            },
+        );
+    }
+
+    for config in env_configs {
+        effective.insert(
+            config.id.clone(),
+            SourcedOidcProviderConfig {
+                config,
+                source: OidcProviderConfigSource::Env,
+            },
+        );
+    }
+
+    let mut configs: Vec<SourcedOidcProviderConfig> = effective.into_values().collect();
+    configs.sort_by(|lhs, rhs| lhs.config.id.cmp(&rhs.config.id));
+    configs
+}
+
+pub fn load_effective_oidc_provider_configs(server_config: Option<&ServerConfig>) -> Vec<SourcedOidcProviderConfig> {
+    let env_configs = load_oidc_provider_configs_from_env();
+    let persisted_configs = server_config
+        .map(load_oidc_provider_configs_from_server_config)
+        .unwrap_or_default();
+    merge_oidc_provider_configs(env_configs, persisted_configs)
+}
+
+pub async fn validate_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
+    let http_client = ReqwestHttpClient(reqwest::Client::new());
+    let state = OidcSys::discover_provider(config, &http_client).await?;
+
+    Ok(OidcProviderValidationResult {
+        issuer: state.metadata.issuer().to_string(),
+        authorization_endpoint: state.metadata.authorization_endpoint().to_string(),
+        token_endpoint: state.metadata.token_endpoint().map(ToString::to_string),
+    })
 }
 
 // --- Helper functions ---
@@ -787,6 +977,21 @@ fn normalize_config_url(config_url: &str) -> Result<String, String> {
     }
 
     Ok(issuer)
+}
+
+fn issuer_candidates(base: &str) -> Vec<String> {
+    let original = base.trim();
+    let mut variants = Vec::with_capacity(2);
+    variants.push(original.to_string());
+
+    let toggled = if original.ends_with('/') {
+        original.trim_end_matches('/').to_string()
+    } else {
+        format!("{original}/")
+    };
+    variants.push(toggled);
+
+    variants
 }
 
 /// Decode the payload section of a JWT without validation (token must already be verified).
@@ -947,6 +1152,189 @@ mod tests {
     }
 
     #[test]
+    fn test_issuer_candidates() {
+        assert_eq!(
+            issuer_candidates("https://idp.example.com/realm"),
+            vec![
+                "https://idp.example.com/realm".to_string(),
+                "https://idp.example.com/realm/".to_string()
+            ]
+        );
+        assert_eq!(
+            issuer_candidates("https://idp.example.com/realm/"),
+            vec![
+                "https://idp.example.com/realm/".to_string(),
+                "https://idp.example.com/realm".to_string()
+            ]
+        );
+        assert_eq!(
+            issuer_candidates("https://idp.example.com"),
+            vec!["https://idp.example.com".to_string(), "https://idp.example.com/".to_string()]
+        );
+    }
+
+    fn build_mocked_oidc_provider_config(id: &str, config_url: &str) -> OidcProviderConfig {
+        OidcProviderConfig {
+            id: id.to_string(),
+            enabled: true,
+            config_url: config_url.to_string(),
+            client_id: "rustfs-oidc-test".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string()],
+            redirect_uri: None,
+            redirect_uri_dynamic: false,
+            claim_name: "sub".to_string(),
+            claim_prefix: "oidc".to_string(),
+            role_policy: String::new(),
+            display_name: "mock-oidc".to_string(),
+            groups_claim: "groups".to_string(),
+            email_claim: "email".to_string(),
+            username_claim: "username".to_string(),
+        }
+    }
+
+    fn start_mock_oidc_discovery_server<F>(
+        build_discovery_issuer: F,
+        max_requests: usize,
+    ) -> (String, std::thread::JoinHandle<()>)
+    where
+        F: Fn(&str) -> String + Send + 'static,
+    {
+        use std::io::Read;
+        use std::io::Write;
+        use std::net::{Shutdown, TcpListener};
+        use std::time::{Duration, Instant};
+
+        // After the last completed response, exit if no new connection arrives within this window.
+        const IDLE_SHUTDOWN: Duration = Duration::from_millis(100);
+        const ABSOLUTE_CAP: Duration = Duration::from_millis(500);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let discovery_issuer = build_discovery_issuer(&base);
+        let discovery_body = serde_json::json!({
+            "issuer": discovery_issuer,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "jwks_uri": format!("{base}/jwks"),
+            "response_types_supported": ["code"],
+            "response_modes_supported": ["query"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        })
+        .to_string();
+        let jwks_body = r#"{"keys":[]}"#;
+
+        let handle = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("failed to set discovery mock listener non-blocking");
+
+            let mut seen = 0usize;
+            let start = Instant::now();
+            let mut last_completed = Instant::now();
+
+            loop {
+                if seen > 0 && last_completed.elapsed() >= IDLE_SHUTDOWN {
+                    break;
+                }
+                if start.elapsed() >= ABSOLUTE_CAP {
+                    break;
+                }
+
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+
+                seen += 1;
+
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buffer).unwrap_or_default();
+                    if n == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..n]);
+                    if request_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if request_bytes.len() >= 8192 {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request_bytes);
+                let path = request.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("");
+
+                let (status, body) = if path.contains("/.well-known/openid-configuration") {
+                    (200, discovery_body.as_str())
+                } else if path.contains("/jwks") {
+                    (200, jwks_body)
+                } else {
+                    (404, r#"{"error":"not found"}"#)
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    if status == 200 { "OK" } else { "Not Found" },
+                    body.len()
+                );
+
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Both);
+                last_completed = Instant::now();
+
+                if seen >= max_requests {
+                    break;
+                }
+            }
+        });
+
+        (base, handle)
+    }
+
+    fn discovery_error_contains_all_variants(err: &str, base: &str) -> bool {
+        err.contains(base) && err.contains(&format!("{base}/")) && err.contains("discovery failed for all issuer variants")
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_provider_config_retries_with_issuer_candidates() {
+        // Discovery document must advertise the canonical issuer path. The first candidate has no
+        // trailing slash; openidconnect rejects issuer mismatch, then the second variant succeeds.
+        let (base, handle) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/rustfs/"), 8);
+        let config_url = format!("{base}/application/o/rustfs");
+        let config = build_mocked_oidc_provider_config("default", &config_url);
+
+        let result = validate_oidc_provider_config(&config).await;
+
+        let validation_result = result.expect("OIDC provider validation should succeed");
+        assert_eq!(validation_result.issuer, format!("{base}/application/o/rustfs/"));
+        assert!(handle.join().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_provider_config_returns_detailed_errors() {
+        let (base, handle) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/other"), 8);
+        let config_url = format!("{base}/application/o/rustfs");
+        let config = build_mocked_oidc_provider_config("default", &config_url);
+
+        let err = validate_oidc_provider_config(&config)
+            .await
+            .expect_err("OIDC provider validation should fail");
+        assert!(discovery_error_contains_all_variants(&err, &base));
+        assert!(err.contains("issuer '"));
+        assert!(err.contains(&format!("issuer '{base}/application/o/rustfs'")));
+        assert!(err.contains(&format!("issuer '{base}/application/o/rustfs/'")));
+        assert!(handle.join().is_ok());
+    }
+
+    #[test]
     fn test_decode_jwt_payload_invalid() {
         assert!(decode_jwt_payload("not-a-jwt").is_empty());
         assert!(decode_jwt_payload("").is_empty());
@@ -1017,6 +1405,59 @@ mod tests {
     fn test_parse_single_provider_no_config_url() {
         let config = OidcSys::parse_single_provider("_TEST_EMPTY", "test_empty");
         assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_parse_persisted_provider_config() {
+        let mut cfg = ServerConfig::new();
+        let mut kvs = KVS(vec![
+            rustfs_ecstore::config::KV {
+                key: ENABLE_KEY.to_string(),
+                value: EnableState::Off.to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CONFIG_URL.to_string(),
+                value: String::new(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CLIENT_ID.to_string(),
+                value: String::new(),
+                hidden_if_empty: false,
+            },
+        ]);
+        kvs.insert(
+            OIDC_CONFIG_URL.to_string(),
+            "https://example.com/.well-known/openid-configuration".to_string(),
+        );
+        kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
+        kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+
+        cfg.0
+            .entry(IDENTITY_OPENID_SUB_SYS.to_string())
+            .or_default()
+            .insert(DEFAULT_DELIMITER.to_string(), kvs);
+
+        let parsed = OidcSys::parse_persisted_configs(&cfg);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "default");
+        assert_eq!(parsed[0].client_id, "console");
+        assert!(parsed[0].enabled);
+    }
+
+    #[test]
+    fn test_merge_oidc_provider_configs_prefers_env() {
+        let mut persisted = test_config("default");
+        persisted.display_name = "Persisted".to_string();
+
+        let mut env = test_config("default");
+        env.display_name = "Environment".to_string();
+
+        let merged = merge_oidc_provider_configs(vec![env], vec![persisted]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].config.display_name, "Environment");
+        assert_eq!(merged[0].source, OidcProviderConfigSource::Env);
     }
 
     #[test]
