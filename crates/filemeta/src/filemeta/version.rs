@@ -761,7 +761,12 @@ impl FileMetaVersionHeader {
             return Err(Error::other(format!("version header array len err need 4 got {alen}")));
         }
 
-        rmp::decode::read_bin_len(&mut cur)?;
+        let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
+        if bin_len != 16 {
+            return Err(Error::other(format!(
+                "version header v1: version_id expected 16 byte binary, got length {bin_len}"
+            )));
+        }
         let mut version_id = [0u8; 16];
         cur.read_exact(&mut version_id)?;
         self.version_id = Some(S3VersionId::Uuid(Uuid::from_bytes(version_id)));
@@ -788,7 +793,12 @@ impl FileMetaVersionHeader {
             return Err(Error::other(format!("version header array len err need 5 got {alen}")));
         }
 
-        rmp::decode::read_bin_len(&mut cur)?;
+        let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
+        if bin_len != 16 {
+            return Err(Error::other(format!(
+                "version header v2: version_id expected 16 byte binary, got length {bin_len}"
+            )));
+        }
         let mut version_id = [0u8; 16];
         cur.read_exact(&mut version_id)?;
         self.version_id = Some(S3VersionId::Uuid(Uuid::from_bytes(version_id)));
@@ -820,20 +830,16 @@ impl FileMetaVersionHeader {
 
         // version_id (legacy fixed 16 bytes or extended 32-byte Wasabi form)
         let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
-        let mut bin = vec![0u8; bin_len];
-        cur.read_exact(&mut bin)?;
         // Match legacy header decode: 16-byte field is always `Some(Uuid)` on read (including nil UUID).
         self.version_id = match bin_len {
             16 => {
-                let arr: [u8; 16] = bin
-                    .try_into()
-                    .map_err(|_| Error::other("FileMetaVersionHeader: version_id expected 16 bytes"))?;
+                let mut arr = [0u8; 16];
+                cur.read_exact(&mut arr)?;
                 Some(S3VersionId::Uuid(Uuid::from_bytes(arr)))
             }
             32 => {
-                let arr: [u8; 32] = bin
-                    .try_into()
-                    .map_err(|_| Error::other("invalid version id in version header: expected 32 bytes for Wasabi ASCII form"))?;
+                let mut arr = [0u8; 32];
+                cur.read_exact(&mut arr)?;
                 if std::str::from_utf8(arr.as_slice()).is_err() {
                     return Err(Error::other(
                         "invalid version id in version header: 32-byte Wasabi form must be valid UTF-8",
@@ -1559,19 +1565,9 @@ impl MetaObject {
 
             match key.as_str() {
                 "ID" => {
-                    let blen = rmp::decode::read_bin_len(rd).map_err(|e| {
-                        tracing::error!(error = %e, "decode_from: read_bin_len ID failed");
-                        e
-                    })? as usize;
-                    let mut buf = vec![0u8; blen];
-                    rd.read_exact(&mut buf).map_err(|e| {
-                        tracing::error!(error = %e, "decode_from: read_exact ID buf failed");
-                        e
-                    })?;
-                    self.version_id = S3VersionId::from_msgpack_id_bytes(&buf).map_err(|e| {
+                    self.version_id = S3VersionId::read_msgpack_bin_field(rd).map_err(|e| {
                         tracing::error!(
                             error = %e,
-                            id_bin_len = blen,
                             "decode_from MetaObject: invalid version id field (ID)"
                         );
                         e
@@ -2313,13 +2309,9 @@ impl MetaDeleteMarker {
 
             match key.as_str() {
                 "ID" => {
-                    let blen = rmp::decode::read_bin_len(rd)? as usize;
-                    let mut buf = vec![0u8; blen];
-                    rd.read_exact(&mut buf)?;
-                    self.version_id = S3VersionId::from_msgpack_id_bytes(&buf).map_err(|e| {
+                    self.version_id = S3VersionId::read_msgpack_bin_field(rd).map_err(|e| {
                         tracing::error!(
                             error = %e,
-                            id_bin_len = blen,
                             "decode_from MetaDeleteMarker: invalid version id field (ID)"
                         );
                         e
@@ -2962,6 +2954,49 @@ mod tests {
         decoded.unmarshal_v(3, &encoded).unwrap();
 
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn version_header_unmarshal_msg_rejects_bad_version_id_bin_len() {
+        let mut wr = Vec::new();
+        rmp::encode::write_array_len(&mut wr, 7).unwrap();
+        rmp::encode::write_bin(&mut wr, &[0u8; 5]).unwrap();
+        let mut h = FileMetaVersionHeader::default();
+        let err = h.unmarshal_msg(&wr).unwrap_err();
+        assert!(err.to_string().contains("expected 16 or 32"), "{err}");
+    }
+
+    #[test]
+    fn version_header_unmarshal_v1_rejects_non_16_byte_version_id() {
+        let mut wr = Vec::new();
+        rmp::encode::write_array_len(&mut wr, 4).unwrap();
+        rmp::encode::write_bin(&mut wr, &[0u8; 8]).unwrap();
+        let mut h = FileMetaVersionHeader::default();
+        assert!(h.unmarshal_v1(&wr).is_err());
+    }
+
+    #[test]
+    fn meta_object_decode_rejects_id_bin_with_bad_length() {
+        let mut wr = Vec::new();
+        rmp::encode::write_map_len(&mut wr, 1).unwrap();
+        rmp::encode::write_str(&mut wr, "ID").unwrap();
+        rmp::encode::write_bin(&mut wr, &[0u8; 64]).unwrap();
+        let mut obj = MetaObject::default();
+        let mut cur = std::io::Cursor::new(wr);
+        let err = obj.decode_from(&mut cur).unwrap_err();
+        assert!(err.to_string().contains("expected 16 or 32"), "{err}");
+    }
+
+    #[test]
+    fn meta_delete_marker_decode_rejects_id_bin_with_bad_length() {
+        let mut wr = Vec::new();
+        rmp::encode::write_map_len(&mut wr, 1).unwrap();
+        rmp::encode::write_str(&mut wr, "ID").unwrap();
+        rmp::encode::write_bin(&mut wr, &[0xffu8; 8]).unwrap();
+        let mut dm = MetaDeleteMarker::default();
+        let mut cur = std::io::Cursor::new(wr);
+        let err = dm.decode_from(&mut cur).unwrap_err();
+        assert!(err.to_string().contains("expected 16 or 32"), "{err}");
     }
 
     #[test]

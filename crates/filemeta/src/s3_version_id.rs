@@ -173,10 +173,36 @@ impl S3VersionId {
         }
     }
 
-    /// Parse S3 `versionId` query/body (`null`, UUID, or 32-char ASCII Wasabi-shaped string).
+    /// Read a msgpack `bin` length prefix and payload as a version id.
     ///
-    /// Exactly 32 ASCII bytes are treated as Wasabi-style ids **before** [`Uuid::parse_str`], because the
-    /// UUID parser accepts some 32-character hex forms that would otherwise collide with that shape.
+    /// Validates length is 16 or 32 **before** reading payload (stack buffers only; no length-based allocation).
+    pub fn read_msgpack_bin_field<R: std::io::Read>(rd: &mut R) -> Result<Option<Self>> {
+        let blen = rmp::decode::read_bin_len(rd).map_err(Error::from)? as usize;
+        match blen {
+            16 => {
+                let mut arr = [0u8; 16];
+                rd.read_exact(&mut arr).map_err(Error::from)?;
+                Self::from_msgpack_id_bytes(&arr)
+            }
+            32 => {
+                let mut arr = [0u8; 32];
+                rd.read_exact(&mut arr).map_err(Error::from)?;
+                Self::from_msgpack_id_bytes(&arr)
+            }
+            _ => Err(Error::other(format!(
+                "invalid version id in object metadata: expected 16 or 32 byte binary ID field, got length {blen}"
+            ))),
+        }
+    }
+
+    /// Parse S3 `versionId` query/body (`null`, UUID, or exactly 32 ASCII bytes).
+    ///
+    /// **Permissive API path:** any 32-byte ASCII string is accepted as the stored Wasabi wire form
+    /// (`WasabiAscii`); charset is **not** restricted to strict `createVersionId` shape here.
+    /// For inbound `X-Wasabi-Set-Version-Id`, use [`Self::parse_x_wasabi_set_version_id`] instead.
+    ///
+    /// Exactly 32 ASCII bytes are handled **before** [`Uuid::parse_str`], because the UUID parser
+    /// accepts some 32-character hex forms that would otherwise collide with that shape.
     pub fn parse_api_version_id(s: &str) -> Result<Option<Self>> {
         if s.is_empty() || s == NULL_VERSION_ID {
             return Ok(None);
@@ -335,5 +361,31 @@ mod tests {
         b[1] = b'1';
         let err = S3VersionId::from_msgpack_id_bytes(b.as_slice()).unwrap_err();
         assert!(err.to_string().contains("must be valid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn read_msgpack_bin_field_rejects_bad_length_before_payload_read() {
+        let mut wr = Vec::new();
+        rmp::encode::write_bin(&mut wr, &[0u8; 2]).unwrap();
+        let total_len = wr.len();
+        let mut cur = std::io::Cursor::new(wr);
+        let err = S3VersionId::read_msgpack_bin_field(&mut cur).unwrap_err();
+        assert!(err.to_string().contains("expected 16 or 32"), "{err}");
+        assert!(
+            (cur.position() as usize) < total_len,
+            "cursor should not consume the full msgpack bin value on reject"
+        );
+    }
+
+    #[test]
+    fn read_msgpack_bin_field_round_trips_uuid_bin() {
+        let u = Uuid::new_v4();
+        let mut wr = Vec::new();
+        rmp::encode::write_bin(&mut wr, u.as_bytes()).unwrap();
+        let total_len = wr.len();
+        let mut cur = std::io::Cursor::new(wr);
+        let id = S3VersionId::read_msgpack_bin_field(&mut cur).unwrap().unwrap();
+        assert_eq!(id, S3VersionId::Uuid(u));
+        assert_eq!(cur.position() as usize, total_len);
     }
 }
