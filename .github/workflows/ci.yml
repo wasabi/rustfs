@@ -200,7 +200,7 @@ jobs:
         with:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
-          rev: 4a04a670cf41274d9be9ab65dc36f4aa3f92fbad
+          rev: da276469212a6d57ac5a6bf831e6af41e0646785
 
       - name: Run end-to-end tests
         run: |
