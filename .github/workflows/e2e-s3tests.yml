@@ -78,6 +78,8 @@ jobs:
 
       - name: Install Python tools
         run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
           python3 -m pip install --user --upgrade pip awscurl tox
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -240,6 +242,8 @@ jobs:
 
       - name: Install Python tools
         run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
           python3 -m pip install --user --upgrade pip awscurl tox
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 

@@ -234,6 +234,15 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
+      # Same as e2e-s3tests.yml: provision awscurl (admin API SigV4) and tox before run.sh.
+      # Minimal images may ship python3 without pip (No module named pip).
+      - name: Install Python tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
+          python3 -m pip install --user --upgrade pip awscurl tox
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Run implemented s3-tests
         run: |
           DEPLOY_MODE=binary \
