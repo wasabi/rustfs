@@ -80,7 +80,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
-          python3 -m pip install --user --upgrade pip awscurl tox
+          python3 -m pip install --user --break-system-packages --upgrade pip awscurl tox
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Enable buildx
@@ -244,7 +244,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
-          python3 -m pip install --user --upgrade pip awscurl tox
+          python3 -m pip install --user --break-system-packages --upgrade pip awscurl tox
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Enable buildx

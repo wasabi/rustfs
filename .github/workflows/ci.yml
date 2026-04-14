@@ -236,11 +236,13 @@ jobs:
 
       # Same as e2e-s3tests.yml: provision awscurl (admin API SigV4) and tox before run.sh.
       # Minimal images may ship python3 without pip (No module named pip).
+      # Ubuntu/Debian PEP 668 (externally-managed-environment) rejects plain --user installs; use
+      # --break-system-packages for CI-only user-site installs (same fallback as scripts/s3-tests/run.sh).
       - name: Install Python tools
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
-          python3 -m pip install --user --upgrade pip awscurl tox
+          python3 -m pip install --user --break-system-packages --upgrade pip awscurl tox
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run implemented s3-tests
