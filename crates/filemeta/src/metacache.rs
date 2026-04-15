@@ -874,7 +874,7 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
 mod tests {
     use super::*;
     use crate::test_data::create_real_xlmeta;
-    use crate::{FileMetaVersion, MetaDeleteMarker};
+    use crate::{FileMetaVersion, MetaDeleteMarker, S3VersionId};
     use std::collections::HashMap;
     use std::io::Cursor;
     use uuid::Uuid;
@@ -916,7 +916,7 @@ mod tests {
             version_type: VersionType::Delete,
             object: None,
             delete_marker: Some(MetaDeleteMarker {
-                version_id: Some(Uuid::from_u128(0x22222222333344445555666666666666)),
+                version_id: Some(S3VersionId::Uuid(Uuid::from_u128(0x22222222333344445555666666666666))),
                 mod_time: Some(OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp")),
                 meta_sys: HashMap::new(),
             }),

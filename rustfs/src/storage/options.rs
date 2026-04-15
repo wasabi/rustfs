@@ -16,6 +16,8 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::{WASABI_SET_VERSION_ID_HEADER, ensure_wasabi_set_version_id_header_allowed, wasabi_version_ids_enabled};
+use rustfs_filemeta::S3VersionId;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
 use rustfs_utils::http::{
@@ -64,22 +66,25 @@ pub async fn del_opts(
         vid
     };
 
-    let vid = vid.map(|v| v.as_str().trim().to_owned());
-
-    // Handle AWS S3 special case: "null" string represents null version ID
-    // When VersionId='null' is specified, it means delete the object with null version ID
-    let vid = if let Some(ref id) = vid {
-        if id.eq_ignore_ascii_case("null") {
-            // Convert "null" to Uuid::nil() string representation
+    let vid = vid.and_then(|v| {
+        let t = v.trim();
+        if t.is_empty() {
+            None
+        } else if t.eq_ignore_ascii_case("null") {
             Some(Uuid::nil().to_string())
         } else {
-            // Validate UUID format for other version IDs
-            if *id != Uuid::nil().to_string() && Uuid::parse_str(id.as_str()).is_err() {
-                error!("del_opts: invalid version id: {} error: invalid UUID format", id);
-                return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-            }
-            Some(id.clone())
+            Some(t.to_owned())
         }
+    });
+
+    let vid = if let Some(ref id) = vid {
+        if *id != Uuid::nil().to_string() {
+            S3VersionId::parse_api_version_id(id.as_str()).map_err(|e| {
+                error!("del_opts: invalid version id: {} error: {}", id, e);
+                StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone())
+            })?;
+        }
+        Some(id.clone())
     } else {
         None
     };
@@ -123,20 +128,26 @@ pub async fn get_opts(
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
 
-    let vid = vid.map(|v| v.as_str().trim().to_owned());
-
     let nil_uuid_str = Uuid::nil().to_string();
+
+    let vid = vid.and_then(|v| {
+        let t = v.trim();
+        if t.is_empty() {
+            None
+        } else if t.eq_ignore_ascii_case("null") {
+            Some(nil_uuid_str.clone())
+        } else {
+            Some(t.to_owned())
+        }
+    });
 
     let vid = match vid {
         Some(ref id) => {
-            if id.eq_ignore_ascii_case("null") {
-                Some(nil_uuid_str.clone())
-            } else {
-                if id.as_str() != nil_uuid_str.as_str() && Uuid::parse_str(id).is_err() {
-                    return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-                }
-                Some(id.clone())
+            if id.as_str() != nil_uuid_str.as_str() {
+                S3VersionId::parse_api_version_id(id.as_str())
+                    .map_err(|_| StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()))?;
             }
+            Some(id.clone())
         }
         None => None,
     };
@@ -203,6 +214,8 @@ pub async fn put_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
+    ensure_wasabi_set_version_id_header_allowed(headers, bucket, object)?;
+
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
 
@@ -212,11 +225,38 @@ pub async fn put_opts(
         vid
     };
 
-    let vid = vid.map(|v| v.as_str().trim().to_owned());
+    let mut vid = vid.and_then(|v| {
+        let t = v.trim();
+        if t.is_empty() {
+            None
+        } else if t.eq_ignore_ascii_case("null") {
+            Some(Uuid::nil().to_string())
+        } else {
+            Some(t.to_owned())
+        }
+    });
+
+    if wasabi_version_ids_enabled()
+        && let Some(raw) = headers.get(WASABI_SET_VERSION_ID_HEADER).and_then(|v| v.to_str().ok())
+    {
+        let t = raw.trim();
+        if !t.is_empty() {
+            if !versioned || version_suspended {
+                return Err(StorageError::InvalidArgument(
+                    bucket.to_owned(),
+                    object.to_owned(),
+                    "X-Wasabi-Set-Version-Id requires bucket versioning to be Enabled (not Off or Suspended)".to_owned(),
+                ));
+            }
+            let id = S3VersionId::parse_x_wasabi_set_version_id(t)
+                .map_err(|e| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), e.to_string()))?;
+            vid = Some(id.to_string());
+        }
+    }
 
     if let Some(ref id) = vid
         && *id != Uuid::nil().to_string()
-        && let Err(_err) = Uuid::parse_str(id.as_str())
+        && S3VersionId::parse_api_version_id(id.as_str()).is_err()
     {
         return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
@@ -235,6 +275,72 @@ pub async fn put_opts(
     opts.versioned = versioned;
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
+
+    Ok(opts)
+}
+
+/// Options for [`CompleteMultipartUpload`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html):
+/// same Wasabi header + versioning rules as [`put_opts`], merged with checksum / replication fields from
+/// [`get_complete_multipart_upload_opts`]. Bucket versioning is read at **complete** time (Wasabi-aligned).
+pub async fn complete_multipart_upload_opts(
+    bucket: &str,
+    object: &str,
+    headers: &HeaderMap<HeaderValue>,
+) -> Result<ObjectOptions> {
+    ensure_wasabi_set_version_id_header_allowed(headers, bucket, object)?;
+
+    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
+    let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+
+    let vid = get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned());
+    let mut vid = vid.and_then(|v| {
+        let t = v.trim();
+        if t.is_empty() {
+            None
+        } else if t.eq_ignore_ascii_case("null") {
+            Some(Uuid::nil().to_string())
+        } else {
+            Some(t.to_owned())
+        }
+    });
+
+    if wasabi_version_ids_enabled()
+        && let Some(raw) = headers.get(WASABI_SET_VERSION_ID_HEADER).and_then(|v| v.to_str().ok())
+    {
+        let t = raw.trim();
+        if !t.is_empty() {
+            if !versioned || version_suspended {
+                return Err(StorageError::InvalidArgument(
+                    bucket.to_owned(),
+                    object.to_owned(),
+                    "X-Wasabi-Set-Version-Id requires bucket versioning to be Enabled (not Off or Suspended)".to_owned(),
+                ));
+            }
+            let id = S3VersionId::parse_x_wasabi_set_version_id(t)
+                .map_err(|e| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), e.to_string()))?;
+            vid = Some(id.to_string());
+        }
+    }
+
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && S3VersionId::parse_api_version_id(id.as_str()).is_err()
+    {
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+    }
+
+    let mut opts = get_complete_multipart_upload_opts(headers)
+        .map_err(|e| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), e.to_string()))?;
+
+    opts.version_id = {
+        if is_dir_object(object) && vid.is_none() {
+            Some(Uuid::nil().to_string())
+        } else {
+            vid
+        }
+    };
+    opts.version_suspended = version_suspended;
+    opts.versioned = versioned;
 
     Ok(opts)
 }
@@ -727,6 +833,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_del_opts_whitespace_only_version_id_is_none() {
+        let headers = create_test_headers();
+        let result = del_opts("test-bucket", "test-object", Some("\t\n ".to_string()), &headers, HashMap::new()).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().version_id, None);
+    }
+
+    #[tokio::test]
     async fn test_del_opts_with_directory_object() {
         let headers = create_test_headers();
 
@@ -845,6 +959,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_opts_whitespace_only_version_id_is_none() {
+        let headers = create_test_headers();
+        let result = get_opts("test-bucket", "test-object", Some("   \t".to_string()), None, &headers).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().version_id, None);
+    }
+
+    #[tokio::test]
     async fn test_get_opts_with_part_number() {
         let headers = create_test_headers();
 
@@ -900,6 +1022,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_put_opts_empty_trimmed_source_version_id_is_none() {
+        let headers = create_test_headers();
+        let result = put_opts("test-bucket", "test-object", Some("  ".to_string()), &headers, HashMap::new()).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().version_id, None);
+    }
+
+    #[tokio::test]
     async fn test_put_opts_with_directory_object() {
         let headers = create_test_headers();
 
@@ -928,6 +1058,50 @@ mod tests {
                 _ => panic!("Expected InvalidVersionID error"),
             }
         }
+    }
+
+    /// Synthetic bucket has no versioning metadata → `prefix_enabled` is false; strict Wasabi header must be rejected.
+    #[tokio::test]
+    async fn test_put_opts_wasabi_header_rejects_when_versioning_not_enabled() {
+        let mut headers = create_test_headers();
+        headers.insert(WASABI_SET_VERSION_ID_HEADER, HeaderValue::from_static("000000000000000000001-ABCDEabcd0"));
+        let result = put_opts("test-bucket", "test-object", None, &headers, HashMap::new()).await;
+        assert!(result.is_err(), "expected InvalidArgument when versioning is not Enabled");
+        match result.unwrap_err() {
+            StorageError::InvalidArgument(_, _, msg) => {
+                assert!(
+                    msg.contains("Enabled") && (msg.contains("Suspended") || msg.contains("not Off")),
+                    "unexpected message: {msg}"
+                );
+            }
+            e => panic!("expected InvalidArgument, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_upload_opts_wasabi_header_rejects_when_versioning_not_enabled() {
+        let mut headers = create_test_headers();
+        headers.insert(WASABI_SET_VERSION_ID_HEADER, HeaderValue::from_static("000000000000000000001-ABCDEabcd0"));
+        let result = complete_multipart_upload_opts("test-bucket", "test-object", &headers).await;
+        assert!(result.is_err(), "expected InvalidArgument when versioning is not Enabled");
+        match result.unwrap_err() {
+            StorageError::InvalidArgument(_, _, msg) => {
+                assert!(
+                    msg.contains("Enabled") && (msg.contains("Suspended") || msg.contains("not Off")),
+                    "unexpected message: {msg}"
+                );
+            }
+            e => panic!("expected InvalidArgument, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_upload_opts_whitespace_only_source_version_id_is_none() {
+        let mut headers = create_test_headers();
+        insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, "  \t");
+        let result = complete_multipart_upload_opts("test-bucket", "test-object", &headers).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().version_id, None);
     }
 
     #[tokio::test]

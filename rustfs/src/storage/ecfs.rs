@@ -157,15 +157,21 @@ impl FS {
     }
 }
 
-pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<Uuid>> {
-    if let Some(vid) = version_id {
-        let uuid = Uuid::parse_str(&vid).map_err(|e| {
-            error!("Invalid version ID: {}", e);
-            s3_error!(InvalidArgument, "Invalid version ID")
-        })?;
-        Ok(Some(uuid))
-    } else {
-        Ok(None)
+pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<String>> {
+    let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    match version_id {
+        None => Ok(None),
+        Some(id) => {
+            // Match get_opts/del_opts: S3 null version sentinel must select the nil UUID, not "latest".
+            if id.eq_ignore_ascii_case("null") {
+                return Ok(Some(Uuid::nil().to_string()));
+            }
+            let parsed = rustfs_filemeta::S3VersionId::parse_api_version_id(&id).map_err(|e| {
+                error!("Invalid version ID: {}", e);
+                s3_error!(InvalidArgument, "Invalid version ID")
+            })?;
+            Ok(parsed.map(|v| v.to_string()))
+        }
     }
 }
 
@@ -872,5 +878,27 @@ impl S3 for FS {
         record_s3_op(S3Operation::UploadPartCopy, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_upload_part_copy(req).await
+    }
+}
+
+#[cfg(test)]
+mod parse_object_version_id_tests {
+    use super::parse_object_version_id;
+    use uuid::Uuid;
+
+    #[test]
+    fn null_sentinel_maps_to_nil_uuid_string() {
+        let nil = Uuid::nil().to_string();
+        for s in ["null", "NULL", " Null "] {
+            let got = parse_object_version_id(Some(s.to_string())).expect("ok");
+            assert_eq!(got.as_deref(), Some(nil.as_str()), "input={s:?}");
+        }
+    }
+
+    #[test]
+    fn empty_and_none_mean_no_version() {
+        assert!(parse_object_version_id(None).unwrap().is_none());
+        assert!(parse_object_version_id(Some(String::new())).unwrap().is_none());
+        assert!(parse_object_version_id(Some("   ".to_string())).unwrap().is_none());
     }
 }

@@ -71,7 +71,8 @@ use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType,
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, ReplicateDecision, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
+    RawFileInfo, ReplicateDecision, ReplicationStatusType, S3VersionId, VersionPurgeStatusType, file_info_from_raw,
+    merge_file_meta_versions,
 };
 use rustfs_lock::LockClient;
 use rustfs_lock::fast_lock::types::LockResult;
@@ -749,16 +750,13 @@ impl ObjectIO for SetDisks {
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 
-        fi.version_id = {
-            if let Some(ref vid) = opts.version_id {
-                Some(Uuid::parse_str(vid.as_str()).map_err(Error::other)?)
-            } else {
-                None
-            }
+        fi.version_id = match opts.version_id.as_deref() {
+            None => None,
+            Some(v) => S3VersionId::parse_api_version_id(v).map_err(Error::other)?,
         };
 
         if opts.versioned && fi.version_id.is_none() {
-            fi.version_id = Some(Uuid::new_v4());
+            fi.version_id = Some(crate::mint_new_object_version_id());
         }
 
         fi.data_dir = Some(Uuid::new_v4());
@@ -1128,12 +1126,12 @@ impl ObjectOperations for SetDisks {
             return Err(to_object_err(Error::MethodNotAllowed, vec![src_bucket, src_object]));
         }
 
-        let version_id = {
+        let version_id: Option<S3VersionId> = {
             if src_info.version_only {
                 if let Some(vid) = &dst_opts.version_id {
-                    Some(Uuid::parse_str(vid)?)
+                    S3VersionId::parse_api_version_id(vid)?
                 } else {
-                    Some(Uuid::new_v4())
+                    Some(crate::mint_new_object_version_id())
                 }
             } else {
                 src_info.version_id
@@ -1297,7 +1295,7 @@ impl ObjectOperations for SetDisks {
                     vr.mod_time = Some(OffsetDateTime::now_utc());
                     vr.deleted = true;
                     if versioned {
-                        vr.version_id = Some(Uuid::new_v4());
+                        vr.version_id = Some(crate::mint_new_object_version_id());
                     }
                 }
             }
@@ -1474,10 +1472,10 @@ impl ObjectOperations for SetDisks {
 
         let otd = ObjectToDelete {
             object_name: object.to_string(),
-            version_id: opts
-                .version_id
-                .clone()
-                .map(|v| Uuid::parse_str(v.as_str()).ok().unwrap_or_default()),
+            version_id: match opts.version_id.as_deref() {
+                None => None,
+                Some(v) => S3VersionId::parse_api_version_id(v).map_err(Error::other)?,
+            },
             ..Default::default()
         };
 
@@ -1558,10 +1556,10 @@ impl ObjectOperations for SetDisks {
                 fi.set_skip_tier_free_version();
             }
 
-            fi.version_id = if let Some(vid) = opts.version_id {
-                Some(Uuid::parse_str(vid.as_str())?)
+            fi.version_id = if let Some(vid) = opts.version_id.as_deref() {
+                S3VersionId::parse_api_version_id(vid).map_err(Error::other)?
             } else if opts.versioned {
-                Some(Uuid::new_v4())
+                Some(crate::mint_new_object_version_id())
             } else {
                 None
             };
@@ -1575,10 +1573,18 @@ impl ObjectOperations for SetDisks {
             return Ok(oi);
         }
 
+        let version_id = opts
+            .version_id
+            .as_deref()
+            .map(S3VersionId::parse_api_version_id)
+            .transpose()
+            .map_err(Error::other)?
+            .flatten();
+
         // Create a single object deletion request
         let mut dfi = FileInfo {
             name: object.to_string(),
-            version_id: opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
+            version_id,
             mark_deleted: mark_delete,
             deleted: delete_marker,
             mod_time: Some(mod_time),
@@ -1734,7 +1740,7 @@ impl ObjectOperations for SetDisks {
             fi.mod_time = opts.mod_time;
         }
         if let Some(ref version_id) = opts.version_id {
-            fi.version_id = Uuid::parse_str(version_id).ok();
+            fi.version_id = S3VersionId::parse_api_version_id(version_id).map_err(Error::other)?;
         }
 
         self.update_object_meta(bucket, object, fi.clone(), &online_disks)
@@ -2738,14 +2744,13 @@ impl MultipartOperations for SetDisks {
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 
-        fi.version_id = if let Some(vid) = &opts.version_id {
-            Some(Uuid::parse_str(vid)?)
-        } else {
-            None
+        fi.version_id = match opts.version_id.as_deref() {
+            None => None,
+            Some(v) => S3VersionId::parse_api_version_id(v).map_err(Error::other)?,
         };
 
         if opts.versioned && opts.version_id.is_none() {
-            fi.version_id = Some(Uuid::new_v4());
+            fi.version_id = Some(crate::mint_new_object_version_id());
         }
 
         fi.data_dir = Some(Uuid::new_v4());
@@ -2877,6 +2882,12 @@ impl MultipartOperations for SetDisks {
 
         let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+
+        // Wasabi-style commit: `getReplicationHeaders` on Complete can replace the version id chosen
+        // at Initiate (no initiate↔complete equality check). Apply when Complete carries an explicit id.
+        if let Some(ref vid) = opts.version_id {
+            fi.version_id = S3VersionId::parse_api_version_id(vid.as_str()).map_err(Error::other)?;
+        }
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
@@ -4613,7 +4624,7 @@ mod tests {
         let version_id = Uuid::new_v4();
         let transition_version_id = Uuid::new_v4();
         let original = FileInfo {
-            version_id: Some(version_id),
+            version_id: Some(S3VersionId::Uuid(version_id)),
             transition_status: TRANSITION_COMPLETE.to_string(),
             transitioned_objname: "remote/object".to_string(),
             transition_tier: "WARM-TIER".to_string(),

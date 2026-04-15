@@ -2647,6 +2647,7 @@ mod tests {
 
     #[test]
     fn build_list_object_versions_m_output_maps_metadata_and_preserves_entry_order() {
+        use rustfs_filemeta::S3VersionId;
         use time::macros::datetime;
         use uuid::Uuid;
 
@@ -2664,7 +2665,7 @@ mod tests {
                     user_defined: HashMap::from([("project".to_string(), "alpha".to_string())]),
                     parity_blocks: 2,
                     data_blocks: 4,
-                    version_id: Some(Uuid::nil()),
+                    version_id: Some(S3VersionId::Uuid(Uuid::nil())),
                     user_tags: "env=prod".to_string(),
                     is_latest: true,
                     etag: Some("0123456789abcdef0123456789abcdef".to_string()),

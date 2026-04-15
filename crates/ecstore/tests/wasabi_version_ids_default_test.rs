@@ -12,21 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod error;
-mod fileinfo;
-mod filemeta;
-mod filemeta_inline;
-mod s3_version_id;
-// pub mod headers;
-mod metacache;
-mod replication;
+//! Separate integration test binary so `LazyLock` reads an unset env (default true).
 
-pub mod test_data;
+use rustfs_ecstore::wasabi_version_ids_enabled;
+use temp_env::with_var_unset;
 
-pub use error::*;
-pub use fileinfo::*;
-pub use filemeta::*;
-pub use filemeta_inline::*;
-pub use metacache::*;
-pub use replication::*;
-pub use s3_version_id::{S3VersionId, WASABI_VERSION_ID_RANDOM_ALPHABET, is_strict_wasabi_create_version_id};
+#[test]
+fn wasabi_version_ids_defaults_to_true_when_unset() {
+    with_var_unset("RUSTFS_WASABI_VERSION_IDS", || {
+        assert!(wasabi_version_ids_enabled());
+    });
+}

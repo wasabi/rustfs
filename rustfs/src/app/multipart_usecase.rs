@@ -22,7 +22,7 @@ use crate::storage::concurrency::get_concurrency_manager;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
-    copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
+    complete_multipart_upload_opts, copy_src_opts, extract_metadata, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts,
 };
 use crate::storage::s3_api::multipart::build_list_parts_output;
@@ -284,7 +284,9 @@ impl DefaultMultipartUsecase {
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
-        let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
+        let opts = complete_multipart_upload_opts(&bucket, &key, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
 
         let uploaded_parts_vec = multipart_upload
             .parts
@@ -358,7 +360,7 @@ impl DefaultMultipartUsecase {
 
         let obj_info = store
             .clone()
-            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
+            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
             .await
             .map_err(ApiError::from)?;
 

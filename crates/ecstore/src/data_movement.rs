@@ -276,6 +276,7 @@ pub(crate) async fn migrate_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_filemeta::S3VersionId;
     use time::OffsetDateTime;
     use uuid::Uuid;
 
@@ -339,7 +340,7 @@ mod tests {
     fn test_data_movement_new_multipart_opts_preserves_etag_and_version() {
         let version_id = Uuid::nil();
         let object_info = ObjectInfo {
-            version_id: Some(version_id),
+            version_id: Some(S3VersionId::Uuid(version_id)),
             etag: Some("etag-value".to_string()),
             user_defined: std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
             ..Default::default()
@@ -360,7 +361,7 @@ mod tests {
         let mod_time = OffsetDateTime::now_utc();
         let version_id = Uuid::nil();
         let object_info = ObjectInfo {
-            version_id: Some(version_id),
+            version_id: Some(S3VersionId::Uuid(version_id)),
             mod_time: Some(mod_time),
             etag: Some("etag-value".to_string()),
             ..Default::default()
@@ -379,7 +380,7 @@ mod tests {
     fn test_data_movement_put_object_opts_preserves_version_and_etag() {
         let version_id = Uuid::nil();
         let object_info = ObjectInfo {
-            version_id: Some(version_id),
+            version_id: Some(S3VersionId::Uuid(version_id)),
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
             etag: Some("etag-value".to_string()),
             user_defined: std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
