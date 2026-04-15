@@ -1,0 +1,77 @@
+# Temporary: time rustfs debug build with vs without lab shared sccache (Redis).
+# Runs only on branch tmp/lab-sccache-verify. Requires self-hosted runners with lab + lab-sccache-redis.
+name: Lab sccache bench
+
+on:
+  push:
+    branches: [tmp/lab-sccache-verify]
+  workflow_dispatch:
+
+concurrency:
+  group: lab-sccache-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  LAB_SCCACHE_REDIS_DEFAULT: redis://lab-sccache-redis.lab.svc.cluster.local:6379/0
+
+jobs:
+  bench:
+    name: Timed cargo build (baseline vs sccache warm)
+    runs-on: [self-hosted, lab, lab-small]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl (matches ARC runner PATH expectations)
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.29.0
+
+      - name: Install mozilla/sccache
+        run: |
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-x86_64-unknown-linux-musl.tar.gz" | tar xz -C /tmp
+          sudo install -m 0755 /tmp/sccache-v0.14.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          sccache --version
+
+      - name: Setup Rust (same as CI debug build)
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: lab-sccache-bench-${{ hashFiles('**/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: false
+
+      - name: Baseline build (no sccache)
+        run: |
+          set -euo pipefail
+          unset RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER SCCACHE_REDIS LAB_SCCACHE_REDIS_DEFAULT || true
+          cargo clean
+          touch rustfs/build.rs
+          /usr/bin/time -f 'BASELINE_SEC %e' cargo build -p rustfs --bins 2>&1 | tee /tmp/sccache-bench-baseline.log
+
+      - name: Prime sccache (cold) and warm rebuild (timed)
+        run: |
+          set -euo pipefail
+          set -a
+          # shellcheck source=scripts/lab-sccache-env.sh
+          source scripts/lab-sccache-env.sh
+          set +a
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-} SCCACHE_REDIS=${SCCACHE_REDIS:-}"
+          cargo clean
+          touch rustfs/build.rs
+          /usr/bin/time -f 'SCCACHE_COLD_SEC %e' cargo build -p rustfs --bins 2>&1 | tee /tmp/sccache-bench-cold.log
+          cargo clean
+          touch rustfs/build.rs
+          /usr/bin/time -f 'SCCACHE_WARM_SEC %e' cargo build -p rustfs --bins 2>&1 | tee /tmp/sccache-bench-warm.log
+
+      - name: Summary
+        run: |
+          {
+            echo "## Lab sccache bench"
+            echo
+            grep -hE 'BASELINE_SEC|SCCACHE_(COLD|WARM)_SEC' /tmp/sccache-bench-*.log 2>/dev/null || true
+            echo
+            echo '### Cargo tail (warm)'
+            tail -5 /tmp/sccache-bench-warm.log 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
