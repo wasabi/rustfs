@@ -70,6 +70,15 @@ runs:
         echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
         echo "Set CARGO_BUILD_JOBS=$jobs"
 
+    - name: Normalize sccache wrapper env
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -f scripts/lab-sccache-env.sh ]]; then
+          # shellcheck disable=SC1091
+          source scripts/lab-sccache-env.sh
+        fi
+
     - name: Install system dependencies (Ubuntu)
       if: runner.os == 'Linux'
       shell: bash
