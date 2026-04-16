@@ -56,6 +56,7 @@ use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use rustfs_workers::workers::Workers;
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 #[cfg(test)]
@@ -1405,7 +1406,7 @@ impl ECStore {
 
         let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
 
-        fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
+        fivs.versions.sort_by_key(|b| Reverse(b.mod_time));
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
