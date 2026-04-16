@@ -32,6 +32,7 @@
 use hashbrown::HashMap;
 use moka::future::Cache;
 use rustfs_config::MI_B;
+use std::cmp::Reverse;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -125,7 +126,7 @@ impl AccessTracker {
             .map(|(key, value): (&String, &(Arc<AtomicU64>, Instant))| (key.clone(), value.0.load(Ordering::Relaxed)))
             .collect();
 
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|b| Reverse(b.1));
         entries.truncate(limit);
         entries
     }
@@ -1530,7 +1531,7 @@ impl HotObjectCache {
             entries.push((key.to_string(), value.access_count.load(Ordering::Relaxed)));
         });
 
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|b| Reverse(b.1));
         entries.truncate(limit);
         entries
     }

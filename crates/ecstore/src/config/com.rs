@@ -382,7 +382,7 @@ fn build_oidc_object(cfg: &Config) -> Map<String, Value> {
     };
 
     let mut providers = subsystem.iter().collect::<Vec<_>>();
-    providers.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    providers.sort_by_key(|(lhs, _)| *lhs);
 
     let mut oidc_obj = Map::new();
     for (instance_key, kvs) in providers {
@@ -417,7 +417,7 @@ fn build_semantic_oidc_object(cfg: &Config) -> Map<String, Value> {
     };
 
     let mut providers = subsystem.iter().collect::<Vec<_>>();
-    providers.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    providers.sort_by_key(|(lhs, _)| *lhs);
 
     let mut oidc_obj = Map::new();
     for (instance_key, kvs) in providers {

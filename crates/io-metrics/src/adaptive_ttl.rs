@@ -17,6 +17,7 @@
 //! This module provides metrics recording for adaptive TTL adjustments
 //! and access tracking for cache items.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -255,7 +256,7 @@ impl AccessTracker {
     /// Get keys sorted by access count (descending).
     pub fn top_keys(&self, n: usize) -> Vec<(&String, &AccessRecord)> {
         let mut entries: Vec<_> = self.records.iter().collect();
-        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+        entries.sort_by_key(|b| Reverse(b.1.count));
         entries.into_iter().take(n).collect()
     }
 

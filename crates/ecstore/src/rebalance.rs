@@ -31,6 +31,7 @@ use http::HeaderMap;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::fmt;
 use std::future::Future;
 use std::io::Cursor;
@@ -1530,7 +1531,7 @@ impl ECStore {
         let mut fivs =
             resolve_rebalance_file_info_versions_result(entry.file_info_versions(&bucket), bucket.as_str(), entry.name.as_str())?;
 
-        fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
+        fivs.versions.sort_by_key(|b| Reverse(b.mod_time));
 
         let mut rebalanced: usize = 0;
         let mut expired: usize = 0;

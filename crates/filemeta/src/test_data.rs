@@ -16,6 +16,7 @@ use crate::{
     ChecksumAlgo, FileMeta, FileMetaShallowVersion, FileMetaVersion, MetaDeleteMarker, MetaObject, Result, S3VersionId,
     VersionType,
 };
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -107,7 +108,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     fm.versions.push(legacy_shallow);
 
     // Sort by modification time (newest first)
-    fm.versions.sort_by(|a, b| b.header.mod_time.cmp(&a.header.mod_time));
+    fm.versions.sort_by_key(|v| Reverse(v.header.mod_time));
 
     fm.marshal_msg()
 }
@@ -348,7 +349,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
     }
 
     // Sort by modification time (newest first)
-    fm.versions.sort_by(|a, b| b.header.mod_time.cmp(&a.header.mod_time));
+    fm.versions.sort_by_key(|v| Reverse(v.header.mod_time));
 
     fm.marshal_msg()
 }
