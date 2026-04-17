@@ -701,18 +701,27 @@ impl ObjectIO for SetDisks {
             if !opts.no_lock {
                 object_lock_guard = Some(
                     async {
-                        let ns_lock = self.new_ns_lock(bucket, object).await?;
-                        ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                            StorageError::other(format!(
-                                "Failed to acquire write lock: {}",
-                                self.format_lock_error_from_error(bucket, object, "write", &e)
+                        let ns_lock = self
+                            .new_ns_lock(bucket, object)
+                            .instrument(debug_span!(
+                                target: "rustfs_put_trace",
+                                "put_object.preconditions_new_ns_lock"
                             ))
-                        })
+                            .await?;
+                        ns_lock
+                            .get_write_lock(get_lock_acquire_timeout())
+                            .instrument(debug_span!(
+                                target: "rustfs_put_trace",
+                                "put_object.preconditions_get_write_lock"
+                            ))
+                            .await
+                            .map_err(|e| {
+                                StorageError::other(format!(
+                                    "Failed to acquire write lock: {}",
+                                    self.format_lock_error_from_error(bucket, object, "write", &e)
+                                ))
+                            })
                     }
-                    .instrument(debug_span!(
-                        "put_object.acquire_write_lock",
-                        phase = "preconditions"
-                    ))
                     .await?,
                 );
             }
@@ -823,7 +832,10 @@ impl ObjectIO for SetDisks {
             }
             (writers, errors)
         }
-        .instrument(debug_span!("put_object.init_bitrot_writers"))
+        .instrument(debug_span!(
+            target: "rustfs_put_trace",
+            "put_object.init_bitrot_writers"
+        ))
         .await;
 
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
@@ -843,7 +855,10 @@ impl ObjectIO for SetDisks {
 
         let (reader, w_size) = match Arc::new(erasure)
             .encode(stream, &mut writers, write_quorum)
-            .instrument(debug_span!("put_object.erasure_encode"))
+            .instrument(debug_span!(
+                target: "rustfs_put_trace",
+                "put_object.erasure_encode"
+            ))
             .await
         {
             Ok((r, w)) => (r, w),
@@ -854,7 +869,11 @@ impl ObjectIO for SetDisks {
         }; // TODO: delete temporary directory on error
 
         {
-            let _finalize = debug_span!("put_object.finalize_metadata").entered();
+            let _finalize = debug_span!(
+                target: "rustfs_put_trace",
+                "put_object.finalize_metadata"
+            )
+            .entered();
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
             //     error!("close_bitrot_writers err {:?}", err);
@@ -938,18 +957,27 @@ impl ObjectIO for SetDisks {
         if !opts.no_lock && object_lock_guard.is_none() {
             object_lock_guard = Some(
                 async {
-                    let ns_lock = self.new_ns_lock(bucket, object).await?;
-                    ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                        StorageError::other(format!(
-                            "Failed to acquire write lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "write", &e)
+                    let ns_lock = self
+                        .new_ns_lock(bucket, object)
+                        .instrument(debug_span!(
+                            target: "rustfs_put_trace",
+                            "put_object.post_encode_new_ns_lock"
                         ))
-                    })
+                        .await?;
+                    ns_lock
+                        .get_write_lock(get_lock_acquire_timeout())
+                        .instrument(debug_span!(
+                            target: "rustfs_put_trace",
+                            "put_object.post_encode_get_write_lock"
+                        ))
+                        .await
+                        .map_err(|e| {
+                            StorageError::other(format!(
+                                "Failed to acquire write lock: {}",
+                                self.format_lock_error_from_error(bucket, object, "write", &e)
+                            ))
+                        })
                 }
-                .instrument(debug_span!(
-                    "put_object.acquire_write_lock",
-                    phase = "post_encode"
-                ))
                 .await?,
             );
         }
