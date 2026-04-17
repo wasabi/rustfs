@@ -119,8 +119,7 @@ use tokio::{
     time::{interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::error;
-use tracing::{debug, info, warn};
+use tracing::{debug, debug_span, error, info, warn, Instrument};
 use uuid::Uuid;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
@@ -698,15 +697,24 @@ impl ObjectIO for SetDisks {
 
         let mut object_lock_guard = None;
 
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+        if let Some(_http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
-                let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                    StorageError::other(format!(
-                        "Failed to acquire write lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "write", &e)
+                object_lock_guard = Some(
+                    async {
+                        let ns_lock = self.new_ns_lock(bucket, object).await?;
+                        ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                            StorageError::other(format!(
+                                "Failed to acquire write lock: {}",
+                                self.format_lock_error_from_error(bucket, object, "write", &e)
+                            ))
+                        })
+                    }
+                    .instrument(debug_span!(
+                        "put_object.acquire_write_lock",
+                        phase = "preconditions"
                     ))
-                })?);
+                    .await?,
+                );
             }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -779,39 +787,44 @@ impl ObjectIO for SetDisks {
             }
         };
 
-        let mut writers = Vec::with_capacity(shuffle_disks.len());
-        let mut errors = Vec::with_capacity(shuffle_disks.len());
-        for disk_op in shuffle_disks.iter() {
-            if let Some(disk) = disk_op
-                && disk.is_online().await
-            {
-                let writer = match create_bitrot_writer(
-                    is_inline_buffer,
-                    Some(disk),
-                    RUSTFS_META_TMP_BUCKET,
-                    &tmp_object,
-                    erasure.shard_file_size(data.size()),
-                    erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256S,
-                )
-                .await
+        let (mut writers, errors) = async {
+            let mut writers = Vec::with_capacity(shuffle_disks.len());
+            let mut errors = Vec::with_capacity(shuffle_disks.len());
+            for disk_op in shuffle_disks.iter() {
+                if let Some(disk) = disk_op
+                    && disk.is_online().await
                 {
-                    Ok(writer) => writer,
-                    Err(err) => {
-                        warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
-                        errors.push(Some(err));
-                        writers.push(None);
-                        continue;
-                    }
-                };
+                    let writer = match create_bitrot_writer(
+                        is_inline_buffer,
+                        Some(disk),
+                        RUSTFS_META_TMP_BUCKET,
+                        &tmp_object,
+                        erasure.shard_file_size(data.size()),
+                        erasure.shard_size(),
+                        HashAlgorithm::HighwayHash256S,
+                    )
+                    .await
+                    {
+                        Ok(writer) => writer,
+                        Err(err) => {
+                            warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                            errors.push(Some(err));
+                            writers.push(None);
+                            continue;
+                        }
+                    };
 
-                writers.push(Some(writer));
-                errors.push(None);
-            } else {
-                errors.push(Some(DiskError::DiskNotFound));
-                writers.push(None);
+                    writers.push(Some(writer));
+                    errors.push(None);
+                } else {
+                    errors.push(Some(DiskError::DiskNotFound));
+                    writers.push(None);
+                }
             }
+            (writers, errors)
         }
+        .instrument(debug_span!("put_object.init_bitrot_writers"))
+        .await;
 
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
         if nil_count < write_quorum {
@@ -828,7 +841,11 @@ impl ObjectIO for SetDisks {
             HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
-        let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
+        let (reader, w_size) = match Arc::new(erasure)
+            .encode(stream, &mut writers, write_quorum)
+            .instrument(debug_span!("put_object.erasure_encode"))
+            .await
+        {
             Ok((r, w)) => (r, w),
             Err(e) => {
                 error!("encode err {:?}", e);
@@ -836,93 +853,105 @@ impl ObjectIO for SetDisks {
             }
         }; // TODO: delete temporary directory on error
 
-        let _ = mem::replace(&mut data.stream, reader);
-        // if let Err(err) = close_bitrot_writers(&mut writers).await {
-        //     error!("close_bitrot_writers err {:?}", err);
-        // }
+        {
+            let _finalize = debug_span!("put_object.finalize_metadata").entered();
+            let _ = mem::replace(&mut data.stream, reader);
+            // if let Err(err) = close_bitrot_writers(&mut writers).await {
+            //     error!("close_bitrot_writers err {:?}", err);
+            // }
 
-        if (w_size as i64) < data.size() {
-            warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
-            return Err(Error::other(format!(
-                "put_object write size < data.size(), w_size={}, data.size={}",
-                w_size,
-                data.size()
-            )));
-        }
-
-        if contains_key_str(&user_defined, SUFFIX_COMPRESSION) {
-            insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
-        }
-
-        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
-
-        //TODO: userDefined
-
-        let etag = data.stream.try_resolve_etag().unwrap_or_default();
-
-        user_defined.insert("etag".to_owned(), etag.clone());
-
-        if !user_defined.contains_key("content-type") {
-            //  get content-type
-        }
-
-        let mut actual_size = data.actual_size();
-        if actual_size < 0 {
-            let is_compressed = fi.is_compressed();
-            if !is_compressed {
-                actual_size = w_size as i64;
+            if (w_size as i64) < data.size() {
+                warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+                return Err(Error::other(format!(
+                    "put_object write size < data.size(), w_size={}, data.size={}",
+                    w_size,
+                    data.size()
+                )));
             }
-        }
 
-        if fi.checksum.is_none()
-            && let Some(content_hash) = data.as_hash_reader().content_hash()
-        {
-            fi.checksum = Some(content_hash.to_bytes(&[]));
-        }
+            if contains_key_str(&user_defined, SUFFIX_COMPRESSION) {
+                insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
+            }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
-            && sc == storageclass::STANDARD
-        {
-            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
-        }
+            let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
 
-        let mod_time = if let Some(mod_time) = opts.mod_time {
-            Some(mod_time)
-        } else {
-            Some(OffsetDateTime::now_utc())
-        };
+            //TODO: userDefined
 
-        for (i, pfi) in parts_metadatas.iter_mut().enumerate() {
-            pfi.metadata = user_defined.clone();
-            if is_inline_buffer {
-                if let Some(writer) = writers[i].take() {
-                    pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
+            let etag = data.stream.try_resolve_etag().unwrap_or_default();
+
+            user_defined.insert("etag".to_owned(), etag.clone());
+
+            if !user_defined.contains_key("content-type") {
+                //  get content-type
+            }
+
+            let mut actual_size = data.actual_size();
+            if actual_size < 0 {
+                let is_compressed = fi.is_compressed();
+                if !is_compressed {
+                    actual_size = w_size as i64;
+                }
+            }
+
+            if fi.checksum.is_none()
+                && let Some(content_hash) = data.as_hash_reader().content_hash()
+            {
+                fi.checksum = Some(content_hash.to_bytes(&[]));
+            }
+
+            if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+                && sc == storageclass::STANDARD
+            {
+                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
+            }
+
+            let mod_time = if let Some(mod_time) = opts.mod_time {
+                Some(mod_time)
+            } else {
+                Some(OffsetDateTime::now_utc())
+            };
+
+            for (i, pfi) in parts_metadatas.iter_mut().enumerate() {
+                pfi.metadata = user_defined.clone();
+                if is_inline_buffer {
+                    if let Some(writer) = writers[i].take() {
+                        pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
+                    }
+
+                    pfi.set_inline_data();
                 }
 
-                pfi.set_inline_data();
+                pfi.mod_time = mod_time;
+                pfi.size = w_size as i64;
+                pfi.versioned = opts.versioned || opts.version_suspended;
+                pfi.add_object_part(1, etag.clone(), w_size, mod_time, actual_size, index_op.clone(), None);
+                pfi.checksum = fi.checksum.clone();
+
+                if opts.data_movement {
+                    pfi.set_data_moved();
+                }
             }
 
-            pfi.mod_time = mod_time;
-            pfi.size = w_size as i64;
-            pfi.versioned = opts.versioned || opts.version_suspended;
-            pfi.add_object_part(1, etag.clone(), w_size, mod_time, actual_size, index_op.clone(), None);
-            pfi.checksum = fi.checksum.clone();
-
-            if opts.data_movement {
-                pfi.set_data_moved();
-            }
+            drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
         }
 
-        drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
-
         if !opts.no_lock && object_lock_guard.is_none() {
-            let ns_lock = self.new_ns_lock(bucket, object).await?;
-            object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                StorageError::other(format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(bucket, object, "write", &e)
+            object_lock_guard = Some(
+                async {
+                    let ns_lock = self.new_ns_lock(bucket, object).await?;
+                    ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                        StorageError::other(format!(
+                            "Failed to acquire write lock: {}",
+                            self.format_lock_error_from_error(bucket, object, "write", &e)
+                        ))
+                    })
+                }
+                .instrument(debug_span!(
+                    "put_object.acquire_write_lock",
+                    phase = "post_encode"
                 ))
-            })?);
+                .await?,
+            );
         }
 
         let (online_disks, _, op_old_dir) = Self::rename_data(
