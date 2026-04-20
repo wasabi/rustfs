@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use tracing::{debug_span, Instrument};
 
 impl NodeService {
     pub(super) async fn handle_refresh(
@@ -124,7 +125,15 @@ impl NodeService {
         };
 
         let lock_client = self.get_lock_client()?;
-        match lock_client.acquire_lock(&args).await {
+        match lock_client
+            .acquire_lock(&args)
+            .instrument(debug_span!(
+                target: "rustfs_lock_rpc",
+                "lock_rpc.handle_lock",
+                resource = %args.resource,
+            ))
+            .await
+        {
             Ok(result) => {
                 // Serialize lock_info if available
                 let lock_info_json = result.lock_info.as_ref().and_then(|info| serde_json::to_string(info).ok());
