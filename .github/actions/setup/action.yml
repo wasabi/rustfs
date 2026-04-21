@@ -48,8 +48,12 @@ runs:
       if: runner.os == 'Linux'
       shell: bash
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
+        set -euo pipefail
+        # Lab runners route apt via apt-cacher-ng (/etc/apt/apt.conf.d/99lab-apt-proxy in lab image).
+        # Still cap wall time and per-URI waits so a stuck cache/mirror cannot hang the job forever.
+        APT_CONN_OPTS="-o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 -o Acquire::ftp::Timeout=180 -o Acquire::Retries=3"
+        sudo timeout --kill-after=120 30m apt-get $APT_CONN_OPTS update
+        sudo timeout --kill-after=120 30m apt-get $APT_CONN_OPTS install -y \
           musl-tools \
           build-essential \
           pkg-config \

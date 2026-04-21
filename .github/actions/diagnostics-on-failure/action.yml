@@ -1,0 +1,107 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "Diagnostics on failure"
+description: "Emit runner, APT, disk, and build-context details to the log. Invoke as a job step with if: failure()."
+
+runs:
+  using: composite
+  steps:
+    - name: Emit failure diagnostics
+      # After another step fails, success() is false for the rest of the job; use always() so this runs
+      # when the parent step used if: failure() and invoked this composite.
+      if: always()
+      shell: bash
+      run: |
+        set +e
+        echo "##[group]Job / runner context"
+        echo "GITHUB_REF=${GITHUB_REF:-}"
+        echo "GITHUB_EVENT_NAME=${GITHUB_EVENT_NAME:-}"
+        echo "GITHUB_SHA=${GITHUB_SHA:-}"
+        echo "RUNNER_OS=${RUNNER_OS:-}"
+        echo "RUNNER_ARCH=${RUNNER_ARCH:-}"
+        echo "RUNNER_NAME=${RUNNER_NAME:-}"
+        echo "RUNNER_LABELS=${RUNNER_LABELS:-}"
+        echo "RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-}"
+        echo "RUNNER_TRACKING_ID=${RUNNER_TRACKING_ID:-}"
+        echo "##[endgroup]"
+
+        echo "##[group]Kernel / OS"
+        uname -a 2>/dev/null || true
+        if [[ -f /etc/os-release ]]; then
+          cat /etc/os-release
+        fi
+        echo "##[endgroup]"
+
+        echo "##[group]Disk and memory"
+        df -h 2>/dev/null || true
+        if command -v free >/dev/null 2>&1; then
+          free -h || true
+        fi
+        echo "##[endgroup]"
+
+        if [[ "${RUNNER_OS:-}" == "Linux" ]]; then
+          echo "##[group]APT: apt.conf.d"
+          ls -la /etc/apt/apt.conf.d 2>/dev/null || true
+          for f in /etc/apt/apt.conf.d/99lab-apt-proxy /etc/apt/apt.conf.d/99lab-force-ipv4; do
+            if [[ -f "$f" ]]; then
+              echo "--- ${f} ---"
+              cat "$f"
+            fi
+          done
+          echo "##[endgroup]"
+
+          echo "##[group]APT: effective settings (Acquire / proxy / timeouts)"
+          apt-config dump 2>/dev/null | grep -E '^(Acquire|APT::Install::)' | head -120 || echo "apt-config dump failed"
+          echo "##[endgroup]"
+
+          echo "##[group]APT: recent logs"
+          if [[ -r /var/log/apt/term.log ]]; then
+            tail -n 120 /var/log/apt/term.log
+          else
+            sudo tail -n 120 /var/log/apt/term.log 2>/dev/null || echo "no readable /var/log/apt/term.log"
+          fi
+          if [[ -r /var/log/apt/history.log ]]; then
+            tail -n 80 /var/log/apt/history.log
+          else
+            sudo tail -n 80 /var/log/apt/history.log 2>/dev/null || echo "no readable /var/log/apt/history.log"
+          fi
+          echo "##[endgroup]"
+
+          echo "##[group]Lab apt-cacher (in-cluster) probe"
+          getent hosts lab-apt-cache.lab.svc.cluster.local 2>/dev/null || true
+          curl -sS -o /dev/null -w "HTTP %{http_code} connect=%{time_connect}s total=%{time_total}s\n" \
+            --connect-timeout 3 --max-time 10 \
+            "http://lab-apt-cache.lab.svc.cluster.local:3142/acng-report.html" 2>&1 \
+            || echo "curl lab-apt-cache probe exit=$?"
+          echo "##[endgroup]"
+
+          echo "##[group]HTTP proxy env (names only)"
+          env | sort | grep -iE '^(http|https|no|all|ftp)_?proxy=' || echo "(no proxy env vars)"
+          echo "##[endgroup]"
+        fi
+
+        echo "##[group]Rust toolchain (if on PATH)"
+        command -v rustc >/dev/null 2>&1 && rustc -vV || echo "rustc not on PATH"
+        command -v cargo >/dev/null 2>&1 && cargo -vV || echo "cargo not on PATH"
+        echo "##[endgroup]"
+
+        echo "##[group]target/ tree (sizes + rustfs artifacts)"
+        if [[ -d target ]]; then
+          du -sh target 2>/dev/null || true
+          find target -maxdepth 4 \( -name 'rustfs*' -o -name '*.rlib' \) -type f 2>/dev/null | head -60 || true
+        else
+          echo "no target/ directory"
+        fi
+        echo "##[endgroup]"

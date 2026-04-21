@@ -339,7 +339,9 @@ jobs:
           # Ensure zip is available
           if ! command -v zip &> /dev/null; then
             if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-              sudo apt-get update && sudo apt-get install -y zip
+              APT_CONN_OPTS="-o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 -o Acquire::ftp::Timeout=180 -o Acquire::Retries=3"
+              sudo timeout --kill-after=120 30m apt-get $APT_CONN_OPTS update
+              sudo timeout --kill-after=120 30m apt-get $APT_CONN_OPTS install -y zip
             fi
           fi
 
@@ -537,6 +539,10 @@ jobs:
           done
 
           echo "✅ Upload completed successfully"
+
+      - name: Failure diagnostics
+        if: failure()
+        uses: ./.github/actions/diagnostics-on-failure
 
   # Build summary
   build-summary:

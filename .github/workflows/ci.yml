@@ -100,10 +100,16 @@ jobs:
       # crate-ci/typos needs jq and wget on PATH; minimal runners may omit them (exit 127).
       - name: Install dependencies for typos action
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq wget
+          set -euo pipefail
+          APT_CONN_OPTS="-o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 -o Acquire::ftp::Timeout=180 -o Acquire::Retries=3"
+          sudo timeout --kill-after=120 30m apt-get $APT_CONN_OPTS update
+          sudo timeout --kill-after=120 30m apt-get $APT_CONN_OPTS install -y jq wget
       - name: Typos check with custom config file
         uses: crate-ci/typos@master
+
+      - name: Failure diagnostics
+        if: failure()
+        uses: ./.github/actions/diagnostics-on-failure
 
   test-and-lint:
     name: Test and Lint
@@ -137,6 +143,10 @@ jobs:
       - name: Check layered dependencies
         run: ./scripts/check_layer_dependencies.sh
 
+      - name: Failure diagnostics
+        if: failure()
+        uses: ./.github/actions/diagnostics-on-failure
+
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
     needs: skip-check
@@ -167,6 +177,10 @@ jobs:
           path: target/debug/rustfs
           if-no-files-found: error
           retention-days: 1
+
+      - name: Failure diagnostics
+        if: failure()
+        uses: ./.github/actions/diagnostics-on-failure
 
   e2e-tests:
     name: End-to-End Tests
@@ -215,6 +229,10 @@ jobs:
           path: /tmp/rustfs.log
           retention-days: 3
 
+      - name: Failure diagnostics
+        if: failure()
+        uses: ./.github/actions/diagnostics-on-failure
+
   s3-implemented-tests:
     name: S3 Implemented Tests
     needs: [ skip-check, build-rustfs-debug-binary ]
@@ -250,3 +268,7 @@ jobs:
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3
+
+      - name: Failure diagnostics
+        if: failure()
+        uses: ./.github/actions/diagnostics-on-failure
