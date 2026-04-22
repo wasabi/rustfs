@@ -91,7 +91,9 @@ jobs:
 
       - name: Build with profiling optimizations
         run: |
-          RUSTFLAGS="-C force-frame-pointers=yes -C debug-assertions=off" \
+          # Must include --cfg tokio_unstable: dial9-tokio-telemetry uses Tokio unstable
+          # runtime APIs. Setting RUSTFLAGS without it shadows .cargo/config and breaks the build.
+          RUSTFLAGS="--cfg tokio_unstable -C force-frame-pointers=yes -C debug-assertions=off" \
           cargo +nightly build --profile profiling -p rustfs --bins
 
       - name: Run performance profiling
