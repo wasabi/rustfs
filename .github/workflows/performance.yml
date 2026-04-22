@@ -63,7 +63,14 @@ jobs:
           tool: samply
 
       - name: Configure kernel for profiling
-        run: echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
+        run: |
+          current_value="$(cat /proc/sys/kernel/perf_event_paranoid)"
+          if [[ "$current_value" == "2" ]]; then
+            echo "kernel.perf_event_paranoid is 2; attempting to set it to 1"
+            echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
+          else
+            echo "kernel.perf_event_paranoid is ${current_value}; skipping change"
+          fi
 
       - name: Prepare test environment
         run: |
