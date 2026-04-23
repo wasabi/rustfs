@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Instant, interval};
+use tracing::Instrument;
 
 use crate::fast_lock::{
     guard::FastLockGuard,
@@ -65,7 +66,12 @@ impl FastObjectLockManager {
     /// Acquire object lock
     pub async fn acquire_lock(&self, request: ObjectLockRequest) -> Result<FastLockGuard, LockResult> {
         let shard = self.get_shard(&request.key);
-        match shard.acquire_lock(&request).await {
+        let shard_span = tracing::debug_span!(
+            target: "rustfs_lock_acquire_detail",
+            "lock_manager.shard_acquire",
+            resource = %request.key,
+        );
+        match shard.acquire_lock(&request).instrument(shard_span).await {
             Ok(()) => {
                 let guard = FastLockGuard::new(request.key, request.mode, request.owner, shard.clone());
                 // Register guard to prevent premature cleanup

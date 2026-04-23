@@ -77,7 +77,7 @@ use rustfs_filemeta::{
 use rustfs_lock::LockClient;
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_lock::local_lock::LocalLock;
-use rustfs_lock::{FastLockGuard, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
+use rustfs_lock::{FastLockGuard, LockMetadata, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 use rustfs_s3_common::EventName;
@@ -536,6 +536,24 @@ impl SetDisks {
     // shuffle_disks TODO: use origin value
 }
 
+/// `LockMetadata` for distributed **read** (shared) lock: `tags["lock_source"]` from [`ObjectOptions::lock_source`],
+/// optional `tags["lock_source_detail"]` for call-site disambiguation,
+/// optional [`ObjectOptions::lock_correlation_id`] as `operation_id` + `tags["trace_id"]` (matches write-lock Put metadata).
+fn read_lock_metadata(opts: &ObjectOptions) -> LockMetadata {
+    let s = opts
+        .lock_source
+        .as_deref()
+        .unwrap_or("ecstore.read_lock.unspecified");
+    let mut m = LockMetadata::new().with_tag("lock_source", s);
+    if let Some(ref d) = opts.lock_source_detail {
+        m = m.with_tag("lock_source_detail", d);
+    }
+    if let Some(ref id) = opts.lock_correlation_id {
+        m = m.with_operation_id(id.clone()).with_tag("trace_id", id.clone());
+    }
+    m
+}
+
 #[async_trait::async_trait]
 impl ObjectIO for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
@@ -568,7 +586,7 @@ impl ObjectIO for SetDisks {
             let guard = self
                 .new_ns_lock(bucket, object)
                 .await?
-                .get_read_lock(get_lock_acquire_timeout())
+                .get_read_lock_with_metadata(get_lock_acquire_timeout(), read_lock_metadata(opts))
                 .await
                 .map_err(|e| {
                     Error::other(format!(
@@ -699,6 +717,10 @@ impl ObjectIO for SetDisks {
 
         if let Some(_http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
+                let pre_trace_id = Uuid::new_v4().to_string();
+                let pre_lock_meta = LockMetadata::new()
+                    .with_operation_id(pre_trace_id.clone())
+                    .with_tag("trace_id", pre_trace_id.clone());
                 object_lock_guard = Some(
                     async {
                         let ns_lock = self
@@ -709,10 +731,11 @@ impl ObjectIO for SetDisks {
                             ))
                             .await?;
                         ns_lock
-                            .get_write_lock(get_lock_acquire_timeout())
+                            .get_write_lock_with_metadata(get_lock_acquire_timeout(), pre_lock_meta)
                             .instrument(debug_span!(
                                 target: "rustfs_put_trace",
-                                "put_object.preconditions_get_write_lock"
+                                "put_object.preconditions_get_write_lock",
+                                trace_id = %pre_trace_id,
                             ))
                             .await
                             .map_err(|e| {
@@ -955,20 +978,29 @@ impl ObjectIO for SetDisks {
         }
 
         if !opts.no_lock && object_lock_guard.is_none() {
+            let post_trace_id = Uuid::new_v4().to_string();
+            let post_lock_meta = LockMetadata::new()
+                .with_operation_id(post_trace_id.clone())
+                .with_tag("trace_id", post_trace_id.clone());
             object_lock_guard = Some(
                 async {
                     let ns_lock = self
                         .new_ns_lock(bucket, object)
                         .instrument(debug_span!(
                             target: "rustfs_put_trace",
-                            "put_object.post_encode_new_ns_lock"
+                            "put_object.post_encode_new_ns_lock",
+                            bucket = %bucket,
+                            object = %object,
                         ))
                         .await?;
                     ns_lock
-                        .get_write_lock(get_lock_acquire_timeout())
+                        .get_write_lock_with_metadata(get_lock_acquire_timeout(), post_lock_meta)
                         .instrument(debug_span!(
                             target: "rustfs_put_trace",
-                            "put_object.post_encode_get_write_lock"
+                            "put_object.post_encode_get_write_lock",
+                            bucket = %bucket,
+                            object = %object,
+                            trace_id = %post_trace_id,
                         ))
                         .await
                         .map_err(|e| {
@@ -1671,7 +1703,7 @@ impl ObjectOperations for SetDisks {
             Some(
                 self.new_ns_lock(bucket, object)
                     .await?
-                    .get_read_lock(get_lock_acquire_timeout())
+                    .get_read_lock_with_metadata(get_lock_acquire_timeout(), read_lock_metadata(opts))
                     .await
                     .map_err(|e| {
                         Error::other(format!(

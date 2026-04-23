@@ -196,7 +196,11 @@ impl ECStore {
         let object = encode_dir_object(object);
 
         if self.single_pool() {
-            return self.pools[0].get_object_reader(bucket, object.as_str(), range, h, opts).await;
+            let mut opts = opts.clone();
+            if opts.lock_source.is_none() {
+                opts.lock_source = Some("s3.get_object".to_string());
+            }
+            return self.pools[0].get_object_reader(bucket, object.as_str(), range, h, &opts).await;
         }
 
         // TODO: nslock
@@ -254,7 +258,11 @@ impl ECStore {
         let object = encode_dir_object(object);
 
         if self.single_pool() {
-            return self.pools[0].get_object_info(bucket, object.as_str(), opts).await;
+            let mut opts = opts.clone();
+            if opts.lock_source.is_none() {
+                opts.lock_source = Some("s3.get_object_info".to_string());
+            }
+            return self.pools[0].get_object_info(bucket, object.as_str(), &opts).await;
         }
 
         // TODO: nslock

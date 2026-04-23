@@ -26,6 +26,7 @@
 
 pub mod disabled_manager;
 pub mod guard;
+pub mod holder_trace;
 pub mod manager;
 pub mod manager_trait;
 pub mod metrics;
