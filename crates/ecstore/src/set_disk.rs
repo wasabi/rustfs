@@ -40,6 +40,7 @@ use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
     },
+    bucket::object_lock::objectlock_sys::check_existing_object_lock_for_write,
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
     config::{GLOBAL_STORAGE_CLASS, storageclass},
     disk::{
@@ -1012,6 +1013,28 @@ impl ObjectIO for SetDisks {
                 }
                 .await?,
             );
+        }
+
+        if opts.existing_object_lock_inline_check {
+            let mut probe_opts = opts.clone();
+            probe_opts.no_lock = true; // we already hold the Exclusive write lock
+            probe_opts.existing_object_lock_inline_check = false; // avoid recursion
+            match self
+                .get_object_info(bucket, object, &probe_opts)
+                .instrument(debug_span!(
+                    target: "rustfs_put_trace",
+                    "put_object.existing_object_lock_inline_check",
+                    bucket = %bucket,
+                    object = %object,
+                ))
+                .await
+            {
+                Ok(existing) => check_existing_object_lock_for_write(&existing)?,
+                Err(StorageError::ObjectNotFound(_, _))
+                | Err(StorageError::VersionNotFound(_, _, _))
+                | Err(StorageError::ErasureReadQuorum) => {} // no prior object; proceed
+                Err(e) => return Err(e),
+            }
         }
 
         let (online_disks, _, op_old_dir) = Self::rename_data(

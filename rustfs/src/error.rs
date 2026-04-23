@@ -239,11 +239,13 @@ impl From<StorageError> for ApiError {
             StorageError::EntityTooSmall(_, _, _) => S3ErrorCode::EntityTooSmall,
             StorageError::PreconditionFailed => S3ErrorCode::PreconditionFailed,
             StorageError::InvalidRangeSpec(_) => S3ErrorCode::InvalidRange,
+            StorageError::ObjectLockViolation { .. } => S3ErrorCode::AccessDenied,
             _ => S3ErrorCode::InternalError,
         };
 
         let message = match &err {
             StorageError::InvalidArgument(_, _, msg) => msg.clone(),
+            StorageError::ObjectLockViolation { reason } => reason.clone(),
             _ if code == S3ErrorCode::InternalError => err.to_string(),
             _ => ApiError::error_code_to_message(&code),
         };
@@ -427,6 +429,12 @@ mod tests {
                 StorageError::InvalidUploadID("bucket".into(), "object".into(), "uploadid".into()),
                 S3ErrorCode::NoSuchUpload,
             ),
+            (
+                StorageError::ObjectLockViolation {
+                    reason: "object lock denies overwrite".into(),
+                },
+                S3ErrorCode::AccessDenied,
+            ),
         ];
 
         for (storage_error, expected_code) in test_cases {
@@ -434,6 +442,18 @@ mod tests {
             assert_eq!(api_error.code, expected_code);
             assert!(api_error.source.is_some());
         }
+    }
+
+    #[test]
+    fn test_api_error_from_storage_error_object_lock_violation_message() {
+        let reason = "object lock denies overwrite".to_string();
+        let api_error: ApiError = StorageError::ObjectLockViolation {
+            reason: reason.clone(),
+        }
+        .into();
+
+        assert_eq!(api_error.code, S3ErrorCode::AccessDenied);
+        assert_eq!(api_error.message, reason);
     }
 
     #[test]

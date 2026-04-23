@@ -268,6 +268,36 @@ pub async fn check_object_lock_for_deletion(
     None
 }
 
+/// Check if an existing object's lock state blocks a PUT overwrite.
+///
+/// Returns `Err(StorageError::ObjectLockViolation)` when the object has a legal hold
+/// (cannot be bypassed) or an active COMPLIANCE retention period. GOVERNANCE retention
+/// is NOT checked here — bypass permission is verified at the API layer.
+pub fn check_existing_object_lock_for_write(existing: &ObjectInfo) -> crate::error::Result<()> {
+    let legal_hold = objectlock::get_object_legalhold_meta(&existing.user_defined);
+    if legal_hold
+        .status
+        .as_ref()
+        .is_some_and(|status| status.as_str() == ObjectLockLegalHoldStatus::ON)
+    {
+        return Err(crate::error::StorageError::ObjectLockViolation {
+            reason: "Object has a legal hold and cannot be overwritten. Remove the legal hold first.".to_string(),
+        });
+    }
+
+    let retention = objectlock::get_object_retention_meta(&existing.user_defined);
+    if let Some(mode) = retention.mode.as_ref()
+        && mode.as_str() == ObjectLockRetentionMode::COMPLIANCE
+        && is_retention_active(mode.as_str(), retention.retain_until_date.as_ref())
+    {
+        return Err(crate::error::StorageError::ObjectLockViolation {
+            reason: "Object is under COMPLIANCE retention and cannot be overwritten.".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,5 +657,80 @@ mod tests {
         // No lock settings should not be locked
         let user_defined = std::collections::HashMap::new();
         assert!(!is_object_locked_by_metadata(&user_defined, false));
+    }
+
+    // ── check_existing_object_lock_for_write ─────────────────────────
+
+    fn make_object_info(user_defined: std::collections::HashMap<String, String>) -> crate::store_api::ObjectInfo {
+        crate::store_api::ObjectInfo {
+            user_defined,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_check_existing_object_lock_legal_hold_on_blocks_write() {
+        let mut ud = std::collections::HashMap::new();
+        ud.insert("x-amz-object-lock-legal-hold".to_string(), "ON".to_string());
+        let obj = make_object_info(ud);
+        let err = check_existing_object_lock_for_write(&obj).unwrap_err();
+        assert!(matches!(err, crate::error::StorageError::ObjectLockViolation { .. }));
+        assert!(err.to_string().contains("legal hold"));
+    }
+
+    #[test]
+    fn test_check_existing_object_lock_legal_hold_off_allows_write() {
+        let mut ud = std::collections::HashMap::new();
+        ud.insert("x-amz-object-lock-legal-hold".to_string(), "OFF".to_string());
+        let obj = make_object_info(ud);
+        assert!(check_existing_object_lock_for_write(&obj).is_ok());
+    }
+
+    #[test]
+    fn test_check_existing_object_lock_compliance_active_blocks_write() {
+        let mut ud = std::collections::HashMap::new();
+        let future = OffsetDateTime::now_utc() + time::Duration::days(30);
+        ud.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        ud.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            future.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+        let obj = make_object_info(ud);
+        let err = check_existing_object_lock_for_write(&obj).unwrap_err();
+        assert!(matches!(err, crate::error::StorageError::ObjectLockViolation { .. }));
+        assert!(err.to_string().contains("COMPLIANCE"));
+    }
+
+    #[test]
+    fn test_check_existing_object_lock_compliance_expired_allows_write() {
+        let mut ud = std::collections::HashMap::new();
+        let past = OffsetDateTime::now_utc() - time::Duration::days(30);
+        ud.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        ud.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            past.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+        let obj = make_object_info(ud);
+        assert!(check_existing_object_lock_for_write(&obj).is_ok());
+    }
+
+    #[test]
+    fn test_check_existing_object_lock_governance_active_allows_write() {
+        // GOVERNANCE is not checked by this predicate — API layer handles bypass permission
+        let mut ud = std::collections::HashMap::new();
+        let future = OffsetDateTime::now_utc() + time::Duration::days(30);
+        ud.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
+        ud.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            future.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+        let obj = make_object_info(ud);
+        assert!(check_existing_object_lock_for_write(&obj).is_ok());
+    }
+
+    #[test]
+    fn test_check_existing_object_lock_no_lock_allows_write() {
+        let obj = make_object_info(std::collections::HashMap::new());
+        assert!(check_existing_object_lock_for_write(&obj).is_ok());
     }
 }
