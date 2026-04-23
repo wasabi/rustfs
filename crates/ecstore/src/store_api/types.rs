@@ -80,6 +80,11 @@ pub struct ObjectOptions {
     pub lock_source_detail: Option<String>,
     /// If set, distributed **read** lock acquires include `LockMetadata.operation_id` and `tags["trace_id"]` (same pattern as write-lock Put tracing).
     pub lock_correlation_id: Option<String>,
+
+    /// When true, `SetDisks::put_object` runs the inline object-lock check under the
+    /// post-encode Exclusive guard instead of the distributed Shared preflight.
+    /// Set by the `Auto` branch of `preflight_mode()` in `execute_put_object`.
+    pub existing_object_lock_inline_check: bool,
 }
 
 impl ObjectOptions {
