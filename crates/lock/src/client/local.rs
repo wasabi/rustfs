@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 use crate::{
     FastLockGuard, GlobalLockManager, LockClient, LockId, LockInfo, LockManager, LockMetadata, LockPriority, LockRequest,
@@ -99,22 +100,66 @@ impl LockClient for LocalClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
         let lock_manager = self.get_lock_manager();
 
+        let corr_trace_id = request.metadata.tags.get("trace_id").map(|t| Arc::from(t.as_str()));
+        let corr_operation_id = request.metadata.operation_id.as_ref().map(|s| Arc::from(s.as_str()));
+        let lock_source = request.metadata.tags.get("lock_source").map(|t| Arc::from(t.as_str()));
+        let lock_source_detail = request.metadata.tags.get("lock_source_detail").map(|t| Arc::from(t.as_str()));
         let lock_request = match request.lock_type {
             LockType::Exclusive => crate::ObjectLockRequest::new_write(request.resource.clone(), request.owner.clone())
-                .with_acquire_timeout(request.acquire_timeout),
+                .with_acquire_timeout(request.acquire_timeout)
+                .with_correlation(corr_trace_id.clone(), corr_operation_id.clone())
+                .with_lock_source_opt(lock_source.clone())
+                .with_lock_source_detail_opt(lock_source_detail.clone()),
             LockType::Shared => crate::ObjectLockRequest::new_read(request.resource.clone(), request.owner.clone())
-                .with_acquire_timeout(request.acquire_timeout),
+                .with_acquire_timeout(request.acquire_timeout)
+                .with_correlation(corr_trace_id, corr_operation_id)
+                .with_lock_source_opt(lock_source)
+                .with_lock_source_detail_opt(lock_source_detail),
         };
 
-        match lock_manager.acquire_lock(lock_request).await {
+        let trace_id = request
+            .metadata
+            .tags
+            .get("trace_id")
+            .map(String::as_str)
+            .unwrap_or("");
+        let lock_source_str = request.metadata.tags.get("lock_source").map(String::as_str).unwrap_or("");
+        let lock_source_detail_str = request
+            .metadata
+            .tags
+            .get("lock_source_detail")
+            .map(String::as_str)
+            .unwrap_or("");
+        let global_span = tracing::debug_span!(
+            target: "rustfs_lock_acquire_detail",
+            "local_lock_client.global_acquire",
+            resource = %request.resource,
+            operation_id = request.metadata.operation_id.as_deref().unwrap_or(""),
+            trace_id = trace_id,
+            lock_source = lock_source_str,
+            lock_source_detail = lock_source_detail_str,
+        );
+
+        match lock_manager.acquire_lock(lock_request).instrument(global_span).await {
             Ok(guard) => {
                 let lock_id = LockId::new_unique(&request.resource);
 
-                {
+                let insert_span = tracing::debug_span!(
+                    target: "rustfs_lock_acquire_detail",
+                    "local_lock_client.guard_storage_insert",
+                    resource = %request.resource,
+                    operation_id = request.metadata.operation_id.as_deref().unwrap_or(""),
+                    trace_id = trace_id,
+                    lock_source = lock_source_str,
+                    lock_source_detail = lock_source_detail_str,
+                );
+                async {
                     let shard = self.get_shard(&lock_id);
                     let mut guards = shard.write().await;
                     guards.insert(lock_id.clone(), guard);
                 }
+                .instrument(insert_span)
+                .await;
 
                 let lock_info = LockInfo {
                     id: lock_id,

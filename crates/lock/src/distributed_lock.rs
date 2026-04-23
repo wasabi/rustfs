@@ -16,7 +16,7 @@ use crate::{
     ObjectKey,
     client::LockClient,
     error::{LockError, Result},
-    types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
+    types::{LockId, LockInfo, LockMetadata, LockRequest, LockResponse, LockStatus, LockType},
 };
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -296,6 +296,22 @@ impl DistributedLock {
         self.acquire_guard(&req).await
     }
 
+    /// Exclusive lock with caller-supplied metadata (e.g. `operation_id` / `tags["trace_id"]` for RPC tracing).
+    pub async fn lock_guard_with_metadata(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+        metadata: LockMetadata,
+    ) -> Result<Option<DistributedLockGuard>> {
+        let req = LockRequest::new(resource, LockType::Exclusive, owner)
+            .with_acquire_timeout(timeout)
+            .with_ttl(ttl)
+            .with_metadata(metadata);
+        self.acquire_guard(&req).await
+    }
+
     /// Convenience: acquire exclusive lock with expected contention logs suppressed
     pub async fn lock_guard_quiet(
         &self,
@@ -322,6 +338,22 @@ impl DistributedLock {
         let req = LockRequest::new(resource, LockType::Shared, owner)
             .with_acquire_timeout(timeout)
             .with_ttl(ttl);
+        self.acquire_guard(&req).await
+    }
+
+    /// Shared lock with `LockMetadata` (e.g. `tags["lock_source"]` for observability).
+    pub async fn rlock_guard_with_metadata(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+        metadata: LockMetadata,
+    ) -> Result<Option<DistributedLockGuard>> {
+        let req = LockRequest::new(resource, LockType::Shared, owner)
+            .with_acquire_timeout(timeout)
+            .with_ttl(ttl)
+            .with_metadata(metadata);
         self.acquire_guard(&req).await
     }
 

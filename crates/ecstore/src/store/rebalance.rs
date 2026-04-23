@@ -353,6 +353,9 @@ impl ECStore {
             if !pool_opts.metadata_chg {
                 pool_opts.version_id = None;
             }
+            if pool_opts.lock_source.is_none() {
+                pool_opts.lock_source = Some("rebalance.get_object_info".to_string());
+            }
 
             futures.push(async move { pool.get_object_info(bucket, object, &pool_opts).await });
         }

@@ -123,7 +123,7 @@ use std::convert::Infallible;
 use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -499,6 +499,39 @@ const SNOWBALL_IGNORE_ERRORS_HEADER_KEYS: &[&str] = &[
     AMZ_SNOWBALL_IGNORE_ERRORS,
     AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS,
 ];
+
+/// **Lab / multinode investigation only** — not a production shortcut. When truthy, `execute_put_object`
+/// skips the `get_object_info` preflight with lock detail `api.s3.put_object.existing_object_lock_check`
+/// (S3 object-lock validation on overwrites). **Default off:** unset, empty, `0`, `false`, `off`, or unknown
+/// string → run the preflight (unchanged from production behavior).
+const RUSTFS_LAB_SKIP_PUT_OBJECT_EXISTING_OBJECT_INFO: &str = "RUSTFS_LAB_SKIP_PUT_OBJECT_EXISTING_OBJECT_INFO";
+
+/// Reads [`RUSTFS_LAB_SKIP_PUT_OBJECT_EXISTING_OBJECT_INFO`] once per process.
+fn lab_skip_put_object_existing_object_info() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var(RUSTFS_LAB_SKIP_PUT_OBJECT_EXISTING_OBJECT_INFO)
+            .ok()
+            .as_deref()
+            .map(lab_env_truthy_for_put_preflight_skip)
+            .unwrap_or(false)
+    })
+}
+
+/// Truthy: `1`, `true`, `yes`, `on` (case-insensitive). All other values (including empty) are off.
+fn lab_env_truthy_for_put_preflight_skip(value: &str) -> bool {
+    match value.trim() {
+        "" => false,
+        s if s.eq_ignore_ascii_case("1")
+            || s.eq_ignore_ascii_case("true")
+            || s.eq_ignore_ascii_case("yes")
+            || s.eq_ignore_ascii_case("on") =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PutObjectExtractOptions {
@@ -1815,16 +1848,27 @@ impl DefaultObjectUsecase {
         )
         .await?;
 
-        let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
-            Err(err) => {
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+        if !lab_skip_put_object_existing_object_info() {
+            let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+                .await
+                .map_err(ApiError::from)?
+                .with_lock_source_detail("api.s3.put_object.existing_object_lock_check")
+                .with_lock_correlation_id(Uuid::new_v4().to_string());
+            match store.get_object_info(&bucket, &key, &current_opts).await {
+                Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
                 }
             }
+        } else {
+            debug!(
+                "lab: {}: skipping get_object_info preflight (lock_source_detail=api.s3.put_object.existing_object_lock_check) bucket={} key={}",
+                RUSTFS_LAB_SKIP_PUT_OBJECT_EXISTING_OBJECT_INFO,
+                bucket,
+                key
+            );
         }
 
         let actual_size = size;
@@ -2046,7 +2090,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.put_object_acl.get_object_info");
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         if access_control_policy.is_some() {
@@ -2255,7 +2300,8 @@ impl DefaultObjectUsecase {
         // offers some protection, but it does not fully eliminate this race.
         let check_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.put_object_retention.retention_check");
 
         if let Ok(existing_obj_info) = store.get_object_info(&bucket, &key, &check_opts).await {
             let bypass_governance = has_bypass_governance_header(&req.headers);
@@ -2351,6 +2397,7 @@ impl DefaultObjectUsecase {
         let version_id = req.input.version_id.clone();
         let opts = ObjectOptions {
             version_id: parse_object_version_id(version_id)?,
+            lock_source_detail: Some("api.s3.put_object_tagging.post_tags_notification_get_object_info".to_string()),
             ..Default::default()
         };
 
@@ -2751,7 +2798,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.get_object_acl.get_object_info");
         store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         Ok(S3Response::new(acl::build_get_object_acl_output()))
@@ -2785,7 +2833,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.get_object_attributes.get_object_info");
 
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
@@ -3012,7 +3061,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.get_object_legal_hold.get_object_info");
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
             error!("get_object_info failed, {}", e.to_string());
@@ -3099,7 +3149,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.get_object_retention.get_object_info");
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
             error!("get_object_info failed, {}", e.to_string());
@@ -3259,7 +3310,9 @@ impl DefaultObjectUsecase {
 
         let current_opts: ObjectOptions = get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.copy_object.existing_object_lock_check")
+            .with_lock_correlation_id(Uuid::new_v4().to_string());
         match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
             Err(err) => {
@@ -3642,7 +3695,8 @@ impl DefaultObjectUsecase {
                 metadata,
             )
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.delete_objects.per_object_get_object_info");
 
             let (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
                 Ok(res) => (res, None),
@@ -3933,7 +3987,9 @@ impl DefaultObjectUsecase {
         // 2. Or use combined get-and-delete in storage layer with retention check callback
         let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.delete_object.existing_object_lock_check")
+            .with_lock_correlation_id(Uuid::new_v4().to_string());
 
         let existing_object_info = match store.get_object_info(&bucket, &key, &get_opts).await {
             Ok(obj_info) => {
@@ -4088,6 +4144,7 @@ impl DefaultObjectUsecase {
         let version_id_for_parse = version_id.clone();
         let opts = ObjectOptions {
             version_id: parse_object_version_id(version_id_for_parse)?,
+            lock_source_detail: Some("api.s3.delete_object_tagging.post_delete_notification_get_object_info".to_string()),
             ..Default::default()
         };
 
@@ -4193,7 +4250,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.head_object.get_object_info");
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -4500,7 +4558,8 @@ impl DefaultObjectUsecase {
         let version_id_str = version_id.clone().unwrap_or_default();
         let opts = post_restore_opts(&version_id_str, &bucket, &object)
             .await
-            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?;
+            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?
+            .with_lock_source_detail("api.s3.restore_object.get_object_info");
 
         let mut obj_info = store
             .get_object_info(&bucket, &object, &opts)
@@ -5238,6 +5297,23 @@ mod tests {
 
         headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("false"));
         assert!(!is_put_object_extract_requested(&headers));
+    }
+
+    #[test]
+    fn lab_env_truthy_for_put_preflight_skip_accepts_standard_truthy() {
+        assert!(lab_env_truthy_for_put_preflight_skip("1"));
+        assert!(lab_env_truthy_for_put_preflight_skip(" true "));
+        assert!(lab_env_truthy_for_put_preflight_skip("Yes"));
+        assert!(lab_env_truthy_for_put_preflight_skip("ON"));
+    }
+
+    #[test]
+    fn lab_env_truthy_for_put_preflight_skip_rejects_falsy_and_unknown() {
+        assert!(!lab_env_truthy_for_put_preflight_skip(""));
+        assert!(!lab_env_truthy_for_put_preflight_skip("0"));
+        assert!(!lab_env_truthy_for_put_preflight_skip("false"));
+        assert!(!lab_env_truthy_for_put_preflight_skip("off"));
+        assert!(!lab_env_truthy_for_put_preflight_skip(" maybe "));
     }
 
     #[test]

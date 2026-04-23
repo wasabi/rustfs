@@ -277,6 +277,13 @@ pub struct ObjectLockRequest {
     pub acquire_timeout: Duration,
     pub lock_timeout: Duration,
     pub priority: LockPriority,
+    /// Correlation from `LockMetadata` (for 3b holder / wait tracing).
+    pub trace_id: Option<Arc<str>>,
+    pub operation_id: Option<Arc<str>>,
+    /// From `LockMetadata.tags["lock_source"]` (e.g. `s3.get_object`, `heal.get_object_info`).
+    pub lock_source: Option<Arc<str>>,
+    /// From `LockMetadata.tags["lock_source_detail"]` (e.g. S3 API handler disambiguation).
+    pub lock_source_detail: Option<Arc<str>>,
 }
 
 impl ObjectLockRequest {
@@ -288,6 +295,10 @@ impl ObjectLockRequest {
             acquire_timeout: crate::fast_lock::DEFAULT_ACQUIRE_TIMEOUT,
             lock_timeout: crate::fast_lock::DEFAULT_LOCK_TIMEOUT,
             priority: LockPriority::Normal,
+            trace_id: None,
+            operation_id: None,
+            lock_source: None,
+            lock_source_detail: None,
         }
     }
 
@@ -299,7 +310,28 @@ impl ObjectLockRequest {
             acquire_timeout: crate::fast_lock::DEFAULT_ACQUIRE_TIMEOUT,
             lock_timeout: crate::fast_lock::DEFAULT_LOCK_TIMEOUT,
             priority: LockPriority::Normal,
+            trace_id: None,
+            operation_id: None,
+            lock_source: None,
+            lock_source_detail: None,
         }
+    }
+
+    /// Attach PUT / RPC correlation for holder / wait diagnostics (`rustfs_lock_holder`).
+    pub fn with_correlation(mut self, trace_id: Option<Arc<str>>, operation_id: Option<Arc<str>>) -> Self {
+        self.trace_id = trace_id;
+        self.operation_id = operation_id;
+        self
+    }
+
+    pub fn with_lock_source_opt(mut self, lock_source: Option<Arc<str>>) -> Self {
+        self.lock_source = lock_source;
+        self
+    }
+
+    pub fn with_lock_source_detail_opt(mut self, lock_source_detail: Option<Arc<str>>) -> Self {
+        self.lock_source_detail = lock_source_detail;
+        self
     }
 
     pub fn with_version(mut self, version: impl Into<Arc<str>>) -> Self {

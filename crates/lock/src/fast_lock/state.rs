@@ -264,6 +264,17 @@ impl AtomicLockState {
         self.readers_waiting(state) > 0 || self.writers_waiting(state) > 0
     }
 
+    /// Reader count, wait queues, and writer flag (for contention tracing).
+    pub fn contention_counts(&self) -> (u8, u16, u16, bool) {
+        let s = self.state.load(Ordering::Acquire);
+        (
+            self.readers_count(s),
+            self.readers_waiting(s),
+            self.writers_waiting(s),
+            (s & WRITER_FLAG_MASK) != 0,
+        )
+    }
+
     /// Get last access time
     pub fn last_accessed(&self) -> u64 {
         self.last_accessed.load(Ordering::Relaxed)
@@ -328,6 +339,9 @@ pub struct SharedOwnerEntry {
     pub count: u32,
     pub acquired_at: SystemTime,
     pub lock_timeout: Duration,
+    /// `LockRequest` / `ObjectLockRequest` correlation at last shared acquire (for `rustfs_lock_holder` snapshots).
+    pub trace_id: Option<Arc<str>>,
+    pub operation_id: Option<Arc<str>>,
 }
 
 impl Default for ObjectLockState {
@@ -349,8 +363,14 @@ impl ObjectLockState {
         }
     }
 
-    /// Try fast path shared lock acquisition
-    pub fn try_acquire_shared_fast(&self, owner: &Arc<str>, lock_timeout: Duration) -> bool {
+    /// Try fast path shared lock acquisition. `trace_id` / `operation_id` are stored for holder diagnostics.
+    pub fn try_acquire_shared_fast(
+        &self,
+        owner: &Arc<str>,
+        lock_timeout: Duration,
+        trace_id: Option<Arc<str>>,
+        operation_id: Option<Arc<str>>,
+    ) -> bool {
         if !self.atomic_state.try_acquire_shared() {
             return false;
         }
@@ -361,12 +381,16 @@ impl ObjectLockState {
             entry.count = entry.count.saturating_add(1);
             entry.acquired_at = SystemTime::now();
             entry.lock_timeout = lock_timeout;
+            entry.trace_id = trace_id;
+            entry.operation_id = operation_id;
         } else {
             shared.push(SharedOwnerEntry {
                 owner: owner.clone(),
                 count: 1,
                 acquired_at: SystemTime::now(),
                 lock_timeout,
+                trace_id,
+                operation_id,
             });
         }
         true
@@ -490,6 +514,70 @@ impl ObjectLockState {
             None
         }
     }
+
+    /// Who is blocking this waiter (best-effort; uses `current_owner` + atomic queues).
+    pub fn waiter_contention_snapshot(&self) -> crate::fast_lock::holder_trace::WaiterContentionSnapshot {
+        let (readers, readers_waiting, writers_waiting, _writer_flag) = self.atomic_state.contention_counts();
+        let co = self.current_owner.read();
+        let (exclusive_holder_fp, exclusive_holder_held_ms) = match co.as_ref() {
+            Some(info) => {
+                let fp = crate::fast_lock::holder_trace::owner_fingerprint(info.owner.as_ref());
+                let ms = SystemTime::now()
+                    .duration_since(info.acquired_at)
+                    .map(|d| d.as_millis())
+                    .ok();
+                (Some(fp), ms)
+            }
+            None => (None, None),
+        };
+        drop(co);
+
+        let so = self.shared_owners.read();
+        let mut shared_readers: Vec<crate::fast_lock::holder_trace::SharedOwnerBrief> = Vec::with_capacity(so.len().min(4));
+        for e in so.iter().take(4) {
+            let held_ms = SystemTime::now()
+                .duration_since(e.acquired_at)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            shared_readers.push(crate::fast_lock::holder_trace::SharedOwnerBrief {
+                owner_fp: crate::fast_lock::holder_trace::owner_fingerprint(e.owner.as_ref()),
+                held_ms,
+                prefix: e.owner.chars().take(48).collect(),
+                trace_id: e.trace_id.clone(),
+                operation_id: e.operation_id.clone(),
+            });
+        }
+        drop(so);
+
+        crate::fast_lock::holder_trace::WaiterContentionSnapshot {
+            lock_mode: self.current_mode(),
+            exclusive_holder_fp,
+            exclusive_holder_held_ms,
+            shared_readers,
+            readers,
+            readers_waiting,
+            writers_waiting,
+        }
+    }
+
+    /// If `owner` matches a shared holder row, return owner + time since that row's `acquired_at` (pre-release).
+    pub fn shared_release_info_if_releasing(&self, owner: &Arc<str>) -> Option<(Arc<str>, Duration)> {
+        let shared = self.shared_owners.read();
+        let entry = shared.iter().find(|e| e.owner.as_ref() == owner.as_ref())?;
+        let held = SystemTime::now().duration_since(entry.acquired_at).ok()?;
+        Some((entry.owner.clone(), held))
+    }
+
+    /// If `owner` is the current exclusive holder, return owner + time held (for pre-release tracing).
+    pub fn exclusive_release_info_if_releasing(&self, owner: &Arc<str>) -> Option<(Arc<str>, Duration)> {
+        let current = self.current_owner.read();
+        let info = current.as_ref()?;
+        if info.owner.as_ref() != owner.as_ref() {
+            return None;
+        }
+        let held = SystemTime::now().duration_since(info.acquired_at).unwrap_or(Duration::ZERO);
+        Some((info.owner.clone(), held))
+    }
 }
 
 #[cfg(test)]
@@ -527,8 +615,8 @@ mod tests {
         // Test shared locks
         let timeout = Duration::from_secs(30);
 
-        assert!(state.try_acquire_shared_fast(&owner1, timeout));
-        assert!(state.try_acquire_shared_fast(&owner2, timeout));
+        assert!(state.try_acquire_shared_fast(&owner1, timeout, None, None));
+        assert!(state.try_acquire_shared_fast(&owner2, timeout, None, None));
         assert!(!state.try_acquire_exclusive_fast(&owner1, timeout));
 
         assert!(state.release_shared(&owner1));
@@ -536,7 +624,24 @@ mod tests {
 
         // Test exclusive lock
         assert!(state.try_acquire_exclusive_fast(&owner1, timeout));
-        assert!(!state.try_acquire_shared_fast(&owner2, timeout));
+        assert!(!state.try_acquire_shared_fast(&owner2, timeout, None, None));
         assert!(state.release_exclusive(&owner1));
+    }
+
+    #[test]
+    fn test_shared_correlation_in_waiter_snapshot() {
+        let state = ObjectLockState::new();
+        let owner = Arc::from("read-owner-1");
+        let op: Arc<str> = Arc::from("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let tr: Arc<str> = Arc::from("feedface-cafe-4242-4242-424242424242");
+        let timeout = Duration::from_secs(30);
+        assert!(state.try_acquire_shared_fast(
+            &owner, timeout, Some(tr.clone()), Some(op.clone())
+        ));
+        let snap = state.waiter_contention_snapshot();
+        assert_eq!(snap.shared_readers.len(), 1);
+        let b = &snap.shared_readers[0];
+        assert_eq!(b.operation_id.as_ref().map(|a| a.as_ref()), Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        assert_eq!(b.trace_id.as_ref().map(|a| a.as_ref()), Some("feedface-cafe-4242-4242-424242424242"));
     }
 }

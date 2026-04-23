@@ -155,6 +155,8 @@ mod tests {
             count: 1,
             acquired_at: SystemTime::now(),
             lock_timeout: Duration::from_secs(30),
+            trace_id: None,
+            operation_id: None,
         });
 
         // Reset

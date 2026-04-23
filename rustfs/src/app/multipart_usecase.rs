@@ -64,6 +64,7 @@ use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{info, instrument, warn};
 use urlencoding::encode;
+use uuid::Uuid;
 
 async fn maybe_enqueue_transition_immediate(obj_info: &rustfs_ecstore::store_api::ObjectInfo, src: LcEventSrc) {
     enqueue_transition_immediate(obj_info, src).await;
@@ -247,7 +248,14 @@ impl DefaultMultipartUsecase {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
             };
 
-            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+            match store
+                .get_object_info(
+                    &bucket,
+                    &key,
+                    &ObjectOptions::default().with_lock_source_detail("api.s3.complete_multipart.if_match_precondition_get_object_info"),
+                )
+                .await
+            {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match
@@ -310,7 +318,9 @@ impl DefaultMultipartUsecase {
 
         let current_opts = get_opts(&bucket, &key, None, None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.complete_multipart.existing_object_lock_check")
+            .with_lock_correlation_id(Uuid::new_v4().to_string());
         match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
             Err(err) => {
@@ -609,7 +619,9 @@ impl DefaultMultipartUsecase {
 
         let current_opts: ObjectOptions = get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.create_multipart.existing_object_lock_check")
+            .with_lock_correlation_id(Uuid::new_v4().to_string());
         match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
             Err(err) => {
