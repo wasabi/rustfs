@@ -1027,9 +1027,7 @@ impl ObjectIO for SetDisks {
                 .await
             {
                 Ok(existing) => check_existing_object_lock_for_write(&existing)?,
-                Err(StorageError::ObjectNotFound(_, _))
-                | Err(StorageError::VersionNotFound(_, _, _))
-                | Err(StorageError::ErasureReadQuorum) => {} // no prior object; proceed
+                Err(StorageError::ObjectNotFound(_, _)) | Err(StorageError::VersionNotFound(_, _, _)) => {} // no prior object; proceed
                 Err(e) => return Err(e),
             }
         }

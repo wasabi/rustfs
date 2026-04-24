@@ -113,7 +113,7 @@ fn sample_take() -> bool {
         return false;
     }
     let m = trace_sample_mod();
-    WAIT_SEQ.fetch_add(1, Ordering::Relaxed) % m == 0
+    WAIT_SEQ.fetch_add(1, Ordering::Relaxed).is_multiple_of(m)
 }
 
 /// First line of contention in slow path (who is ahead, queue depths).
