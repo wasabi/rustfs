@@ -191,7 +191,7 @@ impl LockShard {
                 return Ok(());
             }
 
-            if retry_count == 0 {
+            if retry_count == 0 && tracing::enabled!(target: "rustfs_lock_holder", tracing::Level::DEBUG) {
                 let snap = state.waiter_contention_snapshot();
                 crate::fast_lock::holder_trace::emit_wait_blocked(request, &snap, retry_count);
             }
@@ -225,8 +225,10 @@ impl LockShard {
             }
 
             // If we've exhausted quick retries or have little time left, use notification wait
-            let snap_notify = state.waiter_contention_snapshot();
-            crate::fast_lock::holder_trace::emit_notify_enter(request, &snap_notify, retry_count);
+            if tracing::enabled!(target: "rustfs_lock_holder", tracing::Level::DEBUG) {
+                let snap_notify = state.waiter_contention_snapshot();
+                crate::fast_lock::holder_trace::emit_notify_enter(request, &snap_notify, retry_count);
+            }
 
             let notify_span = tracing::debug_span!(
                 target: "rustfs_lock_acquire_detail",
@@ -266,12 +268,13 @@ impl LockShard {
         {
             let objects = self.objects.read();
             if let Some(state) = objects.get(key) {
-                let release_info = if matches!(mode, LockMode::Exclusive) {
+                let holder_trace_enabled = tracing::enabled!(target: "rustfs_lock_holder", tracing::Level::DEBUG);
+                let release_info = if holder_trace_enabled && matches!(mode, LockMode::Exclusive) {
                     state.exclusive_release_info_if_releasing(owner)
                 } else {
                     None
                 };
-                let release_info_shared = if matches!(mode, LockMode::Shared) {
+                let release_info_shared = if holder_trace_enabled && matches!(mode, LockMode::Shared) {
                     state.shared_release_info_if_releasing(owner)
                 } else {
                     None
@@ -357,12 +360,13 @@ impl LockShard {
         {
             let objects = self.objects.read();
             if let Some(state) = objects.get(key) {
-                let release_info = if matches!(mode, LockMode::Exclusive) {
+                let holder_trace_enabled = tracing::enabled!(target: "rustfs_lock_holder", tracing::Level::DEBUG);
+                let release_info = if holder_trace_enabled && matches!(mode, LockMode::Exclusive) {
                     state.exclusive_release_info_if_releasing(owner)
                 } else {
                     None
                 };
-                let release_info_shared = if matches!(mode, LockMode::Shared) {
+                let release_info_shared = if holder_trace_enabled && matches!(mode, LockMode::Shared) {
                     state.shared_release_info_if_releasing(owner)
                 } else {
                     None
