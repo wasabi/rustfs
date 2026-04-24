@@ -120,7 +120,7 @@ use tokio::{
     time::{interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, debug_span, error, info, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, error, info, warn};
 use uuid::Uuid;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
@@ -541,10 +541,7 @@ impl SetDisks {
 /// optional `tags["lock_source_detail"]` for call-site disambiguation,
 /// optional [`ObjectOptions::lock_correlation_id`] as `operation_id` + `tags["trace_id"]` (matches write-lock Put metadata).
 fn read_lock_metadata(opts: &ObjectOptions) -> LockMetadata {
-    let s = opts
-        .lock_source
-        .as_deref()
-        .unwrap_or("ecstore.read_lock.unspecified");
+    let s = opts.lock_source.as_deref().unwrap_or("ecstore.read_lock.unspecified");
     let mut m = LockMetadata::new().with_tag("lock_source", s);
     if let Some(ref d) = opts.lock_source_detail {
         m = m.with_tag("lock_source_detail", d);

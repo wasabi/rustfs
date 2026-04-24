@@ -237,27 +237,13 @@ impl LockShard {
             let wait_result = match request.mode {
                 LockMode::Shared => {
                     state.atomic_state.inc_readers_waiting();
-                    let result = timeout(
-                        remaining,
-                        state
-                            .optimized_notify
-                            .wait_for_read()
-                            .instrument(notify_span.clone()),
-                    )
-                    .await;
+                    let result = timeout(remaining, state.optimized_notify.wait_for_read().instrument(notify_span.clone())).await;
                     state.atomic_state.dec_readers_waiting();
                     result
                 }
                 LockMode::Exclusive => {
                     state.atomic_state.inc_writers_waiting();
-                    let result = timeout(
-                        remaining,
-                        state
-                            .optimized_notify
-                            .wait_for_write()
-                            .instrument(notify_span),
-                    )
-                    .await;
+                    let result = timeout(remaining, state.optimized_notify.wait_for_write().instrument(notify_span)).await;
                     state.atomic_state.dec_writers_waiting();
                     result
                 }

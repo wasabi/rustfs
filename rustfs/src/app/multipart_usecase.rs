@@ -252,7 +252,8 @@ impl DefaultMultipartUsecase {
                 .get_object_info(
                     &bucket,
                     &key,
-                    &ObjectOptions::default().with_lock_source_detail("api.s3.complete_multipart.if_match_precondition_get_object_info"),
+                    &ObjectOptions::default()
+                        .with_lock_source_detail("api.s3.complete_multipart.if_match_precondition_get_object_info"),
                 )
                 .await
             {

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use tracing::{debug_span, Instrument};
+use tracing::{Instrument, debug_span};
 
 impl NodeService {
     pub(super) async fn handle_refresh(
@@ -124,24 +124,9 @@ impl NodeService {
             }
         };
 
-        let trace_id = args
-            .metadata
-            .tags
-            .get("trace_id")
-            .map(String::as_str)
-            .unwrap_or("");
-        let lock_source = args
-            .metadata
-            .tags
-            .get("lock_source")
-            .map(String::as_str)
-            .unwrap_or("");
-        let lock_source_detail = args
-            .metadata
-            .tags
-            .get("lock_source_detail")
-            .map(String::as_str)
-            .unwrap_or("");
+        let trace_id = args.metadata.tags.get("trace_id").map(String::as_str).unwrap_or("");
+        let lock_source = args.metadata.tags.get("lock_source").map(String::as_str).unwrap_or("");
+        let lock_source_detail = args.metadata.tags.get("lock_source_detail").map(String::as_str).unwrap_or("");
 
         let lock_client = self.get_lock_client()?;
         match lock_client

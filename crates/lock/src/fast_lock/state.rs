@@ -522,10 +522,7 @@ impl ObjectLockState {
         let (exclusive_holder_fp, exclusive_holder_held_ms) = match co.as_ref() {
             Some(info) => {
                 let fp = crate::fast_lock::holder_trace::owner_fingerprint(info.owner.as_ref());
-                let ms = SystemTime::now()
-                    .duration_since(info.acquired_at)
-                    .map(|d| d.as_millis())
-                    .ok();
+                let ms = SystemTime::now().duration_since(info.acquired_at).map(|d| d.as_millis()).ok();
                 (Some(fp), ms)
             }
             None => (None, None),
@@ -635,9 +632,7 @@ mod tests {
         let op: Arc<str> = Arc::from("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
         let tr: Arc<str> = Arc::from("feedface-cafe-4242-4242-424242424242");
         let timeout = Duration::from_secs(30);
-        assert!(state.try_acquire_shared_fast(
-            &owner, timeout, Some(tr.clone()), Some(op.clone())
-        ));
+        assert!(state.try_acquire_shared_fast(&owner, timeout, Some(tr.clone()), Some(op.clone())));
         let snap = state.waiter_contention_snapshot();
         assert_eq!(snap.shared_readers.len(), 1);
         let b = &snap.shared_readers[0];

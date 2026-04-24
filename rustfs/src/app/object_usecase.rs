@@ -53,11 +53,9 @@ use rustfs_ecstore::bucket::{
     },
     metadata::{BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
-    object_lock::{
-        objectlock_sys::{
-            BucketObjectLockSys, check_existing_object_lock_for_write, check_object_lock_for_deletion,
-            check_retention_for_modification,
-        },
+    object_lock::objectlock_sys::{
+        BucketObjectLockSys, check_existing_object_lock_for_write, check_object_lock_for_deletion,
+        check_retention_for_modification,
     },
     quota::QuotaOperation,
     replication::{
@@ -5371,7 +5369,10 @@ mod tests {
     // decision branches so any future divergence is caught immediately.
 
     fn make_lock_obj_info(user_defined: HashMap<String, String>) -> ObjectInfo {
-        ObjectInfo { user_defined, ..Default::default() }
+        ObjectInfo {
+            user_defined,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -5388,13 +5389,16 @@ mod tests {
         let mut ud = HashMap::new();
         let future = OffsetDateTime::now_utc() + time::Duration::days(30);
         ud.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
-        ud.insert(
-            "x-amz-object-lock-retain-until-date".to_string(),
-            future.format(&Rfc3339).unwrap(),
-        );
+        ud.insert("x-amz-object-lock-retain-until-date".to_string(), future.format(&Rfc3339).unwrap());
         let oi = make_lock_obj_info(ud);
-        assert!(validate_existing_object_lock_for_write(&oi).is_err(), "wrapper must reject active COMPLIANCE");
-        assert!(check_existing_object_lock_for_write(&oi).is_err(), "predicate must reject active COMPLIANCE");
+        assert!(
+            validate_existing_object_lock_for_write(&oi).is_err(),
+            "wrapper must reject active COMPLIANCE"
+        );
+        assert!(
+            check_existing_object_lock_for_write(&oi).is_err(),
+            "predicate must reject active COMPLIANCE"
+        );
     }
 
     #[test]
@@ -5403,10 +5407,7 @@ mod tests {
         let mut ud = HashMap::new();
         let future = OffsetDateTime::now_utc() + time::Duration::days(30);
         ud.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
-        ud.insert(
-            "x-amz-object-lock-retain-until-date".to_string(),
-            future.format(&Rfc3339).unwrap(),
-        );
+        ud.insert("x-amz-object-lock-retain-until-date".to_string(), future.format(&Rfc3339).unwrap());
         let oi = make_lock_obj_info(ud);
         assert!(validate_existing_object_lock_for_write(&oi).is_ok(), "wrapper must allow GOVERNANCE");
         assert!(check_existing_object_lock_for_write(&oi).is_ok(), "predicate must allow GOVERNANCE");

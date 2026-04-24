@@ -146,11 +146,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         match self
             .ecstore
-            .get_object_info(
-                bucket,
-                object,
-                &ObjectOptions::default().with_lock_source("heal.get_object_info"),
-            )
+            .get_object_info(bucket, object, &ObjectOptions::default().with_lock_source("heal.get_object_info"))
             .await
         {
             Ok(info) => Ok(Some(info)),
@@ -433,11 +429,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         // Use get_object_info for efficient existence check without heavy heal operations
         match self
             .ecstore
-            .get_object_info(
-                bucket,
-                object,
-                &ObjectOptions::default().with_lock_source("heal.get_object_info"),
-            )
+            .get_object_info(bucket, object, &ObjectOptions::default().with_lock_source("heal.get_object_info"))
             .await
         {
             Ok(_) => Ok(true), // Object exists

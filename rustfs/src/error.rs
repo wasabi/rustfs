@@ -447,10 +447,7 @@ mod tests {
     #[test]
     fn test_api_error_from_storage_error_object_lock_violation_message() {
         let reason = "object lock denies overwrite".to_string();
-        let api_error: ApiError = StorageError::ObjectLockViolation {
-            reason: reason.clone(),
-        }
-        .into();
+        let api_error: ApiError = StorageError::ObjectLockViolation { reason: reason.clone() }.into();
 
         assert_eq!(api_error.code, S3ErrorCode::AccessDenied);
         assert_eq!(api_error.message, reason);

@@ -11,9 +11,9 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::fast_lock::types::{LockMode, ObjectKey, ObjectLockRequest};
@@ -49,11 +49,7 @@ fn format_shared_readers_compact(readers: &[SharedOwnerBrief]) -> String {
         if i > 0 {
             out.push('|');
         }
-        let op = s
-            .operation_id
-            .as_deref()
-            .or(s.trace_id.as_deref())
-            .unwrap_or("-");
+        let op = s.operation_id.as_deref().or(s.trace_id.as_deref()).unwrap_or("-");
         let piece = format!("fp={} op={} held_ms={} prefix={}", s.owner_fp, op, s.held_ms, s.prefix);
         if out.len() + piece.len() > MAX_LEN {
             out.push_str("...(trunc)");
