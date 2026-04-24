@@ -501,9 +501,16 @@ async fn test_put_object_overwrite_blocked_by_compliance_retention() {
 
     let client = env.s3_client();
 
-    put_object_with_retention(&client, bucket, key, b"original-body", ObjectLockRetentionMode::Compliance, future_retain_until(30))
-        .await
-        .unwrap();
+    put_object_with_retention(
+        &client,
+        bucket,
+        key,
+        b"original-body",
+        ObjectLockRetentionMode::Compliance,
+        future_retain_until(30),
+    )
+    .await
+    .unwrap();
 
     let overwrite_result = client
         .put_object()

@@ -435,9 +435,7 @@ impl Clone for StorageError {
             StorageError::NotModified => StorageError::NotModified,
             StorageError::InvalidPartNumber(a) => StorageError::InvalidPartNumber(*a),
             StorageError::InvalidRangeSpec(a) => StorageError::InvalidRangeSpec(a.clone()),
-            StorageError::ObjectLockViolation { reason } => StorageError::ObjectLockViolation {
-                reason: reason.clone(),
-            },
+            StorageError::ObjectLockViolation { reason } => StorageError::ObjectLockViolation { reason: reason.clone() },
         }
     }
 }
@@ -1002,10 +1000,7 @@ mod tests {
         assert!(matches!(StorageError::from_u32(0x30), Some(StorageError::DecommissionAlreadyRunning)));
         assert!(matches!(StorageError::from_u32(0x40), Some(StorageError::RebalanceAlreadyRunning)));
         assert!(matches!(StorageError::from_u32(0x41), Some(StorageError::OperationCanceled)));
-        assert!(matches!(
-            StorageError::from_u32(0x42),
-            Some(StorageError::ObjectLockViolation { .. })
-        ));
+        assert!(matches!(StorageError::from_u32(0x42), Some(StorageError::ObjectLockViolation { .. })));
 
         // Test invalid code returns None
         assert!(StorageError::from_u32(0xFF).is_none());

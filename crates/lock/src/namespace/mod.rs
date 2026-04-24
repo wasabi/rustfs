@@ -361,10 +361,7 @@ impl NamespaceLock {
     ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
         let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
         let resource_str = format!("{}", resource);
-        match self
-            .rlock_guard_with_metadata(resource, owner, timeout, ttl, metadata)
-            .await
-        {
+        match self.rlock_guard_with_metadata(resource, owner, timeout, ttl, metadata).await {
             Ok(Some(guard)) => Ok(guard),
             Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
             Err(e) => Err(e),

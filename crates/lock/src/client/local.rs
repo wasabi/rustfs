@@ -117,12 +117,7 @@ impl LockClient for LocalClient {
                 .with_lock_source_detail_opt(lock_source_detail),
         };
 
-        let trace_id = request
-            .metadata
-            .tags
-            .get("trace_id")
-            .map(String::as_str)
-            .unwrap_or("");
+        let trace_id = request.metadata.tags.get("trace_id").map(String::as_str).unwrap_or("");
         let lock_source_str = request.metadata.tags.get("lock_source").map(String::as_str).unwrap_or("");
         let lock_source_detail_str = request
             .metadata

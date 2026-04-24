@@ -200,7 +200,9 @@ impl ECStore {
             if opts.lock_source.is_none() {
                 opts.lock_source = Some("s3.get_object".to_string());
             }
-            return self.pools[0].get_object_reader(bucket, object.as_str(), range, h, &opts).await;
+            return self.pools[0]
+                .get_object_reader(bucket, object.as_str(), range, h, &opts)
+                .await;
         }
 
         // TODO: nslock

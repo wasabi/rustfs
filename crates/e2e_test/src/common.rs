@@ -257,7 +257,9 @@ pub fn init_logging() {
     INIT.call_once(|| {
         // Use try_init so that if another test binary or thread has already installed
         // a global subscriber, we do not panic and poison the Once for all callers.
-        let _ = tracing_subscriber::fmt().with_env_filter("rustfs=info,e2e_test=debug").try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("rustfs=info,e2e_test=debug")
+            .try_init();
     });
 }
 
