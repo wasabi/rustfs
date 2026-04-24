@@ -1878,7 +1878,7 @@ impl DefaultObjectUsecase {
                     || req.headers.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER);
                 let bucket_has_ol_config = match metadata_sys::get_object_lock_config(&bucket).await {
                     Ok(_) => true,
-                    Err(err) if matches!(err, StorageError::ConfigNotFound) => false,
+                    Err(StorageError::ConfigNotFound) => false,
                     Err(err) => return Err(ApiError::from(err).into()),
                 };
                 if !bucket_has_ol_config && !has_ol_headers {
