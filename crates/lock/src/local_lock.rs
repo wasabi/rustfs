@@ -16,7 +16,7 @@ use crate::{
     GlobalLockManager, ObjectKey,
     error::Result,
     fast_lock::{FastLockGuard, LockManager, LockMode, ObjectLockRequest},
-    types::{LockPriority, LockRequest, LockType},
+    types::{LockMetadata, LockPriority, LockRequest, LockType},
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,6 +65,10 @@ impl LocalLock {
             LockPriority::Critical => crate::fast_lock::types::LockPriority::Critical,
         };
 
+        let corr_trace_id = request.metadata.tags.get("trace_id").map(|t| Arc::from(t.as_str()));
+        let corr_operation_id = request.metadata.operation_id.as_ref().map(|s| Arc::from(s.as_str()));
+        let lock_source = request.metadata.tags.get("lock_source").map(|t| Arc::from(t.as_str()));
+        let lock_source_detail = request.metadata.tags.get("lock_source_detail").map(|t| Arc::from(t.as_str()));
         let object_request = ObjectLockRequest {
             key: object_key,
             mode,
@@ -72,6 +76,10 @@ impl LocalLock {
             acquire_timeout: request.acquire_timeout,
             lock_timeout: request.ttl,
             priority: fast_priority,
+            trace_id: corr_trace_id,
+            operation_id: corr_operation_id,
+            lock_source,
+            lock_source_detail,
         };
 
         match self.manager.as_ref().acquire_lock(object_request).await {
@@ -94,6 +102,21 @@ impl LocalLock {
         self.acquire_guard(&req).await
     }
 
+    pub async fn lock_guard_with_metadata(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+        metadata: LockMetadata,
+    ) -> Result<Option<FastLockGuard>> {
+        let req = LockRequest::new(resource, LockType::Exclusive, owner)
+            .with_acquire_timeout(timeout)
+            .with_ttl(ttl)
+            .with_metadata(metadata);
+        self.acquire_guard(&req).await
+    }
+
     /// Convenience: acquire shared lock as a guard
     pub async fn rlock_guard(
         &self,
@@ -105,6 +128,21 @@ impl LocalLock {
         let req = LockRequest::new(resource, LockType::Shared, owner)
             .with_acquire_timeout(timeout)
             .with_ttl(ttl);
+        self.acquire_guard(&req).await
+    }
+
+    pub async fn rlock_guard_with_metadata(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+        metadata: LockMetadata,
+    ) -> Result<Option<FastLockGuard>> {
+        let req = LockRequest::new(resource, LockType::Shared, owner)
+            .with_acquire_timeout(timeout)
+            .with_ttl(ttl)
+            .with_metadata(metadata);
         self.acquire_guard(&req).await
     }
 }

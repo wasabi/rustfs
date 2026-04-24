@@ -730,7 +730,7 @@ mod tests {
     use rustfs_filemeta::FileInfo;
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
-    use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
+    use rustfs_lock::{LockError, LockInfo, LockMetadata, LockResponse, LockStats};
     use serde_json::Value;
     use serial_test::serial;
     use std::collections::HashMap;
@@ -924,7 +924,10 @@ mod tests {
                     self.set_disks
                         .new_ns_lock(bucket, object)
                         .await?
-                        .get_read_lock(std::time::Duration::from_millis(100))
+                        .get_read_lock_with_metadata(
+                            std::time::Duration::from_millis(100),
+                            LockMetadata::new().with_tag("lock_source", "config.locking_storage.get_object_reader"),
+                        )
                         .await
                         .map_err(|err| Error::other(format!("lock failed: {err}")))?,
                 )

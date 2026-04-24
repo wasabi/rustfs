@@ -487,6 +487,55 @@ async fn test_put_object_overwrite_blocked_by_legal_hold() {
 
 #[tokio::test]
 #[serial]
+async fn test_put_object_overwrite_blocked_by_compliance_retention() {
+    init_logging();
+    info!("🧪 Test: PutObject overwrite blocked by active COMPLIANCE retention");
+
+    let mut env = ObjectLockTestEnvironment::new().await.unwrap();
+    env.start_rustfs().await.unwrap();
+
+    let bucket = "test-put-overwrite-compliance";
+    let key = "compliance-object";
+
+    env.create_object_lock_bucket(bucket).await.unwrap();
+
+    let client = env.s3_client();
+
+    put_object_with_retention(
+        &client,
+        bucket,
+        key,
+        b"original-body",
+        ObjectLockRetentionMode::Compliance,
+        future_retain_until(30),
+    )
+    .await
+    .unwrap();
+
+    let overwrite_result = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(b"replacement-body".to_vec()))
+        .send()
+        .await;
+
+    assert!(
+        overwrite_result.is_err(),
+        "PutObject overwrite should fail while COMPLIANCE retention is active"
+    );
+
+    let error_str = format!("{:?}", overwrite_result.unwrap_err());
+    assert!(
+        error_str.to_lowercase().contains("compliance")
+            || error_str.to_lowercase().contains("access")
+            || error_str.to_lowercase().contains("denied"),
+        "overwrite error should indicate denial, got: {error_str}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_copy_object_applies_requested_legal_hold() {
     init_logging();
     info!("🧪 Test: CopyObject applies requested Legal Hold");

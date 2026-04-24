@@ -53,11 +53,9 @@ use rustfs_ecstore::bucket::{
     },
     metadata::{BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
-    object_lock::{
-        objectlock::{get_object_legalhold_meta, get_object_retention_meta},
-        objectlock_sys::{
-            BucketObjectLockSys, check_object_lock_for_deletion, check_retention_for_modification, is_retention_active,
-        },
+    object_lock::objectlock_sys::{
+        BucketObjectLockSys, check_existing_object_lock_for_write, check_object_lock_for_deletion,
+        check_retention_for_modification,
     },
     quota::QuotaOperation,
     replication::{
@@ -123,7 +121,7 @@ use std::convert::Infallible;
 use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -500,6 +498,54 @@ const SNOWBALL_IGNORE_ERRORS_HEADER_KEYS: &[&str] = &[
     AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS,
 ];
 
+// ── Preflight-mode rollout switch ────────────────────────────────────────────
+
+const RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT: &str = "RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT";
+
+/// Controls the existing-object-lock preflight behaviour on PutObject overwrites.
+///
+/// Set via [`RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT`]:
+/// - `auto` (default / unset / empty): skip the distributed-Shared preflight when the
+///   bucket has no object-lock configuration and the request carries no `x-amz-object-lock-*`
+///   headers; otherwise use the inline check under the post-encode Exclusive lock (Option B).
+/// - `always`: run today's legacy Shared-lock preflight verbatim (pre-Phase-2; use for rollback).
+/// - `never`: skip entirely (equivalent to the Phase 1 lab flag; use with caution).
+/// - Any other value: treated as `auto` (conservative default, a warning is logged).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PreflightMode {
+    Auto,
+    Always,
+    Never,
+}
+
+/// Returns the process-wide [`PreflightMode`] parsed once from
+/// [`RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT`] and cached for the lifetime of the process.
+fn preflight_mode() -> PreflightMode {
+    static MODE: OnceLock<PreflightMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let raw = std::env::var(RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT).unwrap_or_default();
+        parse_preflight_mode(raw.trim())
+    })
+}
+
+/// Parse a raw env-var value into a [`PreflightMode`].
+/// Extracted from `preflight_mode` so tests can exercise the parser directly.
+fn parse_preflight_mode(value: &str) -> PreflightMode {
+    match value.to_ascii_lowercase().as_str() {
+        "" | "auto" => PreflightMode::Auto,
+        "always" => PreflightMode::Always,
+        "never" => PreflightMode::Never,
+        other => {
+            warn!(
+                env = RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT,
+                value = other,
+                "unrecognised value; defaulting to \"auto\""
+            );
+            PreflightMode::Auto
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PutObjectExtractOptions {
     prefix: Option<String>,
@@ -807,30 +853,10 @@ fn validate_object_lock_configuration_input(input_cfg: &ObjectLockConfiguration)
 }
 
 pub(crate) fn validate_existing_object_lock_for_write(existing_obj_info: &ObjectInfo) -> S3Result<()> {
-    let legal_hold = get_object_legalhold_meta(&existing_obj_info.user_defined);
-    if legal_hold
-        .status
-        .as_ref()
-        .is_some_and(|status| status.as_str() == ObjectLockLegalHoldStatus::ON)
-    {
-        return Err(S3Error::with_message(
-            S3ErrorCode::AccessDenied,
-            "Object has a legal hold and cannot be overwritten. Remove the legal hold first.".to_string(),
-        ));
-    }
-
-    let retention = get_object_retention_meta(&existing_obj_info.user_defined);
-    if let Some(mode) = retention.mode.as_ref()
-        && mode.as_str() == ObjectLockRetentionMode::COMPLIANCE
-        && is_retention_active(mode.as_str(), retention.retain_until_date.as_ref())
-    {
-        return Err(S3Error::with_message(
-            S3ErrorCode::AccessDenied,
-            "Object is under COMPLIANCE retention and cannot be overwritten.".to_string(),
-        ));
-    }
-
-    Ok(())
+    check_existing_object_lock_for_write(existing_obj_info).map_err(|e| match e {
+        StorageError::ObjectLockViolation { reason } => S3Error::with_message(S3ErrorCode::AccessDenied, reason),
+        _ => S3Error::with_message(S3ErrorCode::InternalError, e.to_string()),
+    })
 }
 
 fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
@@ -1815,14 +1841,59 @@ impl DefaultObjectUsecase {
         )
         .await?;
 
-        let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
-            Err(err) => {
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+        match preflight_mode() {
+            PreflightMode::Always => {
+                // Legacy: distributed Shared-lock preflight, unchanged from pre-Phase-2 behaviour.
+                // Use `RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT=always` to force this path.
+                let current_opts = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+                    .await
+                    .map_err(ApiError::from)?
+                    .with_lock_source_detail("api.s3.put_object.existing_object_lock_check")
+                    .with_lock_correlation_id(Uuid::new_v4().to_string());
+                match store.get_object_info(&bucket, &key, &current_opts).await {
+                    Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+                    Err(err) => {
+                        if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                            return Err(ApiError::from(err).into());
+                        }
+                    }
+                }
+            }
+            PreflightMode::Never => {
+                debug!(
+                    env = RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT,
+                    bucket = %bucket,
+                    key = %key,
+                    "put_object: skipping existing-object-lock preflight (never)"
+                );
+            }
+            PreflightMode::Auto => {
+                // Bucket-gate (Option A): skip the distributed Shared preflight when the bucket
+                // has no object-lock config AND the request carries no x-amz-object-lock-* headers.
+                // Otherwise defer to the inline check under the post-encode Exclusive guard (Option B).
+                let has_ol_headers = req.headers.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER)
+                    || req.headers.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+                    || req.headers.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER);
+                let bucket_has_ol_config = match metadata_sys::get_object_lock_config(&bucket).await {
+                    Ok(_) => true,
+                    Err(StorageError::ConfigNotFound) => false,
+                    Err(err) => return Err(ApiError::from(err).into()),
+                };
+                if !bucket_has_ol_config && !has_ol_headers {
+                    debug!(
+                        env = RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT,
+                        bucket = %bucket,
+                        key = %key,
+                        "put_object: no OL config or headers; skipping preflight (auto)"
+                    );
+                } else {
+                    debug!(
+                        env = RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT,
+                        bucket = %bucket,
+                        key = %key,
+                        "put_object: OL config or headers present; deferring to inline check (auto)"
+                    );
+                    opts.existing_object_lock_inline_check = true;
                 }
             }
         }
@@ -2046,7 +2117,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.put_object_acl.get_object_info");
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         if access_control_policy.is_some() {
@@ -2255,7 +2327,8 @@ impl DefaultObjectUsecase {
         // offers some protection, but it does not fully eliminate this race.
         let check_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.put_object_retention.retention_check");
 
         if let Ok(existing_obj_info) = store.get_object_info(&bucket, &key, &check_opts).await {
             let bypass_governance = has_bypass_governance_header(&req.headers);
@@ -2351,6 +2424,7 @@ impl DefaultObjectUsecase {
         let version_id = req.input.version_id.clone();
         let opts = ObjectOptions {
             version_id: parse_object_version_id(version_id)?,
+            lock_source_detail: Some("api.s3.put_object_tagging.post_tags_notification_get_object_info".to_string()),
             ..Default::default()
         };
 
@@ -2751,7 +2825,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.get_object_acl.get_object_info");
         store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         Ok(S3Response::new(acl::build_get_object_acl_output()))
@@ -2785,7 +2860,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.get_object_attributes.get_object_info");
 
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
@@ -3012,7 +3088,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.get_object_legal_hold.get_object_info");
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
             error!("get_object_info failed, {}", e.to_string());
@@ -3099,7 +3176,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.get_object_retention.get_object_info");
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
             error!("get_object_info failed, {}", e.to_string());
@@ -3259,7 +3337,9 @@ impl DefaultObjectUsecase {
 
         let current_opts: ObjectOptions = get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.copy_object.existing_object_lock_check")
+            .with_lock_correlation_id(Uuid::new_v4().to_string());
         match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
             Err(err) => {
@@ -3642,7 +3722,8 @@ impl DefaultObjectUsecase {
                 metadata,
             )
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.delete_objects.per_object_get_object_info");
 
             let (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
                 Ok(res) => (res, None),
@@ -3933,7 +4014,9 @@ impl DefaultObjectUsecase {
         // 2. Or use combined get-and-delete in storage layer with retention check callback
         let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.delete_object.existing_object_lock_check")
+            .with_lock_correlation_id(Uuid::new_v4().to_string());
 
         let existing_object_info = match store.get_object_info(&bucket, &key, &get_opts).await {
             Ok(obj_info) => {
@@ -4088,6 +4171,7 @@ impl DefaultObjectUsecase {
         let version_id_for_parse = version_id.clone();
         let opts = ObjectOptions {
             version_id: parse_object_version_id(version_id_for_parse)?,
+            lock_source_detail: Some("api.s3.delete_object_tagging.post_delete_notification_get_object_info".to_string()),
             ..Default::default()
         };
 
@@ -4193,7 +4277,8 @@ impl DefaultObjectUsecase {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+            .with_lock_source_detail("api.s3.head_object.get_object_info");
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -4500,7 +4585,8 @@ impl DefaultObjectUsecase {
         let version_id_str = version_id.clone().unwrap_or_default();
         let opts = post_restore_opts(&version_id_str, &bucket, &object)
             .await
-            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?;
+            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?
+            .with_lock_source_detail("api.s3.restore_object.get_object_info");
 
         let mut obj_info = store
             .get_object_info(&bucket, &object, &opts)
@@ -5238,6 +5324,93 @@ mod tests {
 
         headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("false"));
         assert!(!is_put_object_extract_requested(&headers));
+    }
+
+    // ── PreflightMode parser tests ────────────────────────────────────
+
+    #[test]
+    fn parse_preflight_mode_empty_is_auto() {
+        assert_eq!(parse_preflight_mode(""), PreflightMode::Auto);
+    }
+
+    #[test]
+    fn parse_preflight_mode_explicit_auto_variants() {
+        assert_eq!(parse_preflight_mode("auto"), PreflightMode::Auto);
+        assert_eq!(parse_preflight_mode("Auto"), PreflightMode::Auto);
+        assert_eq!(parse_preflight_mode("AUTO"), PreflightMode::Auto);
+    }
+
+    #[test]
+    fn parse_preflight_mode_always_variants() {
+        assert_eq!(parse_preflight_mode("always"), PreflightMode::Always);
+        assert_eq!(parse_preflight_mode("Always"), PreflightMode::Always);
+        assert_eq!(parse_preflight_mode("ALWAYS"), PreflightMode::Always);
+    }
+
+    #[test]
+    fn parse_preflight_mode_never_variants() {
+        assert_eq!(parse_preflight_mode("never"), PreflightMode::Never);
+        assert_eq!(parse_preflight_mode("Never"), PreflightMode::Never);
+        assert_eq!(parse_preflight_mode("NEVER"), PreflightMode::Never);
+    }
+
+    #[test]
+    fn parse_preflight_mode_unknown_value_falls_back_to_auto() {
+        // Conservative default — operator misconfiguration should not weaken protection.
+        assert_eq!(parse_preflight_mode("maybe"), PreflightMode::Auto);
+        assert_eq!(parse_preflight_mode("1"), PreflightMode::Auto);
+        assert_eq!(parse_preflight_mode("true"), PreflightMode::Auto);
+        assert_eq!(parse_preflight_mode("skip"), PreflightMode::Auto);
+    }
+
+    // ── Predicate-wrapper equivalence ─────────────────────────────────────────
+    // validate_existing_object_lock_for_write is a thin S3-layer wrapper around
+    // check_existing_object_lock_for_write. Verify they agree on all three
+    // decision branches so any future divergence is caught immediately.
+
+    fn make_lock_obj_info(user_defined: HashMap<String, String>) -> ObjectInfo {
+        ObjectInfo {
+            user_defined,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn predicate_equivalence_legal_hold_on_both_reject() {
+        let mut ud = HashMap::new();
+        ud.insert("x-amz-object-lock-legal-hold".to_string(), "ON".to_string());
+        let oi = make_lock_obj_info(ud);
+        assert!(validate_existing_object_lock_for_write(&oi).is_err(), "wrapper must reject legal hold ON");
+        assert!(check_existing_object_lock_for_write(&oi).is_err(), "predicate must reject legal hold ON");
+    }
+
+    #[test]
+    fn predicate_equivalence_compliance_active_both_reject() {
+        let mut ud = HashMap::new();
+        let future = OffsetDateTime::now_utc() + time::Duration::days(30);
+        ud.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        ud.insert("x-amz-object-lock-retain-until-date".to_string(), future.format(&Rfc3339).unwrap());
+        let oi = make_lock_obj_info(ud);
+        assert!(
+            validate_existing_object_lock_for_write(&oi).is_err(),
+            "wrapper must reject active COMPLIANCE"
+        );
+        assert!(
+            check_existing_object_lock_for_write(&oi).is_err(),
+            "predicate must reject active COMPLIANCE"
+        );
+    }
+
+    #[test]
+    fn predicate_equivalence_governance_active_both_allow() {
+        // GOVERNANCE bypass is handled at the API layer; the predicate must not block it.
+        let mut ud = HashMap::new();
+        let future = OffsetDateTime::now_utc() + time::Duration::days(30);
+        ud.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
+        ud.insert("x-amz-object-lock-retain-until-date".to_string(), future.format(&Rfc3339).unwrap());
+        let oi = make_lock_obj_info(ud);
+        assert!(validate_existing_object_lock_for_write(&oi).is_ok(), "wrapper must allow GOVERNANCE");
+        assert!(check_existing_object_lock_for_write(&oi).is_ok(), "predicate must allow GOVERNANCE");
     }
 
     #[test]

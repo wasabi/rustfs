@@ -73,6 +73,18 @@ pub struct ObjectOptions {
 
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
+
+    /// If set, stored in `LockMetadata.tags["lock_source"]` for distributed read/write lock acquires (observability).
+    pub lock_source: Option<String>,
+    /// Finer call path (S3 API handler name, storage helper, etc.) in `LockMetadata.tags["lock_source_detail"]`.
+    pub lock_source_detail: Option<String>,
+    /// If set, distributed **read** lock acquires include `LockMetadata.operation_id` and `tags["trace_id"]` (same pattern as write-lock Put tracing).
+    pub lock_correlation_id: Option<String>,
+
+    /// When true, `SetDisks::put_object` runs the inline object-lock check under the
+    /// post-encode Exclusive guard instead of the distributed Shared preflight.
+    /// Set by the `Auto` branch of `preflight_mode()` in `execute_put_object`.
+    pub existing_object_lock_inline_check: bool,
 }
 
 impl ObjectOptions {
@@ -130,6 +142,24 @@ impl ObjectOptions {
             targets: replication_statuses_map(rs.as_str()),
             ..Default::default()
         }
+    }
+
+    /// Tag for `LockMetadata.tags["lock_source"]` when this path takes a distributed lock.
+    pub fn with_lock_source(mut self, s: impl Into<String>) -> Self {
+        self.lock_source = Some(s.into());
+        self
+    }
+
+    /// Tag for `LockMetadata.tags["lock_source_detail"]` (e.g. `api.s3.put_object.existing_object_lock_check`).
+    pub fn with_lock_source_detail(mut self, s: impl Into<String>) -> Self {
+        self.lock_source_detail = Some(s.into());
+        self
+    }
+
+    /// Correlation UUID for this `get_object_info` (or other read) lock leg — joins read acquire / `shared_released` to the S3 handler in JSONL.
+    pub fn with_lock_correlation_id(mut self, id: impl Into<String>) -> Self {
+        self.lock_correlation_id = Some(id.into());
+        self
     }
 
     pub fn precondition_check(&self, obj_info: &ObjectInfo) -> Result<()> {

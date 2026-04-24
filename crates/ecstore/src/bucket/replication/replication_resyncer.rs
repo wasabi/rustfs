@@ -2232,6 +2232,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             version_suspended,
             versioned,
             replication_request: true,
+            lock_source: Some("replication.resync.get_object_reader".to_string()),
             ..Default::default()
         };
 
@@ -2429,6 +2430,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             version_suspended,
             versioned,
             replication_request: true,
+            lock_source: Some("replication.resync.get_object_reader".to_string()),
             ..Default::default()
         };
 

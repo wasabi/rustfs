@@ -18,7 +18,9 @@ use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
     disk::{DiskStore, endpoint::Endpoint},
     store::ECStore,
-    store_api::{BucketInfo, BucketOperations, HealOperations, ListOperations, ObjectIO, ObjectOperations, StorageAPI},
+    store_api::{
+        BucketInfo, BucketOperations, HealOperations, ListOperations, ObjectIO, ObjectOperations, ObjectOptions, StorageAPI,
+    },
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Arc;
@@ -142,7 +144,11 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
         debug!("Getting object meta: {}/{}", bucket, object);
 
-        match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
+        match self
+            .ecstore
+            .get_object_info(bucket, object, &ObjectOptions::default().with_lock_source("heal.get_object_info"))
+            .await
+        {
             Ok(info) => Ok(Some(info)),
             Err(e) => {
                 // Map ObjectNotFound to None to align with Option return type
@@ -161,7 +167,13 @@ impl HealStorageAPI for ECStoreHealStorage {
         debug!("Getting object data: {}/{}", bucket, object);
 
         let reader = match (*self.ecstore)
-            .get_object_reader(bucket, object, None, Default::default(), &Default::default())
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                Default::default(),
+                &ObjectOptions::default().with_lock_source("heal.get_object_reader"),
+            )
             .await
         {
             Ok(reader) => reader,
@@ -252,7 +264,13 @@ impl HealStorageAPI for ECStoreHealStorage {
 
                 // Stream-read the object to a sink to avoid loading into memory
                 match (*self.ecstore)
-                    .get_object_reader(bucket, object, None, Default::default(), &Default::default())
+                    .get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        Default::default(),
+                        &ObjectOptions::default().with_lock_source("heal.get_object_reader"),
+                    )
                     .await
                 {
                     Ok(reader) => {
@@ -409,7 +427,11 @@ impl HealStorageAPI for ECStoreHealStorage {
         debug!("Checking object exists: {}/{}", bucket, object);
 
         // Use get_object_info for efficient existence check without heavy heal operations
-        match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
+        match self
+            .ecstore
+            .get_object_info(bucket, object, &ObjectOptions::default().with_lock_source("heal.get_object_info"))
+            .await
+        {
             Ok(_) => Ok(true), // Object exists
             Err(e) => {
                 // Map ObjectNotFound to false, other errors must be propagated!

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use tracing::{Instrument, debug_span};
 
 impl NodeService {
     pub(super) async fn handle_refresh(
@@ -123,8 +124,24 @@ impl NodeService {
             }
         };
 
+        let trace_id = args.metadata.tags.get("trace_id").map(String::as_str).unwrap_or("");
+        let lock_source = args.metadata.tags.get("lock_source").map(String::as_str).unwrap_or("");
+        let lock_source_detail = args.metadata.tags.get("lock_source_detail").map(String::as_str).unwrap_or("");
+
         let lock_client = self.get_lock_client()?;
-        match lock_client.acquire_lock(&args).await {
+        match lock_client
+            .acquire_lock(&args)
+            .instrument(debug_span!(
+                target: "rustfs_lock_rpc",
+                "lock_rpc.handle_lock",
+                resource = %args.resource,
+                operation_id = args.metadata.operation_id.as_deref().unwrap_or(""),
+                trace_id = trace_id,
+                lock_source = lock_source,
+                lock_source_detail = lock_source_detail,
+            ))
+            .await
+        {
             Ok(result) => {
                 // Serialize lock_info if available
                 let lock_info_json = result.lock_info.as_ref().and_then(|info| serde_json::to_string(info).ok());

@@ -19,7 +19,7 @@ use crate::{
     error::Result,
     fast_lock::FastLockGuard,
     local_lock::LocalLock,
-    types::{LockId, LockRequest},
+    types::{LockId, LockMetadata, LockRequest},
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +58,16 @@ impl NamespaceLockWrapper {
         self.lock.get_write_lock(self.resource.clone(), &self.owner, timeout).await
     }
 
+    pub async fn get_write_lock_with_metadata(
+        &self,
+        timeout: Duration,
+        metadata: LockMetadata,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        self.lock
+            .get_write_lock_with_metadata(self.resource.clone(), &self.owner, timeout, metadata)
+            .await
+    }
+
     /// Acquire write lock with expected contention logs suppressed
     pub async fn get_write_lock_quiet(
         &self,
@@ -72,6 +82,17 @@ impl NamespaceLockWrapper {
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_read_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
         self.lock.get_read_lock(self.resource.clone(), &self.owner, timeout).await
+    }
+
+    /// Same as [`Self::get_read_lock`], with `LockMetadata` on the wire (e.g. `tags["lock_source"]`).
+    pub async fn get_read_lock_with_metadata(
+        &self,
+        timeout: Duration,
+        metadata: LockMetadata,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        self.lock
+            .get_read_lock_with_metadata(self.resource.clone(), &self.owner, timeout, metadata)
+            .await
     }
 }
 
@@ -226,6 +247,26 @@ impl NamespaceLock {
         }
     }
 
+    pub async fn rlock_guard_with_metadata(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+        metadata: LockMetadata,
+    ) -> Result<Option<NamespaceLockGuard>> {
+        match self {
+            Self::Distributed(lock) => lock
+                .rlock_guard_with_metadata(resource, owner, timeout, ttl, metadata)
+                .await
+                .map(|opt| opt.map(NamespaceLockGuard::Standard)),
+            Self::Local(lock) => lock
+                .rlock_guard_with_metadata(resource, owner, timeout, ttl, metadata)
+                .await
+                .map(|opt| opt.map(NamespaceLockGuard::Fast)),
+        }
+    }
+
     /// Acquire write lock (exclusive lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_write_lock(
@@ -245,6 +286,29 @@ impl NamespaceLock {
                 Err(crate::error::LockError::timeout(resource_str, timeout))
             }
             Err(e) => Err(e),
+        }
+    }
+
+    pub async fn get_write_lock_with_metadata(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        metadata: LockMetadata,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
+        let resource_str = format!("{}", resource);
+        match self {
+            Self::Distributed(lock) => match lock.lock_guard_with_metadata(resource, owner, timeout, ttl, metadata).await {
+                Ok(Some(guard)) => Ok(NamespaceLockGuard::Standard(guard)),
+                Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
+                Err(e) => Err(e),
+            },
+            Self::Local(lock) => match lock.lock_guard_with_metadata(resource, owner, timeout, ttl, metadata).await {
+                Ok(Some(guard)) => Ok(NamespaceLockGuard::Fast(guard)),
+                Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
+                Err(e) => Err(e),
+            },
         }
     }
 
@@ -282,6 +346,22 @@ impl NamespaceLock {
         let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
         let resource_str = format!("{}", resource);
         match self.rlock_guard(resource, owner, timeout, ttl).await {
+            Ok(Some(guard)) => Ok(guard),
+            Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn get_read_lock_with_metadata(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        metadata: LockMetadata,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
+        let resource_str = format!("{}", resource);
+        match self.rlock_guard_with_metadata(resource, owner, timeout, ttl, metadata).await {
             Ok(Some(guard)) => Ok(guard),
             Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
             Err(e) => Err(e),
