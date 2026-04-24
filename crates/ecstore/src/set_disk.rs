@@ -541,7 +541,11 @@ impl SetDisks {
 /// optional `tags["lock_source_detail"]` for call-site disambiguation,
 /// optional [`ObjectOptions::lock_correlation_id`] as `operation_id` + `tags["trace_id"]` (matches write-lock Put metadata).
 fn read_lock_metadata(opts: &ObjectOptions) -> LockMetadata {
-    let s = opts.lock_source.as_deref().unwrap_or("ecstore.read_lock.unspecified");
+    let s = opts
+        .lock_source
+        .as_deref()
+        .or(opts.lock_source_detail.as_deref())
+        .unwrap_or("ecstore.read_lock.unspecified");
     let mut m = LockMetadata::new().with_tag("lock_source", s);
     if let Some(ref d) = opts.lock_source_detail {
         m = m.with_tag("lock_source_detail", d);
