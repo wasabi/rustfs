@@ -203,6 +203,7 @@ meta = {
     "trace": $( $TRACE && echo true || echo false ),
     "utc": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
     "peer_nodes": "$PEER_NODES".split(),
+    "nic_interfaces": "$NIC_INTERFACES".split() if "$NIC_INTERFACES" else [],
 }
 with open("$OUT/meta.json", "w") as f:
     json.dump(meta, f, indent=2)
