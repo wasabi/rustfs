@@ -31,13 +31,13 @@ NST="$OUT/nstat-node${NID}-${TAG}.txt"
   stamp
   echo "=== ss -s ==="
   ss -s || true
-} | tee "$SSS"
+} > "$SSS"
 
 {
   stamp
   echo "=== nstat -az ==="
   nstat -az || true
-} | tee "$NST"
+} > "$NST"
 
 if [[ -n "$PEER_SPEC" ]]; then
   PEER="${PEER_SPEC%%:*}"
@@ -51,7 +51,7 @@ if [[ -n "$PEER_SPEC" ]]; then
     stamp
     echo "=== ss -Hti dst $PEER dport = :$PORT ==="
     ss -Hti "dst $PEER" "dport = :$PORT" 2>/dev/null || ss -Hti "dst $PEER" 2>/dev/null || true
-  } | tee "$SPEER"
+  } > "$SPEER"
 fi
 
 if [[ ${#NICS[@]} -ge 1 ]]; then
@@ -62,7 +62,7 @@ if [[ ${#NICS[@]} -ge 1 ]]; then
       echo "=== ethtool -S $iface (filtered) ==="
       ethtool -S "$iface" 2>/dev/null | grep -Ei 'drop|err|discard|miss|fail' || true
     done
-  } | tee "$ETH"
+  } > "$ETH"
 fi
 
 echo "Wrote snapshots under $OUT (${TAG})"

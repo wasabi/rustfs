@@ -23,10 +23,10 @@ IO="$OUT/iostat-node${NODE_ID}.txt"
   echo "OUT=$OUT NODE_ID=$NODE_ID"
 } | tee -a "$MP" | tee -a "$IO" >/dev/null
 
-mpstat -P ALL 1 | tee -a "$MP" &
+mpstat -P ALL 1 >> "$MP" &
 MP_PID=$!
 
-iostat -xz 1 | tee -a "$IO" &
+iostat -xz 1 >> "$IO" &
 IO_PID=$!
 
 cleanup() {

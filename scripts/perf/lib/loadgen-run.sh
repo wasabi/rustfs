@@ -65,10 +65,8 @@ LOADGEN_CMD=(
     -deleteOnlyOurBuckets
 )
 
-# Append server override if LOADGEN_ENDPOINT is set in paths.env
-if [[ -n "${LOADGEN_ENDPOINT:-}" ]]; then
-    LOADGEN_CMD+=(-s "$LOADGEN_ENDPOINT")
-fi
+# Server endpoint comes from the Server field in LOADGEN_CFG (local.cfg).
+# The binary does not accept a command-line server override flag.
 
 mkdir -p "$OUT"
 LOADGEN_OUT="$OUT/loadgen.txt"
