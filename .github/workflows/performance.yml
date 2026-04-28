@@ -27,7 +27,7 @@ on:
       profile_duration:
         description: "Profiling duration in seconds"
         required: false
-        default: "120"
+        default: "300"
         type: string
 
 permissions:
@@ -99,19 +99,33 @@ jobs:
       - name: Run performance profiling
         id: profiling
         run: |
-          DURATION="${{ github.event.inputs.profile_duration || '120' }}"
+          DURATION="${{ github.event.inputs.profile_duration || '300' }}"
           echo "Running profiling for ${DURATION} seconds..."
 
-          timeout "${DURATION}s" samply record \
+          set +e
+          timeout --signal=SIGINT --kill-after=30s "${DURATION}s" samply record \
             --output samply-profile.json \
-            ./target/profiling/rustfs ${RUSTFS_VOLUMES} || true
+            ./target/profiling/rustfs ${RUSTFS_VOLUMES}
+          SAMPLY_EXIT_CODE=$?
+          set -e
 
+          echo "samply_exit_code=${SAMPLY_EXIT_CODE}"
+          ls -lah samply-profile* || true
+
+          PROFILE_PATH=""
           if [ -f "samply-profile.json" ]; then
+            PROFILE_PATH="samply-profile.json"
+          elif [ -f "samply-profile.json.gz" ]; then
+            PROFILE_PATH="samply-profile.json.gz"
+          fi
+
+          if [ -n "${PROFILE_PATH}" ]; then
             echo "profile_generated=true" >> $GITHUB_OUTPUT
+            echo "profile_path=${PROFILE_PATH}" >> $GITHUB_OUTPUT
             echo "Profile generated successfully"
           else
             echo "profile_generated=false" >> $GITHUB_OUTPUT
-            echo "::warning::Profile data not generated"
+            echo "::warning::Profile data not generated (samply exit code: ${SAMPLY_EXIT_CODE})"
           fi
 
       - name: Upload profile data
@@ -119,7 +133,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: performance-profile-${{ github.run_number }}
-          path: samply-profile.json
+          path: ${{ steps.profiling.outputs.profile_path }}
           retention-days: 30
 
       - name: Failure diagnostics
