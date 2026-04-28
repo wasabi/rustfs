@@ -21,8 +21,13 @@
 #   --trace                         enable debug RUST_LOG recipe on node1; collect obs JSONL
 #
 # Required env (source conf/paths.env before running):
-#   PEER_NODES, RUSTFS_VOLUMES, DATA_DIRS, PEER_RUSTFS_BIN
-#   LOADGEN_BIN, LOADGEN_CFG, LOADGEN_ENDPOINT (optional), LOADGEN_HOST (optional)
+#   LOADGEN_BIN, LOADGEN_CFG
+# Optional env:
+#   PEER_NODES          space-separated peer hostnames; if empty, peer monitoring
+#                       and artifact collection are skipped (node1-only run)
+#   RUSTFS_VOLUMES      informational; recorded in meta.json
+#   DATA_DIRS, PEER_RUSTFS_BIN  used only by deploy.sh / cleanup.sh
+#   LOADGEN_ENDPOINT (optional), LOADGEN_HOST (optional)
 #   NIC_INTERFACES (optional, for ethtool snapshots)
 #   RUSTFS_OBS_LOG_DIR (optional, default /var/logs/rustfs — used by --trace)
 
@@ -90,10 +95,12 @@ log "no_deploy=${NO_DEPLOY} force_cleanup=${FORCE_CLEANUP} trace=${TRACE}"
 # Validate required env
 # ---------------------------------------------------------------------------
 
-: "${PEER_NODES:?PEER_NODES must be set (source conf/paths.env)}"
-: "${RUSTFS_VOLUMES:?RUSTFS_VOLUMES must be set (source conf/paths.env)}"
 : "${LOADGEN_BIN:?LOADGEN_BIN must be set (source conf/paths.env)}"
 : "${LOADGEN_CFG:?LOADGEN_CFG must be set (source conf/paths.env)}"
+
+if [[ -z "${PEER_NODES:-}" ]]; then
+    log "PEER_NODES not set — running node1-only (no peer monitors, no peer artifact collection)"
+fi
 
 # ---------------------------------------------------------------------------
 # RUST_LOG recipe
@@ -134,9 +141,11 @@ stop_monitors() {
     fi
     for node in "${!REMOTE_MONITOR_PIDS[@]}"; do
         local_ssh_pid="${REMOTE_MONITOR_PIDS[$node]}"
+        local node_host="${node##*@}"
+        local pid_file="${OUT}/node-${node_host}/monitor-node${node_host}-pid.txt"
         # Signal the remote monitor process via its saved PID file
-        if ssh "$node" "test -f '${OUT}/monitor-node${node}-pid.txt'"; then
-            remote_pid=$(ssh "$node" "cat '${OUT}/monitor-node${node}-pid.txt'")
+        if ssh "$node" "test -f '${pid_file}'"; then
+            remote_pid=$(ssh "$node" "cat '${pid_file}'")
             ssh "$node" "kill '$remote_pid' 2>/dev/null || true" || true
         fi
         # Also kill the local SSH background job
@@ -146,12 +155,15 @@ stop_monitors() {
 }
 
 collect_peer_artifacts() {
+    [[ -n "${PEER_NODES:-}" ]] || return 0
     log "Collecting artifacts from peer nodes..."
     for node in $PEER_NODES; do
-        local node_out="$OUT/node-${node}"
-        mkdir -p "$node_out"
-        log "  scp ${node}:${OUT}/ → ${node_out}/"
-        scp -r -q "$node:${OUT}/." "$node_out/" || log "  WARNING: scp from $node failed"
+        local node_host="${node##*@}"
+        local node_out="$OUT/node-${node_host}"
+        log "  scp ${node}:${node_out}/ → ${node_out}/"
+        # Copy the peer's subdirectory directly (avoids the "/." suffix that breaks
+        # newer OpenSSH and the "@" character that appears when PEER_NODES uses user@host).
+        scp -r -q "${node}:${node_out}" "${OUT}/" || log "  WARNING: scp from $node failed"
     done
 }
 
@@ -202,7 +214,7 @@ meta = {
     "duration": "$DURATION",
     "trace": $( $TRACE && echo True || echo False ),
     "utc": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
-    "peer_nodes": "$PEER_NODES".split(),
+    "peer_nodes": "${PEER_NODES:-}".split(),
     "nic_interfaces": "$NIC_INTERFACES".split() if "$NIC_INTERFACES" else [],
 }
 with open("$OUT/meta.json", "w") as f:
@@ -220,31 +232,48 @@ log "--- Step 3: start monitors ---"
 NODE_ID=1
 mkdir -p "$OUT/node1"
 
-NODE_ID=1 OUT="$OUT/node1" PEER_SPEC="${PEER_NODES%% *}:9000" \
-    bash "$LIB/monitor.sh" &
+# PEER_SPEC: tcp-socket tracking target for node1's ss snapshots.
+# Empty when PEER_NODES is not set (node1-only run).
+LOCAL_PEER_SPEC="${PEER_NODES:+${PEER_NODES%% *}:9000}"
+
+NODE_ID=1 OUT="$OUT/node1" PEER_SPEC="${LOCAL_PEER_SPEC}" \
+    bash "$LIB/monitor.sh" >> "$OUT/node1/monitor-node1.log" 2>&1 &
 LOCAL_MONITOR_PID=$!
 log "Local monitor started (pid=${LOCAL_MONITOR_PID})"
 
-PEER_NODE_ID=2
-for node in $PEER_NODES; do
-    peer_out="$OUT/node-${node}"
-    mkdir -p "$peer_out"
-    # Start monitor on peer; save its PID to a file on the remote for clean signalling
-    ssh "$node" "
-        mkdir -p '${peer_out}'
-        export NODE_ID=${PEER_NODE_ID}
-        export OUT='${peer_out}'
-        export PEER_SPEC=''
-        export NIC_INTERFACES='${NIC_INTERFACES:-}'
-        nohup bash '${SCRIPT_DIR}/lib/monitor.sh' \
-            >>'${peer_out}/monitor-node${PEER_NODE_ID}.log' 2>&1 &
-        echo \$! > '${peer_out}/monitor-node${node}-pid.txt'
-        disown
-    " &
-    REMOTE_MONITOR_PIDS["$node"]=$!
-    log "Remote monitor started on $node (node_id=${PEER_NODE_ID})"
-    (( PEER_NODE_ID++ ))
-done
+if [[ -n "${PEER_NODES:-}" ]]; then
+    PEER_NODE_ID=2
+    for node in $PEER_NODES; do
+        # Strip optional user prefix (e.g. "ba@node2" → "node2") for directory and file names.
+        node_host="${node##*@}"
+        peer_out="$OUT/node-${node_host}"
+
+        # Ship the lib scripts to the peer so the remote monitor can run even if the
+        # peer node does not have a local copy of the repo.
+        REMOTE_LIB="/tmp/perf-lib-${node_host}"
+        log "Shipping monitor scripts to $node:${REMOTE_LIB}..."
+        ssh "$node" "mkdir -p '${REMOTE_LIB}'"
+        scp -q "$LIB/"*.sh "$node:${REMOTE_LIB}/"
+
+        # Start monitor on peer; save its PID to a file on the remote for clean signalling.
+        # Note: do NOT mkdir "$peer_out" locally here — collect_peer_artifacts uses
+        # "scp -r host:$peer_out $OUT/" which would double-nest if the dir already exists.
+        ssh "$node" "
+            mkdir -p '${peer_out}'
+            export NODE_ID=${PEER_NODE_ID}
+            export OUT='${peer_out}'
+            export PEER_SPEC=''
+            export NIC_INTERFACES='${NIC_INTERFACES:-}'
+            nohup bash '${REMOTE_LIB}/monitor.sh' \
+                >>'${peer_out}/monitor-node${PEER_NODE_ID}.log' 2>&1 &
+            echo \$! > '${peer_out}/monitor-node${node_host}-pid.txt'
+            disown
+        " &
+        REMOTE_MONITOR_PIDS["$node"]=$!
+        log "Remote monitor started on $node (node_id=${PEER_NODE_ID})"
+        (( PEER_NODE_ID++ ))
+    done
+fi
 
 # Brief pause to let monitors take their T0 snapshots before load starts
 sleep 2
@@ -254,13 +283,33 @@ sleep 2
 # ---------------------------------------------------------------------------
 
 log "--- Step 4: run loadgen (duration=${DURATION}) ---"
-bash "$LIB/loadgen-run.sh"
+bash "$LIB/loadgen-run.sh" &
+LOADGEN_PID=$!
+
+# Stop monitors the moment PUT traffic ends — keyed on the /AVG summary line
+# that the loadgen writes immediately after its last PUT interval, before cleanup.
+# This ensures CPU/disk/NIC stats cover only the PUT window, not the cleanup phase.
+LOADGEN_OUT="$OUT/loadgen.txt"
+while kill -0 "$LOADGEN_PID" 2>/dev/null \
+      && ! grep -q '/AVG' "$LOADGEN_OUT" 2>/dev/null; do
+    sleep 1
+done
+
+if grep -q '/AVG' "$LOADGEN_OUT" 2>/dev/null; then
+    log "PUT traffic complete — stopping monitors (loadgen cleanup continues)"
+    stop_monitors
+    LOCAL_MONITOR_PID=""
+    declare -A REMOTE_MONITOR_PIDS
+fi
+
+# Wait for the full loadgen process (including cleanup) to finish
+wait "$LOADGEN_PID"
 LOADGEN_STATUS=$?
 log "Loadgen finished (status=${LOADGEN_STATUS})"
 
 # ---------------------------------------------------------------------------
-# Step 5 — Stop monitors (done via EXIT trap on normal path too, but doing
-#           it explicitly here gives cleaner T1 snapshot timing)
+# Step 5 — Stop monitors (no-op if already stopped above; kept for the
+#           case where loadgen exits before /AVG appears, e.g. on error)
 # ---------------------------------------------------------------------------
 
 log "--- Step 5: stop monitors ---"
