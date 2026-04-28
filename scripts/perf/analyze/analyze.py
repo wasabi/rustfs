@@ -92,16 +92,13 @@ _SAR_PAT = re.compile(
 
 
 def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
-    """Parse sar -n DEV file; aggregate rxkB/s + txkB/s across ifaces; return Gbps stats."""
+    """Parse sar -n DEV file; return per-interface Gbps stats.
+
+    Returns {iface: {mean_rx_Gbps, peak_rx_Gbps, mean_tx_Gbps, peak_tx_Gbps}}
+    for each requested interface that has data.
+    """
     if not path.exists():
         return None
-
-    # Collect per-sample totals across all requested interfaces
-    # key: sample_index → (rx_kbs_total, tx_kbs_total)
-    samples: list[tuple[float, float]] = []
-    # buffer per-interface per-timestamp to aggregate
-    buf: dict[str, tuple[float, float]] = {}  # iface → (rx, tx) for current second
-    prev_ts: str = ""
 
     rx_by_iface: dict[str, list[float]] = {i: [] for i in ifaces}
     tx_by_iface: dict[str, list[float]] = {i: [] for i in ifaces}
@@ -119,25 +116,25 @@ def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
                 except ValueError:
                     pass
 
-    # Require at least one interface with data
     found = [i for i in ifaces if rx_by_iface[i]]
     if not found:
         return None
 
-    # Aggregate per sample across all found interfaces (zip to shortest)
-    n = min(len(rx_by_iface[i]) for i in found)
-    rx_totals = [sum(rx_by_iface[i][t] for i in found) for t in range(n)]
-    tx_totals = [sum(tx_by_iface[i][t] for i in found) for t in range(n)]
-
     def _kbs_to_gbps(kbs: float) -> float:
         return kbs * 8 / 1_000_000  # kB/s × 8 bits × 1/1e6 = Gbit/s
 
-    return {
-        "mean_rx_Gbps": round(_kbs_to_gbps(sum(rx_totals) / n), 3),
-        "peak_rx_Gbps": round(_kbs_to_gbps(max(rx_totals)), 3),
-        "mean_tx_Gbps": round(_kbs_to_gbps(sum(tx_totals) / n), 3),
-        "peak_tx_Gbps": round(_kbs_to_gbps(max(tx_totals)), 3),
-    }
+    result = {}
+    for iface in found:
+        rx = rx_by_iface[iface]
+        tx = tx_by_iface[iface]
+        n = len(rx)
+        result[iface] = {
+            "mean_rx_Gbps": round(_kbs_to_gbps(sum(rx) / n), 3),
+            "peak_rx_Gbps": round(_kbs_to_gbps(max(rx)), 3),
+            "mean_tx_Gbps": round(_kbs_to_gbps(sum(tx) / n), 3),
+            "peak_tx_Gbps": round(_kbs_to_gbps(max(tx)), 3),
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +170,91 @@ def parse_mpstat(path: Path) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# iostat parser
+# ---------------------------------------------------------------------------
+
+def parse_iostat(path: Path) -> Optional[dict]:
+    """Parse iostat -xz output; return per-device write MB/s and %util summary.
+
+    Handles both older (wkB/s) and newer (wMB/s) iostat column formats.
+    Returns a dict with:
+        devices: list of {device, mean_write_MBs, peak_write_MBs, mean_util_pct, peak_util_pct}
+        total_mean_write_MBs: sum of mean_write_MBs across all devices
+        total_peak_write_MBs: sum of peak_write_MBs across all devices
+    """
+    if not path.exists():
+        return None
+
+    # Per-device samples: device → list of (write_MBs, util_pct)
+    samples: dict[str, list[tuple[float, float]]] = {}
+    write_col: Optional[int] = None
+    write_scale: float = 1.0   # 1.0 for wMB/s, 1/1024 for wkB/s
+    util_col: Optional[int] = None
+
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            # Detect header line by presence of "%util"
+            if "%util" in line and ("wMB/s" in line or "wkB/s" in line):
+                cols = line.split()
+                if "wMB/s" in cols:
+                    write_col = cols.index("wMB/s")
+                    write_scale = 1.0
+                elif "wkB/s" in cols:
+                    write_col = cols.index("wkB/s")
+                    write_scale = 1.0 / 1024.0
+                util_col = cols.index("%util")
+                continue
+
+            if write_col is None or util_col is None:
+                continue
+
+            parts = line.split()
+            # Data rows: first field is device name, all others are floats
+            if len(parts) <= max(write_col, util_col):
+                continue
+            device = parts[0]
+            # Skip header repetitions and non-device lines
+            if not device or device.startswith("%") or device in ("Device", "Device:"):
+                continue
+            try:
+                write_mbs = float(parts[write_col]) * write_scale
+                util_pct  = float(parts[util_col])
+            except (ValueError, IndexError):
+                continue
+            samples.setdefault(device, []).append((write_mbs, util_pct))
+
+    if not samples:
+        return None
+
+    devices = []
+    total_mean_write = 0.0
+    total_peak_write = 0.0
+    for dev, pts in sorted(samples.items()):
+        writes = [p[0] for p in pts]
+        utils  = [p[1] for p in pts]
+        mean_w = sum(writes) / len(writes)
+        peak_w = max(writes)
+        mean_u = sum(utils)  / len(utils)
+        peak_u = max(utils)
+        total_mean_write += mean_w
+        total_peak_write += peak_w
+        devices.append({
+            "device":           dev,
+            "mean_write_MBs":   round(mean_w, 1),
+            "peak_write_MBs":   round(peak_w, 1),
+            "mean_util_pct":    round(mean_u, 1),
+            "peak_util_pct":    round(peak_u, 1),
+        })
+
+    return {
+        "devices":               devices,
+        "total_mean_write_MBs":  round(total_mean_write, 1),
+        "total_peak_write_MBs":  round(total_peak_write, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Artifact discovery
 # ---------------------------------------------------------------------------
 
@@ -186,6 +268,7 @@ def find_node_artifacts(out_dir: Path) -> dict[str, dict[str, Path]]:
         nodes["node1"] = {
             "mpstat":  node1_dir / "mpstat-node1.txt",
             "sar_net": node1_dir / "sar-net-node1.txt",
+            "iostat":  node1_dir / "iostat-node1.txt",
             "node_id": 1,
         }
 
@@ -199,10 +282,11 @@ def find_node_artifacts(out_dir: Path) -> dict[str, dict[str, Path]]:
             continue
         m = re.search(r"mpstat-node(\d+)\.txt", mpstat_files[0].name)
         node_id = int(m.group(1)) if m else None
-        label = d.name  # e.g. "node-node2"
+        label = d.name[5:] if d.name.startswith("node-") else d.name
         nodes[label] = {
             "mpstat":  mpstat_files[0],
             "sar_net": d / f"sar-net-node{node_id}.txt" if node_id else None,
+            "iostat":  d / f"iostat-node{node_id}.txt" if node_id else None,
             "node_id": node_id,
         }
 
@@ -246,6 +330,20 @@ def compute_regression(
 
 
 # ---------------------------------------------------------------------------
+# Markdown table helpers
+# ---------------------------------------------------------------------------
+
+def _md_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    """Return markdown table lines with columns padded for alignment."""
+    all_rows = [headers] + rows
+    widths = [max(len(cell) for cell in col) for col in zip(*all_rows)]
+    def fmt_row(cells: list[str]) -> str:
+        return "| " + " | ".join(c.ljust(w) for c, w in zip(cells, widths)) + " |"
+    sep = "|" + "|".join("-" * (w + 2) for w in widths) + "|"
+    return [fmt_row(headers), sep] + [fmt_row(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 
@@ -254,6 +352,7 @@ def render_report_md(data: dict) -> str:
     lg = data["loadgen"]
     net = data["network"]
     cpu = data["cpu"]
+    dsk = data.get("disk", {})
     reg = data["regression"]
 
     lines = [
@@ -261,46 +360,73 @@ def render_report_md(data: dict) -> str:
         "",
         "## Throughput (load generator)",
         "",
-        "| Interval | MB/s | avgOpMs | maxOpMs |",
-        "|----------|------|---------|---------|",
     ]
-    for iv in lg["intervals"]:
-        lines.append(f"| {iv['id']} | {iv['throughput_MBs']:.1f} | {iv['avg_op_ms']} | {iv['max_op_ms']} |")
-    lines.append(f"| **Mean** | **{lg['mean_throughput_MBs']:.1f}** | **{lg['mean_avg_op_ms']:.0f}** | — |")
+    tput_rows = [
+        [iv['id'], f"{iv['throughput_MBs']:.1f}", str(iv['avg_op_ms']), str(iv['max_op_ms'])]
+        for iv in lg["intervals"]
+    ]
+    tput_rows.append([
+        "**Mean**",
+        f"**{lg['mean_throughput_MBs']:.1f}**",
+        f"**{lg['mean_avg_op_ms']:.0f}**",
+        "—",
+    ])
+    lines += _md_table(["Interval", "MB/s", "avgOpMs", "maxOpMs"], tput_rows)
     lines.append("")
 
     if net:
-        lines += [
-            "## Network bandwidth (NIC aggregate)",
-            "",
-            f"Interfaces: {', '.join(meta.get('nic_interfaces', []) or ['(unknown)'])}",
-            "",
-            "| Node | Mean TX Gbit/s | Peak TX Gbit/s | Mean RX Gbit/s | Peak RX Gbit/s |",
-            "|------|---------------|---------------|---------------|---------------|",
-        ]
-        for node_label, stats in sorted(net.items()):
-            if stats:
-                lines.append(
-                    f"| {node_label} | {stats['mean_tx_Gbps']:.3f} | {stats['peak_tx_Gbps']:.3f}"
-                    f" | {stats['mean_rx_Gbps']:.3f} | {stats['peak_rx_Gbps']:.3f} |"
-                )
-            else:
-                lines.append(f"| {node_label} | — | — | — | — |")
+        lines += ["## Network bandwidth (per interface)", ""]
+        net_rows = []
+        for node_label, iface_stats in sorted(net.items()):
+            if not iface_stats:
+                net_rows.append([node_label, "—", "—", "—", "—", "—"])
+                continue
+            for iface, stats in sorted(iface_stats.items()):
+                net_rows.append([
+                    node_label,
+                    iface,
+                    f"{stats['mean_tx_Gbps']:.3f}",
+                    f"{stats['peak_tx_Gbps']:.3f}",
+                    f"{stats['mean_rx_Gbps']:.3f}",
+                    f"{stats['peak_rx_Gbps']:.3f}",
+                ])
+        if net_rows:
+            lines += _md_table(
+                ["Node", "Interface", "Mean TX Gbit/s", "Peak TX Gbit/s", "Mean RX Gbit/s", "Peak RX Gbit/s"],
+                net_rows,
+            )
         lines.append("")
 
     if cpu:
-        lines += [
-            "## CPU utilisation",
-            "",
-            "| Node | Mean active % |",
-            "|------|--------------|",
-        ]
+        lines += ["## CPU utilisation", ""]
+        cpu_rows = []
         for node_label, stats in sorted(cpu.items()):
-            if stats:
-                lines.append(f"| {node_label} | {stats['mean_active_pct']:.1f} |")
-            else:
-                lines.append(f"| {node_label} | — |")
+            cpu_rows.append([node_label, f"{stats['mean_active_pct']:.1f}" if stats else "—"])
+        lines += _md_table(["Node", "Mean active %"], cpu_rows)
         lines.append("")
+
+    if dsk:
+        lines += ["## Disk I/O (write)", ""]
+        disk_rows = []
+        for node_label, stats in sorted(dsk.items()):
+            if not stats:
+                disk_rows.append([node_label, "—", "—", "—", "—", "—", "—"])
+                continue
+            for dev in stats["devices"]:
+                disk_rows.append([
+                    node_label,
+                    dev["device"],
+                    f"{dev['mean_write_MBs']:.1f}",
+                    f"{dev['peak_write_MBs']:.1f}",
+                    f"{dev['mean_util_pct']:.1f}",
+                    f"{dev['peak_util_pct']:.1f}",
+                ])
+        if disk_rows:
+            lines += _md_table(
+                ["Node", "Device", "Mean Write MB/s", "Peak Write MB/s", "Mean %util", "Peak %util"],
+                disk_rows,
+            )
+            lines.append("")
 
     lines.append("## Regression check")
     lines.append("")
@@ -383,10 +509,12 @@ def main() -> int:
 
     network: dict = {}
     cpu: dict = {}
+    disk: dict = {}
 
     for label, paths in node_artifacts.items():
-        sar_path = paths.get("sar_net")
-        mp_path  = paths.get("mpstat")
+        sar_path    = paths.get("sar_net")
+        mp_path     = paths.get("mpstat")
+        iostat_path = paths.get("iostat")
 
         if sar_path and Path(sar_path).exists() and nic_interfaces:
             network[label] = parse_sar_net(Path(sar_path), nic_interfaces)
@@ -397,6 +525,11 @@ def main() -> int:
             cpu[label] = parse_mpstat(Path(mp_path))
         else:
             cpu[label] = None
+
+        if iostat_path and Path(iostat_path).exists():
+            disk[label] = parse_iostat(Path(iostat_path))
+        else:
+            disk[label] = None
 
     # --- baseline + regression ---
     baseline: dict = {}
@@ -422,6 +555,7 @@ def main() -> int:
         "loadgen":    loadgen_data,
         "network":    network,
         "cpu":        cpu,
+        "disk":       disk,
         "regression": regression,
     }
 
