@@ -43,7 +43,7 @@ if [[ -f "$PATHS_ENV" ]]; then
     source "$PATHS_ENV"
 fi
 
-log()  { echo "[run-perf-test] $(date -u '+%H:%M:%S') $*" | tee -a "${OUT:-/tmp}/run.log"; }
+log()  { echo "[run-perf-test] $(date -u '+%H:%M:%S') $*"; }
 die()  { echo "[run-perf-test] ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
