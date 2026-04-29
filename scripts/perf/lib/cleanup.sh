@@ -121,8 +121,9 @@ sudo systemctl start rustfs
 # ---------------------------------------------------------------------------
 
 health_poll() {
-    local host="$1"
-    local url="http://${host}:9000/minio/health/live"
+    local ssh_target="$1"
+    local host="${ssh_target##*@}"
+    local url="http://${host}:9000/health"
     local attempts=0
     local max=30
 
@@ -131,10 +132,10 @@ health_poll() {
             log "Node $host is healthy"
             return 0
         fi
-        (( attempts++ ))
+        attempts=$((attempts + 1))
         sleep 1
     done
-    die "Node $host did not become healthy after ${max}s"
+    die "Node $ssh_target ($host) did not become healthy after ${max}s"
 }
 
 for node in $PEER_NODES; do
