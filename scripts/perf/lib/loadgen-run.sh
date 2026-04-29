@@ -44,7 +44,17 @@ log "Config: ${LOADGEN_CFG}  Endpoint: ${LOADGEN_ENDPOINT:-<from cfg>}"
 #   - No request timeout cap (0 = none)
 #   - deleteOnlyOurBuckets: limits end-of-run S3 DELETE to this run's buckets
 
+# Line-buffer through the pipe to tee. stdout to a pipe is often fully buffered;
+# without stdbuf, summary lines can hit loadgen.txt before prior interval rows,
+# leaving analyze.py with zero parsed intervals after an early SIGTERM.
+
+STDBUF=()
+if command -v stdbuf >/dev/null 2>&1; then
+    STDBUF=(stdbuf -oL -eL)
+fi
+
 LOADGEN_CMD=(
+    "${STDBUF[@]}"
     "$LOADGEN_BIN"
     -c       "$LOADGEN_CFG"
     -z       "0-1500K"
@@ -84,7 +94,7 @@ log "Test ID → ${TEST_ID} (saved to loadgen-test-id.txt)"
 
 if [[ -n "${LOADGEN_HOST:-}" ]]; then
     log "Running loadgen remotely on ${LOADGEN_HOST}..."
-    # Expand the array to a quoted string safe for ssh
+    # Expand the array to a quoted string safe for ssh (same stdbuf recipe as locally)
     ssh "$LOADGEN_HOST" "$(printf '%q ' "${LOADGEN_CMD[@]}")" \
         2>&1 | tee "$LOADGEN_OUT"
 else
