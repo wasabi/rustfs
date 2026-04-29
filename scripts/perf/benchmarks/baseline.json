@@ -1,45 +1,21 @@
 {
-  "_comment": "Baseline throughput thresholds keyed by TOPOLOGY_LABEL/VARIANT. analyze.py uses these for regression gating. null values are skipped (SKIP, not FAIL) \u2014 seed them with: python3 scripts/perf/analyze/analyze.py --update-baseline --out <run-dir> --baseline scripts/perf/benchmarks/baseline.json",
-  "two-node/always": {
-    "throughput_MBs": 665,
-    "avg_op_ms": 109,
-    "tolerance_pct": 10,
-    "source": "scripts/perf/runbooks/findings-summary.md \u2014 two-node EC:1 locks-on baseline (Apr 2026)"
-  },
-  "two-node/auto": {
+  "_comment": "Baseline throughput thresholds keyed by TOPOLOGY_LABEL only. analyze.py uses these for regression gating. null values are skipped (SKIP, not FAIL) \u2014 seed them with: python3 scripts/perf/analyze/analyze.py --update-baseline --out <run-dir> --baseline scripts/perf/benchmarks/baseline.json",
+  "two-node": {
     "throughput_MBs": 1100,
     "avg_op_ms": 64,
     "tolerance_pct": 10,
     "source": "scripts/perf/runbooks/findings-summary.md \u2014 Phase 2 preflight-skip result (Apr 2026)"
   },
-  "two-node/never": {
-    "throughput_MBs": 1100,
-    "avg_op_ms": 64,
-    "tolerance_pct": 10,
-    "source": "scripts/perf/runbooks/findings-summary.md \u2014 locks-off control, same ceiling as auto (Apr 2026)"
-  },
-  "single-node/default": {
+  "single-node": {
     "throughput_MBs": 2500,
     "avg_op_ms": 28,
     "tolerance_pct": 10,
     "source": "scripts/perf/runbooks/findings-summary.md \u2014 single-node EC:1 two local disks (Apr 2026)"
   },
-  "three-node/always": {
-    "throughput_MBs": null,
-    "avg_op_ms": null,
-    "tolerance_pct": 10,
-    "source": "TODO: seed after first three-node run with --update-baseline"
-  },
-  "three-node/auto": {
+  "three-node": {
     "throughput_MBs": 1433.6,
     "avg_op_ms": 52.0,
     "tolerance_pct": 10,
     "source": "updated by analyze.py from smoke-1777422711 (2026-04-29T00:31:51Z)"
-  },
-  "three-node/never": {
-    "throughput_MBs": null,
-    "avg_op_ms": null,
-    "tolerance_pct": 10,
-    "source": "TODO: seed after first three-node run with --update-baseline"
   }
 }
