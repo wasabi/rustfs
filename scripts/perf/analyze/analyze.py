@@ -57,23 +57,46 @@ _LOADGEN_PAT = re.compile(
     r"PUT:\s+\d+ objs,\s+\S+/obj,\s+(\S+)/sec,\s+(\d+) avgOpMs,\s+(\d+) maxOpMs"
 )
 
+# When only the summary row is present (#<test>/AVG PUT: …), e.g. loadgen stdout was
+# block-buffered to tee until SIGTERM dropped earlier interval rows from loadgen.txt.
+_LOADGEN_SUMMARY_AVG_PAT = re.compile(
+    r"#\d+/\s*AVG\s+"
+    r"PUT:\s+\d+ objs,\s+\S+/obj,\s+(\S+)/sec,\s+(\d+) avgOpMs,\s+(\d+) maxOpMs"
+)
+
 
 def parse_loadgen(path: Path) -> list[dict]:
     """Return list of per-interval dicts with throughput_MBs, avg_op_ms, max_op_ms."""
-    intervals = []
-    with open(path) as f:
-        for line in f:
-            m = _LOADGEN_PAT.search(line)
-            if m:
-                loop, throughput_str, avg_ms, max_ms = m.groups()
-                intervals.append(
-                    {
-                        "id": loop,
-                        "throughput_MBs": round(_bytefmt_to_mbs(throughput_str), 1),
-                        "avg_op_ms": int(avg_ms),
-                        "max_op_ms": int(max_ms),
-                    }
-                )
+    raw = path.read_text(errors="replace")
+    intervals: list[dict] = []
+    for line in raw.splitlines():
+        m = _LOADGEN_PAT.search(line)
+        if m:
+            loop, throughput_str, avg_ms, max_ms = m.groups()
+            intervals.append(
+                {
+                    "id": loop,
+                    "throughput_MBs": round(_bytefmt_to_mbs(throughput_str), 1),
+                    "avg_op_ms": int(avg_ms),
+                    "max_op_ms": int(max_ms),
+                }
+            )
+    if intervals:
+        return intervals
+    # Fallback: one aggregate row printed after PUT traffic (may be the only line left on disk).
+    for line in raw.splitlines():
+        sm = _LOADGEN_SUMMARY_AVG_PAT.search(line)
+        if sm:
+            throughput_str, avg_ms, max_ms = sm.groups()
+            intervals.append(
+                {
+                    "id": "AVG",
+                    "throughput_MBs": round(_bytefmt_to_mbs(throughput_str), 1),
+                    "avg_op_ms": int(avg_ms),
+                    "max_op_ms": int(max_ms),
+                }
+            )
+            break
     return intervals
 
 
@@ -124,10 +147,7 @@ def _sar_iface_is_active(
     mean_tx_gbps: float,
     peak_tx_gbps: float,
 ) -> bool:
-    """Exclude loopback and interfaces with negligible RX/TX vs noise / idle rows."""
-    # Local loopback — same idea as dropping loop* block devices from disk tables.
-    if iface == "lo":
-        return False
+    """Exclude interfaces with negligible RX/TX vs noise / idle rows (same rules for lo and NICs)."""
     # Sar output often prints all-zero lines for unused NICs rounded to 0.000.
     min_gbps = 0.002
     if max(mean_rx_gbps, peak_rx_gbps, mean_tx_gbps, peak_tx_gbps) >= min_gbps:
@@ -141,7 +161,7 @@ def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
     Returns {iface: {mean_rx_Gbps, peak_rx_Gbps, mean_tx_Gbps, peak_tx_Gbps}}
     for each requested interface that has data.
 
-    Omits loopback and idle interfaces (negligible RX/TX); active-window trimming
+    Omits idle interfaces (negligible RX/TX, including inactive lo); active-window trimming
     still uses combined traffic from every interface that has samples.
     """
     if not path.exists():
@@ -577,6 +597,9 @@ def main() -> int:
         print("WARNING: meta.json not found — report headers will be incomplete", file=sys.stderr)
 
     nic_interfaces: list[str] = meta.get("nic_interfaces") or []
+    # sar -n DEV records every iface (incl. lo); meta lists physical NIC names only —
+    # merge loopback so reports can show localhost traffic beside eno*.
+    ifaces_for_sar = list(dict.fromkeys([*nic_interfaces, "lo"]))
     topology: str = meta.get("topology", "unknown")
 
     # --- loadgen ---
@@ -614,8 +637,8 @@ def main() -> int:
         mp_path     = paths.get("mpstat")
         iostat_path = paths.get("iostat")
 
-        if sar_path and Path(sar_path).exists() and nic_interfaces:
-            network[label] = parse_sar_net(Path(sar_path), nic_interfaces)
+        if sar_path and Path(sar_path).exists() and ifaces_for_sar:
+            network[label] = parse_sar_net(Path(sar_path), ifaces_for_sar)
         else:
             network[label] = None
 

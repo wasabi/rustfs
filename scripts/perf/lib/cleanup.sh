@@ -13,7 +13,8 @@
 #   source conf/paths.env
 #   bash scripts/perf/lib/cleanup.sh
 #
-# Also called by run-perf-test.sh when --force-cleanup is passed.
+# Called from run-perf-test.sh when --force-cleanup, after PUT traffic (/AVG), to
+# terminate loadgen early and skip the slower loadgen DELETE phase — same rm/restart logic.
 #
 # Required env (sourced from conf/paths.env by the caller):
 #   PEER_NODES    space-separated peer hostnames

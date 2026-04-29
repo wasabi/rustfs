@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # run-perf-test.sh — top-level driver for a RustFS performance test run.
 #
-# Sequences: [cleanup] → [deploy] → monitors → loadgen → stop monitors →
+# Sequences: deploy → monitors → loadgen → stop monitors after PUT →
+#            (--force-cleanup: kill loadgen, run cleanup.sh, skip S3 DELETE) →
 #            collect peer artifacts → analyze
 #
 # Usage:
@@ -15,7 +16,9 @@
 #   --out      DIR                  output root; default: ./perf-results/<UTC-timestamp>
 #   --no-deploy                     skip build + restart; nodes must already be running
 #   --binary   PATH                 use pre-built binary (skips cargo build; implies deploy)
-#   --force-cleanup                 run lib/cleanup.sh before deploy
+#   --force-cleanup                 after PUT traffic (see /AVG in loadgen.txt):
+#                                   kill loadgen, run cleanup.sh — skip loadgen S3 DELETE,
+#                                   remove bucket dirs on disk, restart rustfs
 #   --trace                         enable debug RUST_LOG recipe on node1; collect obs JSONL
 #
 # Required env (source conf/paths.env before running):
@@ -28,6 +31,8 @@
 #   LOADGEN_ENDPOINT (optional), LOADGEN_HOST (optional)
 #   NIC_INTERFACES (optional, for ethtool snapshots)
 #   RUSTFS_OBS_LOG_DIR (optional, default /var/logs/rustfs — used by --trace)
+#   PUT_PHASE_DRAIN_SECS (optional) seconds after the final-summary line before stopping
+#                       monitors / killing loadgen (-force-cleanup); default 5
 
 set -euo pipefail
 
@@ -111,7 +116,7 @@ fi
 # Export vars consumed by lib scripts
 # ---------------------------------------------------------------------------
 
-export PEER_NODES RUSTFS_VOLUMES PEER_RUSTFS_BIN
+export PEER_NODES RUSTFS_VOLUMES PEER_RUSTFS_BIN DATA_DIRS
 export LOADGEN_BIN LOADGEN_CFG LOADGEN_ENDPOINT LOADGEN_HOST
 export LOADGEN_HOST NIC_INTERFACES
 export RUST_LOG
@@ -164,6 +169,14 @@ collect_peer_artifacts() {
     done
 }
 
+# True when loadgen printed the PUT summary row containing #<test>/ AVG (may follow
+# a HH:MM:SS timestamp on the same line — do not anchor to line start).
+_loadgen_put_summary_ready() {
+    local logfile="$1"
+    [[ -f "$logfile" ]] || return 1
+    grep -qE '#[[:digit:]]+/[[:space:]]*AVG\b' "$logfile" 2>/dev/null
+}
+
 # EXIT trap: always stop monitors and collect artifacts, even on failure
 on_exit() {
     local exit_code=$?
@@ -175,15 +188,6 @@ on_exit() {
     log "=== run-perf-test.sh done (exit_code=${exit_code}) ==="
 }
 trap on_exit EXIT
-
-# ---------------------------------------------------------------------------
-# Step 0 — Forced cleanup (optional)
-# ---------------------------------------------------------------------------
-
-if $FORCE_CLEANUP; then
-    log "--- Step 0: forced cleanup ---"
-    bash "$LIB/cleanup.sh"
-fi
 
 # ---------------------------------------------------------------------------
 # Step 1 — Deploy
@@ -282,30 +286,50 @@ log "--- Step 4: run loadgen (duration=${DURATION}) ---"
 bash "$LIB/loadgen-run.sh" &
 LOADGEN_PID=$!
 
-# Stop monitors the moment PUT traffic ends — keyed on the /AVG summary line
-# that the loadgen writes immediately after its last PUT interval, before cleanup.
-# This ensures CPU/disk/NIC stats cover only the PUT window, not the cleanup phase.
+# Stop monitors after PUT traffic ends — wait for summary line "#<test>/ AVG …"; optional
+# drain (${PUT_PHASE_DRAIN_SECS:-5}s) lets in-flight requests finish before telemetry stop
+# or force-cleanup kills loadgen.
 LOADGEN_OUT="$OUT/loadgen.txt"
+LOADGEN_FORCE_KILLED=false
+PUT_PHASE_DRAIN_SECS="${PUT_PHASE_DRAIN_SECS:-5}"
+
 while kill -0 "$LOADGEN_PID" 2>/dev/null \
-      && ! grep -q '/AVG' "$LOADGEN_OUT" 2>/dev/null; do
+      && ! _loadgen_put_summary_ready "$LOADGEN_OUT"; do
     sleep 1
 done
 
-if grep -q '/AVG' "$LOADGEN_OUT" 2>/dev/null; then
-    log "PUT traffic complete — stopping monitors (loadgen cleanup continues)"
+if _loadgen_put_summary_ready "$LOADGEN_OUT"; then
+    log "PUT summary line (#…/ AVG) seen — draining ${PUT_PHASE_DRAIN_SECS}s for in-flight PUTs to finish"
+    sleep "${PUT_PHASE_DRAIN_SECS}"
+    log "PUT traffic complete — stopping monitors"
     stop_monitors
     LOCAL_MONITOR_PID=""
     declare -A REMOTE_MONITOR_PIDS
+
+    if $FORCE_CLEANUP; then
+        log "--force-cleanup: killing loadgen (skip S3 DELETE cleanup phase)"
+        kill "$LOADGEN_PID" 2>/dev/null || true
+        wait "$LOADGEN_PID" 2>/dev/null || true
+        LOADGEN_FORCE_KILLED=true
+        log "--- Step 4b: manual bucket cleanup (force-cleanup) ---"
+        bash "$LIB/cleanup.sh"
+    else
+        log "Loadgen DELETE cleanup phase continues..."
+    fi
 fi
 
-# Wait for the full loadgen process (including cleanup) to finish
-wait "$LOADGEN_PID"
-LOADGEN_STATUS=$?
+if $LOADGEN_FORCE_KILLED; then
+    LOADGEN_STATUS=0
+else
+    # Includes normal completion (loadgen S3 DELETE cleanup) or error exit
+    wait "$LOADGEN_PID"
+    LOADGEN_STATUS=$?
+fi
 log "Loadgen finished (status=${LOADGEN_STATUS})"
 
 # ---------------------------------------------------------------------------
-# Step 5 — Stop monitors (no-op if already stopped above; kept for the
-#           case where loadgen exits before /AVG appears, e.g. on error)
+# Step 5 — Stop monitors (no-op if already stopped above; fallback if loadgen exits
+#           before #<test>/ AVG summary appears, e.g. on error)
 # ---------------------------------------------------------------------------
 
 log "--- Step 5: stop monitors ---"
