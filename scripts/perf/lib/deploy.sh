@@ -9,7 +9,6 @@
 #   RUSTFS_VOLUMES      full volumes string for this topology
 #
 # Required env (set by run-perf-test.sh from flags / caller environment):
-#   PREFLIGHT_VARIANT   always | auto | never
 #   RUST_LOG            error (normal) or debug recipe (--trace mode)
 #   RUSTFS_BINARY       path to pre-built binary; if empty, cargo build is run
 #
@@ -65,12 +64,11 @@ sudo chmod +x "${PEER_RUSTFS_BIN}"
 expand_template() {
     sed \
         -e "s|@@RUSTFS_VOLUMES@@|${RUSTFS_VOLUMES}|g" \
-        -e "s|@@PREFLIGHT_VARIANT@@|${PREFLIGHT_VARIANT}|g" \
         -e "s|@@RUST_LOG@@|${RUST_LOG}|g" \
         "$CONF_TEMPLATE"
 }
 
-log "Expanding env template (variant=${PREFLIGHT_VARIANT})..."
+log "Expanding env template..."
 EXPANDED="$(expand_template)"
 
 # Write to peers first so they are configured before node1 restarts

@@ -2,8 +2,8 @@
 """analyze.py — parse perf run artifacts and produce report.json + report.md.
 
 Usage:
-    python3 analyze.py --out /tmp/perf-results/A1 --baseline benchmarks/baseline.json
-    python3 analyze.py --out /tmp/perf-results/A1 --baseline benchmarks/baseline.json --update-baseline
+    python3 analyze.py --out /tmp/perf-results/run1 --baseline benchmarks/baseline.json
+    python3 analyze.py --out /tmp/perf-results/run1 --baseline benchmarks/baseline.json --update-baseline
 
 Inputs read from --out DIR:
     loadgen.txt             per-minute PUT stats from the load generator
@@ -344,9 +344,8 @@ def compute_regression(
     mean_throughput: float,
     baseline: dict,
     topology: str,
-    variant: str,
 ) -> dict:
-    key = f"{topology}/{variant}"
+    key = topology
     entry = baseline.get(key)
     if entry is None or entry.get("throughput_MBs") is None:
         return {
@@ -399,7 +398,7 @@ def render_report_md(data: dict) -> str:
     reg = data["regression"]
 
     lines = [
-        f"# Perf report — {meta['variant']} / {meta['topology']} — {meta['utc']} ({meta['git_sha']})",
+        f"# Perf report — {meta['topology']} — {meta['utc']} ({meta['git_sha']})",
         "",
         "## Throughput (load generator)",
         "",
@@ -502,7 +501,7 @@ def main() -> int:
     parser.add_argument(
         "--update-baseline",
         action="store_true",
-        help="Write measured mean back into baseline.json for this topology/variant key",
+        help="Write measured mean back into baseline.json for this topology key",
     )
     args = parser.parse_args()
 
@@ -522,7 +521,6 @@ def main() -> int:
 
     nic_interfaces: list[str] = meta.get("nic_interfaces") or []
     topology: str = meta.get("topology", "unknown")
-    variant: str = meta.get("variant", "unknown")
 
     # --- loadgen ---
     loadgen_path = out_dir / "loadgen.txt"
@@ -583,13 +581,12 @@ def main() -> int:
     elif args.baseline:
         print(f"WARNING: baseline file not found: {args.baseline}", file=sys.stderr)
 
-    regression = compute_regression(mean_throughput, baseline, topology, variant)
+    regression = compute_regression(mean_throughput, baseline, topology)
 
     # --- assemble report.json ---
     report = {
         "meta": {
             "git_sha":        meta.get("git_sha", "unknown"),
-            "variant":        variant,
             "topology":       topology,
             "duration":       meta.get("duration", "unknown"),
             "utc":            meta.get("utc", "unknown"),
@@ -616,7 +613,7 @@ def main() -> int:
 
     # --- update-baseline ---
     if args.update_baseline and baseline_path:
-        key = f"{topology}/{variant}"
+        key = topology
         if key not in baseline:
             baseline[key] = {}
         old_val = baseline[key].get("throughput_MBs")

@@ -39,8 +39,7 @@ Two cluster sizes are supported. Topology is selected via `TOPOLOGY_LABEL` in
 ## RustFS environment (all nodes)
 
 These variables are the same on every node. `deploy.sh` expands
-`conf/rustfs.env.template` with `RUSTFS_VOLUMES` and
-`RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT` from the current run config.
+`conf/rustfs.env.template` with `RUSTFS_VOLUMES` and `RUST_LOG` from the current run.
 
 ```bash
 RUSTFS_ADDRESS=":9000"
@@ -88,8 +87,7 @@ nodes (no bonding). Each is a 10 Gbit/s link.
 and node2 (measured per interface).
 
 **Effective ceiling in practice:** RustFS PUT traffic saturates at roughly ~5 Gbit/s TX on
-node1 when the bottleneck shifts to the network path (e.g. with locks disabled or the
-preflight skip applied).
+node1 when the bottleneck shifts to the network path (e.g. with the Phase 2 preflight fix in effect).
 
 To verify the ceiling before a test run:
 

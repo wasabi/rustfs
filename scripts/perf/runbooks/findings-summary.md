@@ -73,16 +73,17 @@ must grant), every POST-encode lock wait includes a full remote round-trip.
 ## The Phase 2 preflight fix
 
 **What it does:** removes a redundant distributed Shared-lock preflight that happened
-*before* encode on every PUT. Controlled by
-`RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT=auto|always|never`.
+*before* encode on every PUT. The original investigation toggled behaviour with
+`RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT`; the perf harness no longer sets this
+variable — runs rely on server defaults (`auto`).
 
 **Why it helps:** `auto` mode skips the Shared-lock preflight for buckets with no
 object-lock configuration (the common case). Object-lock validation is moved inline under
 the post-encode Exclusive lock that already exists. This eliminates one full distributed
 lock round-trip per PUT on the common path.
 
-**Result:** throughput jumps from ~660 MB/s (`always`) to ~1.1 GB/s (`auto`/`never`),
-matching the locks-off control. The remaining bottleneck at ~1.1 GB/s is NIC TX bandwidth
+**Result:** throughput jumps from ~660 MB/s (legacy `always`) to ~1.1 GB/s (`auto`/`never` in
+those experiments), matching the locks-off control. The remaining bottleneck at ~1.1 GB/s is NIC TX bandwidth
 (~5 Gbit/s observed on eno1409/eno1419 under RustFS PUT load).
 
 ---
@@ -93,16 +94,16 @@ matching the locks-off control. The remaining bottleneck at ~1.1 GB/s is NIC TX 
 
 | What you see | Interpretation |
 |---|---|
-| `auto` ≈ `never` ≈ 1.1 GB/s, `always` ≈ 665 MB/s | Normal — preflight fix working as designed |
-| `auto` drops toward `always` (~665 MB/s) | Regression in the preflight skip — check `put_object.existing_object_lock_inline_check` span hold time; run `--trace` |
-| All variants drop below `always` baseline | Broader regression — check CPU, disk, NIC counters; may be a lock-path or EC-path change |
-| All variants above `always` but below `auto` baseline | Partial regression or noise — compare node1 TX; if near 5 Gbit/s, may be bandwidth-limited |
+| Measured throughput near the `two-node` / `three-node` baseline in `baseline.json` | Normal — compare against the keyed entry for your `TOPOLOGY_LABEL` |
+| Throughput drops toward ~665 MB/s (legacy `always`-era ceiling from the investigation) | Possible regression in the preflight / inline OL path — check `put_object.existing_object_lock_inline_check` span hold time; run `--trace` |
+| Throughput well below that legacy ceiling | Broader regression — check CPU, disk, NIC counters; may be a lock-path or EC-path change |
+| Throughput below baseline but still above ~665 MB/s | Partial regression or noise — compare node1 TX; if near 5 Gbit/s, may be bandwidth-limited |
 
 ### NIC bandwidth (eno1409 / eno1419)
 
 | What you see | Interpretation |
 |---|---|
-| node1 TX ~5 Gbit/s, throughput ~1.1 GB/s | Bandwidth-limited — this is expected for `auto`/`never` |
+| node1 TX ~5 Gbit/s, throughput ~1.1 GB/s | Bandwidth-limited — this is expected after the Phase 2 preflight fix |
 | node1 TX well below ~5 Gbit/s, throughput low | Software-path bottleneck (lock, EC, RPC) — not network-limited |
 | node1 TX near 0, but throughput also low | Check whether RustFS is running and healthy on all nodes |
 
