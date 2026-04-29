@@ -47,10 +47,17 @@ log "Config: ${LOADGEN_CFG}  Endpoint: ${LOADGEN_ENDPOINT:-<from cfg>}"
 # Line-buffer through the pipe to tee. stdout to a pipe is often fully buffered;
 # without stdbuf, summary lines can hit loadgen.txt before prior interval rows,
 # leaving analyze.py with zero parsed intervals after an early SIGTERM.
+# Also line-buffer tee's writes to loadgen.txt (disk files are fully buffered by default).
 
 STDBUF=()
 if command -v stdbuf >/dev/null 2>&1; then
     STDBUF=(stdbuf -oL -eL)
+fi
+
+# Second stdbuf instance for tee (must be a separate array expansion in bash).
+TEE_IO=()
+if [[ ${#STDBUF[@]} -gt 0 ]]; then
+    TEE_IO=("${STDBUF[@]}")
 fi
 
 LOADGEN_CMD=(
@@ -96,10 +103,10 @@ if [[ -n "${LOADGEN_HOST:-}" ]]; then
     log "Running loadgen remotely on ${LOADGEN_HOST}..."
     # Expand the array to a quoted string safe for ssh (same stdbuf recipe as locally)
     ssh "$LOADGEN_HOST" "$(printf '%q ' "${LOADGEN_CMD[@]}")" \
-        2>&1 | tee "$LOADGEN_OUT"
+        2>&1 | "${TEE_IO[@]}" tee "$LOADGEN_OUT"
 else
     log "Running loadgen locally..."
-    "${LOADGEN_CMD[@]}" 2>&1 | tee "$LOADGEN_OUT"
+    "${LOADGEN_CMD[@]}" 2>&1 | "${TEE_IO[@]}" tee "$LOADGEN_OUT"
 fi
 
 # Capture tee-pipeline exit code; bash sets PIPESTATUS after a pipeline
