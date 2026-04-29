@@ -154,8 +154,12 @@ stop_monitors() {
     done
 }
 
+ARTIFACTS_COLLECTED=false
+
 collect_peer_artifacts() {
     [[ -n "${PEER_NODES:-}" ]] || return 0
+    $ARTIFACTS_COLLECTED && return 0
+    ARTIFACTS_COLLECTED=true
     log "Collecting artifacts from peer nodes..."
     for node in $PEER_NODES; do
         local node_host="${node##*@}"
@@ -210,7 +214,7 @@ import json, os
 meta = {
     "git_sha": "$GIT_SHA",
     "variant": "$VARIANT",
-    "topology": os.environ.get("TOPOLOGY_LABEL", "unknown"),
+    "topology": "${TOPOLOGY_LABEL:-unknown}",
     "duration": "$DURATION",
     "trace": $( $TRACE && echo True || echo False ),
     "utc": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",

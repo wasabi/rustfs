@@ -78,6 +78,32 @@ def parse_loadgen(path: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Active-window trimming
+# ---------------------------------------------------------------------------
+
+def _active_slice(combined: list[float]) -> tuple[int, int]:
+    """Return (start, end) indices of the active PUT window.
+
+    Trims leading and trailing samples where the combined signal is below 10%
+    of its peak value.  This removes the idle setup phase (bucket creation,
+    connection warm-up) that precedes actual PUT traffic and would otherwise
+    dilute per-second means for NIC, CPU, and disk metrics.
+
+    If the signal is all-zero or all-equal the full range is returned unchanged.
+    """
+    if not combined:
+        return 0, 0
+    peak = max(combined)
+    if peak == 0:
+        return 0, len(combined)
+    threshold = peak * 0.10
+    active = [i for i, v in enumerate(combined) if v >= threshold]
+    if not active:
+        return 0, len(combined)
+    return active[0], active[-1] + 1
+
+
+# ---------------------------------------------------------------------------
 # sar -n DEV parser
 # ---------------------------------------------------------------------------
 
@@ -120,21 +146,28 @@ def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
     if not found:
         return None
 
+    # Trim to active PUT window using combined TX+RX across all interfaces.
+    n = min(len(rx_by_iface[i]) for i in found)
+    combined = [sum(rx_by_iface[i][t] + tx_by_iface[i][t] for i in found) for t in range(n)]
+    start, end = _active_slice(combined)
+
     def _kbs_to_gbps(kbs: float) -> float:
         return kbs * 8 / 1_000_000  # kB/s × 8 bits × 1/1e6 = Gbit/s
 
     result = {}
     for iface in found:
-        rx = rx_by_iface[iface]
-        tx = tx_by_iface[iface]
-        n = len(rx)
+        rx = rx_by_iface[iface][start:end]
+        tx = tx_by_iface[iface][start:end]
+        if not rx:
+            continue
+        n_active = len(rx)
         result[iface] = {
-            "mean_rx_Gbps": round(_kbs_to_gbps(sum(rx) / n), 3),
+            "mean_rx_Gbps": round(_kbs_to_gbps(sum(rx) / n_active), 3),
             "peak_rx_Gbps": round(_kbs_to_gbps(max(rx)), 3),
-            "mean_tx_Gbps": round(_kbs_to_gbps(sum(tx) / n), 3),
+            "mean_tx_Gbps": round(_kbs_to_gbps(sum(tx) / n_active), 3),
             "peak_tx_Gbps": round(_kbs_to_gbps(max(tx)), 3),
         }
-    return result
+    return result or None
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +198,11 @@ def parse_mpstat(path: Path) -> Optional[dict]:
                     pass
     if not idle_pcts:
         return None
-    mean_idle = sum(idle_pcts) / len(idle_pcts)
+    # Trim to active PUT window: high active% (low idle%) corresponds to traffic.
+    active_pcts = [100.0 - v for v in idle_pcts]
+    start, end = _active_slice(active_pcts)
+    trimmed = idle_pcts[start:end] or idle_pcts
+    mean_idle = sum(trimmed) / len(trimmed)
     return {"mean_active_pct": round(100.0 - mean_idle, 1)}
 
 
@@ -227,12 +264,18 @@ def parse_iostat(path: Path) -> Optional[dict]:
     if not samples:
         return None
 
+    # Trim to active PUT window using combined write signal across all devices.
+    n_common = min(len(pts) for pts in samples.values())
+    combined_write = [sum(samples[d][t][0] for d in samples) for t in range(n_common)]
+    start, end = _active_slice(combined_write)
+
     devices = []
     total_mean_write = 0.0
     total_peak_write = 0.0
     for dev, pts in sorted(samples.items()):
-        writes = [p[0] for p in pts]
-        utils  = [p[1] for p in pts]
+        pts_trimmed = pts[start:end] or pts
+        writes = [p[0] for p in pts_trimmed]
+        utils  = [p[1] for p in pts_trimmed]
         mean_w = sum(writes) / len(writes)
         peak_w = max(writes)
         mean_u = sum(utils)  / len(utils)
