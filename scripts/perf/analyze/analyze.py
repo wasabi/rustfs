@@ -117,11 +117,32 @@ _SAR_PAT = re.compile(
 )
 
 
+def _sar_iface_is_active(
+    iface: str,
+    mean_rx_gbps: float,
+    peak_rx_gbps: float,
+    mean_tx_gbps: float,
+    peak_tx_gbps: float,
+) -> bool:
+    """Exclude loopback and interfaces with negligible RX/TX vs noise / idle rows."""
+    # Local loopback — same idea as dropping loop* block devices from disk tables.
+    if iface == "lo":
+        return False
+    # Sar output often prints all-zero lines for unused NICs rounded to 0.000.
+    min_gbps = 0.002
+    if max(mean_rx_gbps, peak_rx_gbps, mean_tx_gbps, peak_tx_gbps) >= min_gbps:
+        return True
+    return False
+
+
 def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
     """Parse sar -n DEV file; return per-interface Gbps stats.
 
     Returns {iface: {mean_rx_Gbps, peak_rx_Gbps, mean_tx_Gbps, peak_tx_Gbps}}
     for each requested interface that has data.
+
+    Omits loopback and idle interfaces (negligible RX/TX); active-window trimming
+    still uses combined traffic from every interface that has samples.
     """
     if not path.exists():
         return None
@@ -161,11 +182,17 @@ def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
         if not rx:
             continue
         n_active = len(rx)
+        mean_rx_g = _kbs_to_gbps(sum(rx) / n_active)
+        peak_rx_g = _kbs_to_gbps(max(rx))
+        mean_tx_g = _kbs_to_gbps(sum(tx) / n_active)
+        peak_tx_g = _kbs_to_gbps(max(tx))
+        if not _sar_iface_is_active(iface, mean_rx_g, peak_rx_g, mean_tx_g, peak_tx_g):
+            continue
         result[iface] = {
-            "mean_rx_Gbps": round(_kbs_to_gbps(sum(rx) / n_active), 3),
-            "peak_rx_Gbps": round(_kbs_to_gbps(max(rx)), 3),
-            "mean_tx_Gbps": round(_kbs_to_gbps(sum(tx) / n_active), 3),
-            "peak_tx_Gbps": round(_kbs_to_gbps(max(tx)), 3),
+            "mean_rx_Gbps": round(mean_rx_g, 3),
+            "peak_rx_Gbps": round(peak_rx_g, 3),
+            "mean_tx_Gbps": round(mean_tx_g, 3),
+            "peak_tx_Gbps": round(peak_tx_g, 3),
         }
     return result or None
 
@@ -210,14 +237,38 @@ def parse_mpstat(path: Path) -> Optional[dict]:
 # iostat parser
 # ---------------------------------------------------------------------------
 
+def _iostat_device_is_active(
+    device: str,
+    mean_w: float,
+    peak_w: float,
+    mean_u: float,
+    peak_u: float,
+) -> bool:
+    """Exclude loop/ram disks and rows with no meaningful write or util."""
+    # Pseudo-block devices typical on Linux hosts — not RustFS data disks.
+    if device.startswith(("loop", "ram", "zram")):
+        return False
+    # Noise floor: rounded-to-zero churn from iostat floats.
+    min_write_mbs = 0.05
+    min_util_pct = 0.15
+    if max(mean_w, peak_w) >= min_write_mbs:
+        return True
+    if max(mean_u, peak_u) >= min_util_pct:
+        return True
+    return False
+
+
 def parse_iostat(path: Path) -> Optional[dict]:
     """Parse iostat -xz output; return per-device write MB/s and %util summary.
 
     Handles both older (wkB/s) and newer (wMB/s) iostat column formats.
+    Drops idle/non-storage rows (loop/ram/zram and negligible write/util) so
+    reports stay readable — active-window trimming still uses every device.
+
     Returns a dict with:
         devices: list of {device, mean_write_MBs, peak_write_MBs, mean_util_pct, peak_util_pct}
-        total_mean_write_MBs: sum of mean_write_MBs across all devices
-        total_peak_write_MBs: sum of peak_write_MBs across all devices
+        total_mean_write_MBs: sum of mean_write_MBs across listed (active) devices
+        total_peak_write_MBs: sum of peak_write_MBs across listed (active) devices
     """
     if not path.exists():
         return None
@@ -280,6 +331,8 @@ def parse_iostat(path: Path) -> Optional[dict]:
         peak_w = max(writes)
         mean_u = sum(utils)  / len(utils)
         peak_u = max(utils)
+        if not _iostat_device_is_active(dev, mean_w, peak_w, mean_u, peak_u):
+            continue
         total_mean_write += mean_w
         total_peak_write += peak_w
         devices.append({
@@ -289,6 +342,10 @@ def parse_iostat(path: Path) -> Optional[dict]:
             "mean_util_pct":    round(mean_u, 1),
             "peak_util_pct":    round(peak_u, 1),
         })
+
+    # All devices were filtered (e.g. only loopback devices) — no useful table rows.
+    if not devices:
+        return None
 
     return {
         "devices":               devices,
