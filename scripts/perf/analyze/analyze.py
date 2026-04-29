@@ -8,7 +8,7 @@ Usage:
 Inputs read from --out DIR:
     loadgen.txt             per-minute PUT stats from the load generator
     node1/mpstat-node1.txt  mpstat -P ALL output for node1
-    node1/sar-net-node1.txt sar -n DEV output for node1
+    node1/sar-net-node1.txt sar -n DEV output for node1 (canonical active window when present)
     node-*/mpstat-nodeN.txt same for each peer node (N = 2, 3, ...)
     node-*/sar-net-nodeN.txt
     meta.json               run metadata written by run-perf-test.sh
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -126,9 +127,32 @@ def _active_slice(combined: list[float]) -> tuple[int, int]:
     return active[0], active[-1] + 1
 
 
-# ---------------------------------------------------------------------------
-# sar -n DEV parser
-# ---------------------------------------------------------------------------
+# Canonical fractional window [start_frac, end_frac) mapped from SAR sample
+# indices via start_frac=start/n, end_frac=end/n (end exclusive).
+
+
+def _active_slice_fracs(combined: list[float]) -> tuple[float, float]:
+    """Return fractional [sf, ef) corresponding to `_active_slice` on `combined`."""
+    n = len(combined)
+    if not n:
+        return 0.0, 1.0
+    start, end = _active_slice(combined)
+    return start / n, end / n
+
+
+def _indices_from_window_fracs(n: int, window_fracs: tuple[float, float]) -> tuple[int, int]:
+    """Map canonical fractional window [sf, ef) onto a series of length n (exclusive end index)."""
+    if n <= 0:
+        return 0, 0
+    sf, ef = window_fracs
+    sf = max(0.0, min(1.0, float(sf)))
+    ef = max(0.0, min(1.0, float(ef)))
+    if ef <= sf:
+        return 0, n
+    lo = min(n, int(math.floor(sf * n + 1e-12)))
+    hi = max(lo, min(n, int(math.ceil(ef * n - 1e-12))))
+    return lo, hi
+
 
 # Match data rows: optional AM/PM time, then interface name, then fields.
 # sar -n DEV 1 columns: HH:MM:SS [AM|PM]  IFACE  rxpck/s  txpck/s  rxkB/s  txkB/s ...
@@ -138,6 +162,56 @@ _SAR_PAT = re.compile(
     r"\S+\s+\S+\s+"                           # rxpck/s  txpck/s
     r"(\S+)\s+(\S+)"                          # rxkB/s   txkB/s
 )
+
+
+def _sar_physical_combined_kbs(rx_by_iface: dict[str, list[float]],
+                               tx_by_iface: dict[str, list[float]],
+                               found: list[str]) -> tuple[list[float], int]:
+    """Build per-tick combined RX+TX kB/s on physical NICs (exclude lo); return (combined, n)."""
+    if not found:
+        return [], 0
+    n_len = min(len(rx_by_iface[i]) for i in found)
+    trim_ifaces = [i for i in found if i != "lo"]
+    if not trim_ifaces:
+        trim_ifaces = list(found)
+    combined = [
+        sum(rx_by_iface[i][t] + tx_by_iface[i][t] for i in trim_ifaces)
+        for t in range(n_len)
+    ]
+    return combined, n_len
+
+
+def sar_window_fracs_from_file(path: Path, ifaces: list[str]) -> Optional[tuple[float, float]]:
+    """Canonical [sf, ef) from node1 SAR: physical NICs combined RX+TX, `_active_slice` trim.
+
+    Returns None if file missing or no usable SAR rows.
+    """
+    if not path.exists():
+        return None
+    rx_by_iface: dict[str, list[float]] = {i: [] for i in ifaces}
+    tx_by_iface: dict[str, list[float]] = {i: [] for i in ifaces}
+
+    with open(path) as f:
+        for line in f:
+            m = _SAR_PAT.match(line.strip())
+            if not m:
+                continue
+            iface, rx_kbs, tx_kbs = m.groups()
+            if iface in rx_by_iface:
+                try:
+                    rx_by_iface[iface].append(float(rx_kbs))
+                    tx_by_iface[iface].append(float(tx_kbs))
+                except ValueError:
+                    pass
+
+    found = [i for i in ifaces if rx_by_iface[i]]
+    if not found:
+        return None
+
+    combined, _n = _sar_physical_combined_kbs(rx_by_iface, tx_by_iface, found)
+    if not combined:
+        return None
+    return _active_slice_fracs(combined)
 
 
 def _sar_iface_is_active(
@@ -155,16 +229,23 @@ def _sar_iface_is_active(
     return False
 
 
-def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
+def parse_sar_net(
+    path: Path,
+    ifaces: list[str],
+    window_fracs: Optional[tuple[float, float]] = None,
+) -> Optional[dict]:
     """Parse sar -n DEV file; return per-interface Gbps stats.
 
     Returns {iface: {mean_rx_Gbps, peak_rx_Gbps, mean_tx_Gbps, peak_tx_Gbps}}
     for each requested interface that has data.
 
-    Omits idle interfaces (negligible RX/TX, including inactive lo).  Global
-    active-window trim uses combined TX+RX on physical NICs only (lo excluded).
-    For lo, mean/peak use a separate trim on lo's own RX+TX so bursty localhost
-    traffic is not averaged against long idle stretches in the cluster window.
+    Omits idle interfaces (negligible RX/TX, including inactive lo).
+
+    When ``window_fracs`` is set (from node1 SAR), all interfaces use that
+    fractional ``[sf, ef)`` mapped to this file's sample length so NIC, CPU,
+    and disk summaries align.  When None, trim uses combined TX+RX on physical
+    NICs only; ``lo`` additionally uses its own ``_active_slice`` on loopback
+    RX+TX (localhost can be bursty vs the physical-NIC window).
     """
     if not path.exists():
         return None
@@ -190,17 +271,17 @@ def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
         return None
 
     n = min(len(rx_by_iface[i]) for i in found)
-    # Combined trim: physical NICs only — including lo stretches the "active
-    # window" based on eno traffic while lo is often bursty; averaging lo over
-    # that window makes mean_rx/mean_tx far below peak on loopback.
-    trim_ifaces = [i for i in found if i != "lo"]
-    if not trim_ifaces:
-        trim_ifaces = list(found)
-    combined = [
-        sum(rx_by_iface[i][t] + tx_by_iface[i][t] for i in trim_ifaces)
-        for t in range(n)
-    ]
-    start, end = _active_slice(combined)
+    if window_fracs is not None:
+        start, end = _indices_from_window_fracs(n, window_fracs)
+    else:
+        trim_ifaces = [i for i in found if i != "lo"]
+        if not trim_ifaces:
+            trim_ifaces = list(found)
+        combined = [
+            sum(rx_by_iface[i][t] + tx_by_iface[i][t] for i in trim_ifaces)
+            for t in range(n)
+        ]
+        start, end = _active_slice(combined)
 
     def _kbs_to_gbps(kbs: float) -> float:
         return kbs * 8 / 1_000_000  # kB/s × 8 bits × 1/1e6 = Gbit/s
@@ -209,7 +290,7 @@ def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
     for iface in found:
         rx_full = rx_by_iface[iface][:n]
         tx_full = tx_by_iface[iface][:n]
-        if iface == "lo":
+        if window_fracs is None and iface == "lo":
             lo_combo = [rx_full[t] + tx_full[t] for t in range(n)]
             lo_start, lo_end = _active_slice(lo_combo)
             rx = rx_full[lo_start:lo_end]
@@ -248,8 +329,12 @@ _MPSTAT_PAT = re.compile(
 )
 
 
-def parse_mpstat(path: Path) -> Optional[dict]:
-    """Parse mpstat -P ALL file; return mean active CPU % across all intervals."""
+def parse_mpstat(path: Path, window_fracs: Optional[tuple[float, float]] = None) -> Optional[dict]:
+    """Parse mpstat -P ALL file; return mean active CPU % across all intervals.
+
+    When ``window_fracs`` is set, trim idle rows with the same fractional window
+    as SAR (node1).  Otherwise trim using active CPU% (_active_slice).
+    """
     if not path.exists():
         return None
     idle_pcts: list[float] = []
@@ -263,10 +348,14 @@ def parse_mpstat(path: Path) -> Optional[dict]:
                     pass
     if not idle_pcts:
         return None
-    # Trim to active PUT window: high active% (low idle%) corresponds to traffic.
-    active_pcts = [100.0 - v for v in idle_pcts]
-    start, end = _active_slice(active_pcts)
-    trimmed = idle_pcts[start:end] or idle_pcts
+    n = len(idle_pcts)
+    if window_fracs is not None:
+        start, end = _indices_from_window_fracs(n, window_fracs)
+        trimmed = idle_pcts[start:end] or idle_pcts
+    else:
+        active_pcts = [100.0 - v for v in idle_pcts]
+        start, end = _active_slice(active_pcts)
+        trimmed = idle_pcts[start:end] or idle_pcts
     mean_idle = sum(trimmed) / len(trimmed)
     return {"mean_active_pct": round(100.0 - mean_idle, 1)}
 
@@ -296,12 +385,82 @@ def _iostat_device_is_active(
     return False
 
 
-def parse_iostat(path: Path) -> Optional[dict]:
+def _iostat_batch_combined_write_mb_s(batch: dict[str, tuple[float, float]]) -> float:
+    """Sum write MB/s for real block devices (exclude loop/ram/zram noise in trim signal)."""
+    return sum(
+        w for dev, (w, _) in batch.items()
+        if not dev.startswith(("loop", "ram", "zram"))
+    )
+
+
+def _iostat_read_batches(path: Path) -> list[dict[str, tuple[float, float]]]:
+    """Parse iostat -xz into one dict per reporting interval (between avg-cpu markers).
+
+    iostat omits idle loop devices in later intervals; naively glob-appending device rows
+    misaligns timelines and makes min(per-device counts)==1 when loop* only appear once,
+    destroying combined_write and reported means/peaks.
+    """
+    batches: list[dict[str, tuple[float, float]]] = []
+    current: dict[str, tuple[float, float]] = {}
+    write_col: Optional[int] = None
+    write_scale = 1.0
+    util_col: Optional[int] = None
+
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if line.startswith("avg-cpu"):
+                if write_col is not None:
+                    batches.append(dict(current))
+                current = {}
+                continue
+
+            cols = line.split()
+            if "%util" in line and ("wMB/s" in cols or "wkB/s" in cols):
+                if "wMB/s" in cols:
+                    write_col = cols.index("wMB/s")
+                    write_scale = 1.0
+                elif "wkB/s" in cols:
+                    write_col = cols.index("wkB/s")
+                    write_scale = 1.0 / 1024.0
+                util_col = cols.index("%util")
+                current = {}
+                continue
+
+            if write_col is None or util_col is None:
+                continue
+            if not line:
+                continue
+
+            parts = line.split()
+            if len(parts) <= max(write_col, util_col):
+                continue
+            device = parts[0]
+            if not device or device.startswith("%") or device in ("Device", "Device:"):
+                continue
+            try:
+                write_mbs = float(parts[write_col]) * write_scale
+                util_pct = float(parts[util_col])
+            except (ValueError, IndexError):
+                continue
+            current[device] = (write_mbs, util_pct)
+
+    if write_col is not None and current:
+        batches.append(dict(current))
+    return batches
+
+
+def parse_iostat(path: Path, window_fracs: Optional[tuple[float, float]] = None) -> Optional[dict]:
     """Parse iostat -xz output; return per-device write MB/s and %util summary.
+
+    Intervals are aligned using avg-cpu / Device-section boundaries so short-lived rows
+    (e.g. loop devices in the first snapshot only) cannot collapse the timeline.
 
     Handles both older (wkB/s) and newer (wMB/s) iostat column formats.
     Drops idle/non-storage rows (loop/ram/zram and negligible write/util) so
-    reports stay readable — active-window trimming still uses every device.
+    reports stay readable — when ``window_fracs`` is None, active-window trimming
+    uses combined write MB/s per interval; when set, the same fractional window
+    as SAR (node1) is applied.
 
     Returns a dict with:
         devices: list of {device, mean_write_MBs, peak_write_MBs, mean_util_pct, peak_util_pct}
@@ -311,63 +470,40 @@ def parse_iostat(path: Path) -> Optional[dict]:
     if not path.exists():
         return None
 
-    # Per-device samples: device → list of (write_MBs, util_pct)
-    samples: dict[str, list[tuple[float, float]]] = {}
-    write_col: Optional[int] = None
-    write_scale: float = 1.0   # 1.0 for wMB/s, 1/1024 for wkB/s
-    util_col: Optional[int] = None
-
-    with open(path) as f:
-        for raw in f:
-            line = raw.strip()
-            # Detect header line by presence of "%util"
-            if "%util" in line and ("wMB/s" in line or "wkB/s" in line):
-                cols = line.split()
-                if "wMB/s" in cols:
-                    write_col = cols.index("wMB/s")
-                    write_scale = 1.0
-                elif "wkB/s" in cols:
-                    write_col = cols.index("wkB/s")
-                    write_scale = 1.0 / 1024.0
-                util_col = cols.index("%util")
-                continue
-
-            if write_col is None or util_col is None:
-                continue
-
-            parts = line.split()
-            # Data rows: first field is device name, all others are floats
-            if len(parts) <= max(write_col, util_col):
-                continue
-            device = parts[0]
-            # Skip header repetitions and non-device lines
-            if not device or device.startswith("%") or device in ("Device", "Device:"):
-                continue
-            try:
-                write_mbs = float(parts[write_col]) * write_scale
-                util_pct  = float(parts[util_col])
-            except (ValueError, IndexError):
-                continue
-            samples.setdefault(device, []).append((write_mbs, util_pct))
-
-    if not samples:
+    batches = _iostat_read_batches(path)
+    if not batches:
         return None
 
-    # Trim to active PUT window using combined write signal across all devices.
-    n_common = min(len(pts) for pts in samples.values())
-    combined_write = [sum(samples[d][t][0] for d in samples) for t in range(n_common)]
-    start, end = _active_slice(combined_write)
+    nb = len(batches)
 
-    devices = []
+    combined_write = [_iostat_batch_combined_write_mb_s(batches[t]) for t in range(nb)]
+
+    if window_fracs is not None:
+        start, end = _indices_from_window_fracs(nb, window_fracs)
+    else:
+        start, end = _active_slice(combined_write)
+
+    all_devs: set[str] = set()
+    for t in range(start, end):
+        all_devs.update(batches[t].keys())
+
+    devices: list[dict] = []
     total_mean_write = 0.0
     total_peak_write = 0.0
-    for dev, pts in sorted(samples.items()):
-        pts_trimmed = pts[start:end] or pts
-        writes = [p[0] for p in pts_trimmed]
-        utils  = [p[1] for p in pts_trimmed]
+
+    for dev in sorted(all_devs):
+        writes: list[float] = []
+        utils: list[float] = []
+        for t in range(start, end):
+            if dev in batches[t]:
+                w, u = batches[t][dev]
+                writes.append(w)
+                utils.append(u)
+        if not writes:
+            continue
         mean_w = sum(writes) / len(writes)
         peak_w = max(writes)
-        mean_u = sum(utils)  / len(utils)
+        mean_u = sum(utils) / len(utils)
         peak_u = max(utils)
         if not _iostat_device_is_active(dev, mean_w, peak_w, mean_u, peak_u):
             continue
@@ -646,6 +782,13 @@ def main() -> int:
     # --- per-node telemetry ---
     node_artifacts = find_node_artifacts(out_dir)
 
+    # One fractional [sf, ef) from node1 physical-NIC SAR trim; apply to all nodes' SAR/mpstat/iostat.
+    window_fracs: Optional[tuple[float, float]] = None
+    n1 = node_artifacts.get("node1", {})
+    sar_node1 = n1.get("sar_net")
+    if sar_node1 and Path(sar_node1).exists() and ifaces_for_sar:
+        window_fracs = sar_window_fracs_from_file(Path(sar_node1), ifaces_for_sar)
+
     network: dict = {}
     cpu: dict = {}
     disk: dict = {}
@@ -656,17 +799,17 @@ def main() -> int:
         iostat_path = paths.get("iostat")
 
         if sar_path and Path(sar_path).exists() and ifaces_for_sar:
-            network[label] = parse_sar_net(Path(sar_path), ifaces_for_sar)
+            network[label] = parse_sar_net(Path(sar_path), ifaces_for_sar, window_fracs)
         else:
             network[label] = None
 
         if mp_path and Path(mp_path).exists():
-            cpu[label] = parse_mpstat(Path(mp_path))
+            cpu[label] = parse_mpstat(Path(mp_path), window_fracs)
         else:
             cpu[label] = None
 
         if iostat_path and Path(iostat_path).exists():
-            disk[label] = parse_iostat(Path(iostat_path))
+            disk[label] = parse_iostat(Path(iostat_path), window_fracs)
         else:
             disk[label] = None
 
