@@ -4,7 +4,8 @@
 # Kills the load generator, stops RustFS on all nodes, removes only the
 # bucket directories created by the load generator (identified by the Bucket
 # prefix in the loadgen config file), then restarts RustFS and waits for
-# healthy.
+# healthy. Stop, rm, start, and health polling run in parallel across nodes
+# and data dirs (barrier wait between phases).
 #
 # This is faster than letting the loadgen run its own S3 DELETE cleanup, and
 # more targeted than wiping entire data directories.
@@ -24,7 +25,7 @@
 
 set -euo pipefail
 
-log()  { echo "[cleanup] $(date -u '+%H:%M:%S') $*"; }
+log()  { printf '%s\n' "[cleanup] $(date -u '+%H:%M:%S') $*"; }
 die()  { echo "[cleanup] ERROR: $*" >&2; exit 1; }
 
 # Validate required vars before touching anything
@@ -62,63 +63,100 @@ fi
 log "Load generator stopped"
 
 # ---------------------------------------------------------------------------
-# 2. STOP RUSTFS — peers first, then local
+# 2. STOP RUSTFS — all peers and local in parallel, then barrier wait
 # ---------------------------------------------------------------------------
 
+log "Stopping rustfs on all nodes (parallel)..."
+
+STOP_PIDS=()
 for node in $PEER_NODES; do
-    log "Stopping rustfs service on $node..."
-    ssh "$node" "sudo systemctl stop rustfs || true"
+    log "Stopping rustfs on $node..."
+    ( ssh "$node" "sudo systemctl stop rustfs || true" ) &
+    STOP_PIDS+=($!)
 done
 
-log "Stopping rustfs service locally..."
-sudo systemctl stop rustfs || true
+log "Stopping rustfs locally..."
+( sudo systemctl stop rustfs || true ) &
+STOP_PIDS+=($!)
+
+for pid in "${STOP_PIDS[@]}"; do
+    wait "$pid" || true
+done
 
 sleep 1
 
 # ---------------------------------------------------------------------------
-# 3. REMOVE BUCKET DIRECTORIES — targeted match on prefix, all nodes
+# 3. REMOVE BUCKET DIRECTORIES — each (node × data dir) concurrently
 # ---------------------------------------------------------------------------
 
+log "Removing '${BUCKET_PREFIX}-*' across nodes and data dirs (parallel)..."
+
+RM_PIDS=()
 for dir in $DATA_DIRS; do
     : "${dir:?DATA_DIRS contains an empty token — aborting}"
 
     for node in $PEER_NODES; do
         log "Removing '${BUCKET_PREFIX}-*' from ${dir} on $node..."
-        ssh "$node" "
-            count=\$(sudo find '${dir}' -maxdepth 1 -type d -name '${BUCKET_PREFIX}-*' | wc -l)
-            if [[ \$count -gt 0 ]]; then
-                sudo find '${dir}' -maxdepth 1 -type d -name '${BUCKET_PREFIX}-*' | xargs sudo rm -rf
-                echo \"  removed \$count bucket dir(s) from ${dir} on \$(hostname)\"
-            else
-                echo \"  nothing to remove in ${dir} on \$(hostname)\"
-            fi
-        "
+        (
+            ssh "$node" "
+                count=\$(sudo find '${dir}' -maxdepth 1 -type d -name '${BUCKET_PREFIX}-*' | wc -l)
+                if [[ \$count -gt 0 ]]; then
+                    sudo find '${dir}' -maxdepth 1 -type d -name '${BUCKET_PREFIX}-*' | xargs sudo rm -rf
+                    echo \"  removed \$count bucket dir(s) from ${dir} on \$(hostname)\"
+                else
+                    echo \"  nothing to remove in ${dir} on \$(hostname)\"
+                fi
+            "
+        ) &
+        RM_PIDS+=($!)
     done
 
     log "Removing '${BUCKET_PREFIX}-*' from ${dir} locally..."
-    count=$(sudo find "${dir}" -maxdepth 1 -type d -name "${BUCKET_PREFIX}-*" | wc -l)
-    if [[ "$count" -gt 0 ]]; then
-        sudo find "${dir}" -maxdepth 1 -type d -name "${BUCKET_PREFIX}-*" | xargs sudo rm -rf
-        log "  removed $count bucket dir(s) from ${dir} locally"
-    else
-        log "  nothing to remove in ${dir} locally"
-    fi
+    (
+        count=$(sudo find "${dir}" -maxdepth 1 -type d -name "${BUCKET_PREFIX}-*" | wc -l)
+        if [[ "$count" -gt 0 ]]; then
+            sudo find "${dir}" -maxdepth 1 -type d -name "${BUCKET_PREFIX}-*" | xargs sudo rm -rf
+            log "  removed $count bucket dir(s) from ${dir} locally"
+        else
+            log "  nothing to remove in ${dir} locally"
+        fi
+    ) &
+    RM_PIDS+=($!)
+done
+
+for pid in "${RM_PIDS[@]}"; do
+    wait "$pid" || die "Bucket removal failed (pid=$pid)"
 done
 
 # ---------------------------------------------------------------------------
-# 4. RESTART RUSTFS — peers first, then local
+# 4. RESTART RUSTFS — peers and local in parallel, then barrier wait
 # ---------------------------------------------------------------------------
 
+log "Starting rustfs on all nodes (parallel)..."
+
+START_PIDS=()
 for node in $PEER_NODES; do
-    log "Starting rustfs service on $node..."
-    ssh "$node" "sudo systemctl start rustfs"
+    log "Starting rustfs on $node..."
+    (
+        ssh "$node" "sudo systemctl start rustfs"
+        log "Started rustfs on $node"
+    ) &
+    START_PIDS+=($!)
 done
 
-log "Starting rustfs service locally..."
-sudo systemctl start rustfs
+log "Starting rustfs locally..."
+(
+    sudo systemctl start rustfs
+    log "Started rustfs locally"
+) &
+START_PIDS+=($!)
+
+for pid in "${START_PIDS[@]}"; do
+    wait "$pid" || die "systemctl start rustfs failed (pid=$pid)"
+done
 
 # ---------------------------------------------------------------------------
-# 5. HEALTH POLL — all nodes must respond before returning
+# 5. HEALTH POLL — poll all nodes concurrently; all must pass
 # ---------------------------------------------------------------------------
 
 health_poll() {
@@ -139,9 +177,18 @@ health_poll() {
     die "Node $ssh_target ($host) did not become healthy after ${max}s"
 }
 
+POLL_PIDS=()
 for node in $PEER_NODES; do
-    health_poll "$node"
+    log "Polling health on $node..."
+    health_poll "$node" &
+    POLL_PIDS+=($!)
 done
-health_poll "127.0.0.1"
+log "Polling health on 127.0.0.1..."
+health_poll "127.0.0.1" &
+POLL_PIDS+=($!)
+
+for pid in "${POLL_PIDS[@]}"; do
+    wait "$pid" || die "Health check failed (pid=$pid)"
+done
 
 log "Cleanup complete — all nodes healthy, test buckets removed"
