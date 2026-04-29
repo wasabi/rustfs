@@ -1,42 +1,26 @@
-# A/B test runbook
+# Standard perf test runbook
 
-Procedure for running the standard PUT performance A/B test. This is the reference runbook
-for both manual runs and the CI pipeline (`lab-perf.yml`).
+Procedure for running the standard PUT performance test. This is the reference runbook for
+both manual runs and the CI pipeline (`lab-perf.yml`).
 
----
-
-## The three variants
-
-The `RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT` env var controls whether a
-distributed Shared lock is acquired before each PUT to check existing object-lock state.
-
-| Variant | Value | What it does | Expected throughput |
-|---------|-------|--------------|---------------------|
-| **A0** | `always` | Legacy behavior: Shared-lock preflight on every PUT | ~665 MB/s (two-node) |
-| **A1** | `auto` | Tiered: bucket-gate skips the preflight when no OL config is present; validates inline under the post-encode Exclusive lock otherwise | ~1100 MB/s (two-node) |
-| **A2** | `never` | Force-skip all preflight and inline validation | ~1100 MB/s (two-node) |
-
-`auto` is the production-bound default. `always` is the rollback baseline. `never` is a
-bisection control -- **do not use in production**.
-
-Pass to `run-perf-test.sh` via `--variant always|auto|never`.
+Perf runs use RustFS server defaults for PUT object-lock behaviour (the `auto` preflight
+path from the Phase 2 fix). The harness does **not** expose the old
+`RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT` knob.
 
 ---
 
 ## Standard run procedure
 
-> **Note:** Steps 1-5 assume the Phase 1 harness (`run-perf-test.sh`, `lib/cleanup.sh`) is in
-> place. For a manual run before the harness is built, set
-> `RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT=<value>` on all nodes, restart RustFS, and
-> run the loadgen directly. The env var reference, pass criteria, and metrics table below apply
-> to both paths.
+> **Note:** The steps below assume the Phase 1 harness (`run-perf-test.sh`, `lib/cleanup.sh`) is in
+> place. For a manual run before the harness is built, restart RustFS with the same topology
+> and run the loadgen directly against the endpoint.
 
-### Step 0 -- Set up conf/paths.env
+### Step 0 — Set up conf/paths.env
 
 Copy `conf/paths.env.example` to `conf/paths.env` and fill in all values. Confirm
 `TOPOLOGY_LABEL` matches the cluster you are testing.
 
-### Step 1 -- Forced cleanup (recommended before each run)
+### Step 1 — Forced cleanup (recommended before each run)
 
 ```bash
 bash rustfs/scripts/perf/lib/cleanup.sh
@@ -46,50 +30,26 @@ This kills any running load generator, stops RustFS on all nodes, wipes data dir
 and restarts RustFS cleanly. Faster than waiting for the load generator's own S3 DELETE
 cleanup. See [Cleanup notes](#cleanup-notes) below.
 
-### Step 2 -- Run A0 (always -- rollback baseline)
+### Step 2 — Run the perf test
 
 ```bash
 bash rustfs/scripts/perf/run-perf-test.sh \
-  --variant always \
   --duration 5m \
-  --out /tmp/perf-results/A0
+  --out /tmp/perf-results/run1
 ```
 
-Record results from `/tmp/perf-results/A0/report.md`.
-
-### Step 3 -- Forced cleanup between runs
-
-```bash
-bash rustfs/scripts/perf/lib/cleanup.sh
-```
-
-### Step 4 -- Run A1 (auto -- production candidate)
-
-```bash
-bash rustfs/scripts/perf/run-perf-test.sh \
-  --variant auto \
-  --duration 5m \
-  --out /tmp/perf-results/A1
-```
-
-### Step 5 (optional) -- Run A2 (never -- bisection control)
-
-```bash
-bash rustfs/scripts/perf/run-perf-test.sh \
-  --variant never \
-  --duration 5m \
-  --out /tmp/perf-results/A2
-```
+Record results from `/tmp/perf-results/run1/report.md`.
 
 ---
 
 ## Pass criteria
 
-A1 (`auto`) **passes** when all of the following hold:
+A run **passes** the automated regression gate when throughput is within tolerance of the
+baseline for the current `TOPOLOGY_LABEL` in `benchmarks/baseline.json` (see
+`scripts/perf/analyze/analyze.py`). You should also verify:
 
-1. **Throughput:** A1 >= A2 x 0.95 **and** A1 >= A0 x 1.6
-2. **Errors:** no new load-generator errors that were absent in A0
-3. **Object-lock smoke tests** (run against a bucket with OL enabled):
+1. **Errors:** no unexpected load-generator errors
+2. **Object-lock smoke tests** (run against a bucket with OL enabled):
 
 | Scenario | Expected |
 |----------|----------|
@@ -98,74 +58,64 @@ A1 (`auto`) **passes** when all of the following hold:
 | PUT overwrite with GOVERNANCE mode, no bypass header | `403 AccessDenied` |
 | PUT overwrite with GOVERNANCE mode + `x-amz-bypass-governance-retention: true` | `200 OK` |
 
-All four must pass before sign-off.
-
 ---
 
 ## Metrics table (fill in after each run)
 
-| Field | A0 (`always`) | A1 (`auto`) | A2 (`never`) |
-|-------|--------------|-------------|--------------|
-| Date (UTC) | | | |
-| RustFS git SHA | | | |
-| Topology | | | |
-| Duration | | | |
-| Throughput (MB/s) | | | |
-| avgOpMs | | | |
-| maxOpMs | | | |
-| node1 TX peak (Gbit/s) | | | |
-| Errors | | | |
-| OL smoke: legal-hold | -- | pass/fail | -- |
-| OL smoke: COMPLIANCE | -- | pass/fail | -- |
-| OL smoke: GOVERNANCE bypass | -- | pass/fail | -- |
-
----
-
-## Rollback
-
-To revert to pre-A1 behavior without a code change:
-
-```bash
-RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT=always
-# restart RustFS on all nodes
-```
+| Field | Value |
+|-------|-------|
+| Date (UTC) | |
+| RustFS git SHA | |
+| Topology | |
+| Duration | |
+| Throughput (MB/s) | |
+| avgOpMs | |
+| maxOpMs | |
+| node1 TX peak (Gbit/s) | |
+| Errors | |
+| OL smoke: legal-hold | pass/fail |
+| OL smoke: COMPLIANCE | pass/fail |
+| OL smoke: GOVERNANCE bypass | pass/fail |
 
 ---
 
 ## Fail / inconclusive
 
-If A1 does not meet the pass criteria:
+If the regression gate fails or throughput looks wrong:
 
 1. Record the raw numbers in the metrics table above.
-2. Check the `rustfs_put_trace` span for `put_object.existing_object_lock_inline_check` -- look
-   for unexpected hold-time growth. Add `--trace` to the next run to collect span data.
-3. Fallback option: set `RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT=always` for one
-   release while investigating, and open a follow-up for Phase 2.1 (sibling APIs).
+2. Check the `rustfs_put_trace` span for `put_object.existing_object_lock_inline_check` —
+   look for unexpected hold-time growth. Add `--trace` to the next run to collect span data.
+3. If the issue is not explained by throughput + bandwidth alone, compare CPU, disk, and NIC
+   counters before attributing to a single subsystem.
 
-If the delta between A1 and A2 is within noise (< 5%) but both are below the A0 baseline,
-the regression is in a different part of the stack -- check CPU, disk, and NIC counters before
-attributing to the preflight path.
+---
+
+## Historical context: the Phase 2 preflight experiments
+
+During development, lab A/B runs compared `always` (legacy Shared-lock preflight on every PUT),
+`auto` (tiered skip when no OL config), and `never` (force-skip). Production behaviour is
+now fixed on the `auto` path; the harness no longer rotates those modes. For the measured
+numbers from that period, see `findings-summary.md`.
 
 ---
 
 ## Sign-off
 
-After A1 passes all criteria:
+After the run passes automated and manual checks:
 
 1. Fill in the metrics table above with final numbers, git SHA, and date.
-2. Record the A/B result in your tracking doc or PR description.
+2. Record the result in your tracking doc or PR description.
 3. Update `benchmarks/baseline.json` if the measured numbers differ from the seeded values
    (run `python3 scripts/perf/analyze/analyze.py --update-baseline`).
-4. Consider opening a Phase 2.1 follow-up for sibling APIs (CopyObject, DeleteObject,
-   CompleteMultipart, CreateMultipart) if the throughput pattern suggests the fix generalises.
 
 ---
 
 ## Cleanup notes
 
 The load generator cleans up its own buckets via S3 DELETE (`-deleteOnlyOurBuckets`) but
-this is slow -- it issues one DELETE per object through the full RustFS stack. For back-to-back
-A/B runs, the faster path is `cleanup.sh`, which:
+this is slow — it issues one DELETE per object through the full RustFS stack. For back-to-back
+runs, the faster path is `cleanup.sh`, which:
 
 1. Kills the load generator immediately
 2. Stops RustFS on all nodes
@@ -202,9 +152,10 @@ To also capture per-locker acquire timings (shows local vs remote leg split), ap
 This emits structured events: `wait_blocked` (sampled), `exclusive_released`, and
 `shared_released` (when hold >= `RUSTFS_LOCK_HOLDER_MIN_HOLD_LOG_MS`, default 20 ms).
 Tune volume with:
-- `RUSTFS_LOCK_HOLDER_TRACE_SAMPLE=N` -- log one in N `wait_blocked` events (default 32;
+
+- `RUSTFS_LOCK_HOLDER_TRACE_SAMPLE=N` — log one in N `wait_blocked` events (default 32;
   set 1 for maximum detail)
-- `RUSTFS_LOCK_HOLDER_MIN_HOLD_LOG_MS=N` -- minimum hold duration to emit release events
+- `RUSTFS_LOCK_HOLDER_MIN_HOLD_LOG_MS=N` — minimum hold duration to emit release events
 
 Restart RustFS on node1 after any `RUST_LOG` change.
 
@@ -212,9 +163,9 @@ Restart RustFS on node1 after any `RUST_LOG` change.
 
 | Span name | What it measures |
 |-----------|-----------------|
-| `put_object.post_encode_get_write_lock` | Full distributed write-lock acquire time (dominant latency -- mean ~103 ms, p90 ~155 ms in baseline) |
+| `put_object.post_encode_get_write_lock` | Full distributed write-lock acquire time (dominant latency — mean ~103 ms, p90 ~155 ms in baseline) |
 | `distributed_lock.lock_client_acquire` | Per-locker acquire time; index 0 = local FastLock, remaining indices = one per remote node |
-| `put_object.existing_object_lock_inline_check` | Inline OL validation under the post-encode write lock (`auto` mode only) |
+| `put_object.existing_object_lock_inline_check` | Inline OL validation under the post-encode write lock |
 
 ### Collecting and analysing trace logs
 

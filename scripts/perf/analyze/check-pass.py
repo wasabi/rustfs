@@ -41,10 +41,10 @@ def main() -> int:
     delta_pct = reg.get("delta_pct")
     baseline  = reg.get("baseline_throughput_MBs")
     tolerance = reg.get("tolerance_pct")
-    key       = reg.get("baseline_key", f"{meta.get('topology','?')}/{meta.get('variant','?')}")
+    key       = reg.get("baseline_key", str(meta.get("topology", "?")))
 
     if passed is None:
-        # No baseline for this topology/variant — gate is skipped, not a failure
+        # No baseline for this topology — gate is skipped, not a failure
         note = reg.get("note", "no baseline available")
         print(f"SKIP: {key} — {note}")
         return 0

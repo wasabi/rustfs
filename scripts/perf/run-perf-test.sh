@@ -7,12 +7,10 @@
 # Usage:
 #   source conf/paths.env           # load lab config
 #   bash scripts/perf/run-perf-test.sh \
-#       --variant auto \
 #       --duration 5m \
 #       --out /tmp/perf-results
 #
 # Flags:
-#   --variant  always|auto|never    RUSTFS_PUTOBJECT_EXISTING_OBJECT_LOCK_PREFLIGHT
 #   --duration DURATION             passed to loadgen -dur (default: 5m)
 #   --out      DIR                  output root; default: ./perf-results/<UTC-timestamp>
 #   --no-deploy                     skip build + restart; nodes must already be running
@@ -55,7 +53,6 @@ die()  { echo "[run-perf-test] ERROR: $*" >&2; exit 1; }
 # Parse flags
 # ---------------------------------------------------------------------------
 
-VARIANT=""
 DURATION="5m"
 OUT=""
 NO_DEPLOY=false
@@ -65,7 +62,6 @@ TRACE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --variant)    VARIANT="$2";        shift 2 ;;
         --duration)   DURATION="$2";       shift 2 ;;
         --out)        OUT="$2";            shift 2 ;;
         --no-deploy)  NO_DEPLOY=true;      shift   ;;
@@ -76,11 +72,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "$VARIANT" ]] || die "--variant is required (always|auto|never)"
-
 # Default output dir: timestamped under ./perf-results/
 if [[ -z "$OUT" ]]; then
-    OUT="$(pwd)/perf-results/$(date -u '+%Y%m%dT%H%M%SZ')-${VARIANT}"
+    OUT="$(pwd)/perf-results/$(date -u '+%Y%m%dT%H%M%SZ')"
 fi
 mkdir -p "$OUT"
 
@@ -88,7 +82,7 @@ mkdir -p "$OUT"
 exec > >(tee -a "$OUT/run.log") 2>&1
 
 log "=== run-perf-test.sh start ==="
-log "variant=${VARIANT} duration=${DURATION} out=${OUT}"
+log "duration=${DURATION} out=${OUT}"
 log "no_deploy=${NO_DEPLOY} force_cleanup=${FORCE_CLEANUP} trace=${TRACE}"
 
 # ---------------------------------------------------------------------------
@@ -120,7 +114,6 @@ fi
 export PEER_NODES RUSTFS_VOLUMES PEER_RUSTFS_BIN
 export LOADGEN_BIN LOADGEN_CFG LOADGEN_ENDPOINT LOADGEN_HOST
 export LOADGEN_HOST NIC_INTERFACES
-export PREFLIGHT_VARIANT="$VARIANT"
 export RUST_LOG
 export RUSTFS_BINARY
 export DURATION
@@ -213,7 +206,6 @@ python3 - <<EOF
 import json, os
 meta = {
     "git_sha": "$GIT_SHA",
-    "variant": "$VARIANT",
     "topology": "${TOPOLOGY_LABEL:-unknown}",
     "duration": "$DURATION",
     "trace": $( $TRACE && echo True || echo False ),
