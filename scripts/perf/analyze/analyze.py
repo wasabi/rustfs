@@ -161,8 +161,10 @@ def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
     Returns {iface: {mean_rx_Gbps, peak_rx_Gbps, mean_tx_Gbps, peak_tx_Gbps}}
     for each requested interface that has data.
 
-    Omits idle interfaces (negligible RX/TX, including inactive lo); active-window trimming
-    still uses combined traffic from every interface that has samples.
+    Omits idle interfaces (negligible RX/TX, including inactive lo).  Global
+    active-window trim uses combined TX+RX on physical NICs only (lo excluded).
+    For lo, mean/peak use a separate trim on lo's own RX+TX so bursty localhost
+    traffic is not averaged against long idle stretches in the cluster window.
     """
     if not path.exists():
         return None
@@ -187,9 +189,17 @@ def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
     if not found:
         return None
 
-    # Trim to active PUT window using combined TX+RX across all interfaces.
     n = min(len(rx_by_iface[i]) for i in found)
-    combined = [sum(rx_by_iface[i][t] + tx_by_iface[i][t] for i in found) for t in range(n)]
+    # Combined trim: physical NICs only — including lo stretches the "active
+    # window" based on eno traffic while lo is often bursty; averaging lo over
+    # that window makes mean_rx/mean_tx far below peak on loopback.
+    trim_ifaces = [i for i in found if i != "lo"]
+    if not trim_ifaces:
+        trim_ifaces = list(found)
+    combined = [
+        sum(rx_by_iface[i][t] + tx_by_iface[i][t] for i in trim_ifaces)
+        for t in range(n)
+    ]
     start, end = _active_slice(combined)
 
     def _kbs_to_gbps(kbs: float) -> float:
@@ -197,8 +207,16 @@ def parse_sar_net(path: Path, ifaces: list[str]) -> Optional[dict]:
 
     result = {}
     for iface in found:
-        rx = rx_by_iface[iface][start:end]
-        tx = tx_by_iface[iface][start:end]
+        rx_full = rx_by_iface[iface][:n]
+        tx_full = tx_by_iface[iface][:n]
+        if iface == "lo":
+            lo_combo = [rx_full[t] + tx_full[t] for t in range(n)]
+            lo_start, lo_end = _active_slice(lo_combo)
+            rx = rx_full[lo_start:lo_end]
+            tx = tx_full[lo_start:lo_end]
+        else:
+            rx = rx_full[start:end]
+            tx = tx_full[start:end]
         if not rx:
             continue
         n_active = len(rx)

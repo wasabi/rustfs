@@ -31,8 +31,8 @@
 #   LOADGEN_ENDPOINT (optional), LOADGEN_HOST (optional)
 #   NIC_INTERFACES (optional, for ethtool snapshots)
 #   RUSTFS_OBS_LOG_DIR (optional, default /var/logs/rustfs — used by --trace)
-#   PUT_PHASE_DRAIN_SECS (optional) seconds after the final-summary line before stopping
-#                       monitors / killing loadgen (-force-cleanup); default 5
+#   PUT_PHASE_DRAIN_SECS (optional) extra seconds after loadgen.txt has summary + interval
+#                       rows before stopping monitors / killing loadgen; default 0 (often not needed)
 
 set -euo pipefail
 
@@ -177,6 +177,14 @@ _loadgen_put_summary_ready() {
     grep -qE '#[[:digit:]]+/[[:space:]]*AVG\b' "$logfile" 2>/dev/null
 }
 
+# True when at least one per-interval PUT row exists (#<test>/<n> PUT:, not …/AVG).
+# Matches analyze.py — avoids killing the loadgen | tee pipeline before intervals hit disk.
+_loadgen_has_put_interval_line() {
+    local logfile="$1"
+    [[ -f "$logfile" ]] || return 1
+    grep -qE '#[[:digit:]]+/[[:space:]]*[0-9]+[[:space:]]+PUT:' "$logfile" 2>/dev/null
+}
+
 # EXIT trap: always stop monitors and collect artifacts, even on failure
 on_exit() {
     local exit_code=$?
@@ -286,12 +294,11 @@ log "--- Step 4: run loadgen (duration=${DURATION}) ---"
 bash "$LIB/loadgen-run.sh" &
 LOADGEN_PID=$!
 
-# Stop monitors after PUT traffic ends — wait for summary line "#<test>/ AVG …"; optional
-# drain (${PUT_PHASE_DRAIN_SECS:-5}s) lets in-flight requests finish before telemetry stop
-# or force-cleanup kills loadgen.
+# Stop monitors after PUT traffic ends — wait for #<test>/AVG, then until a per-interval
+# PUT row appears in loadgen.txt (tee can lag); optional extra drain (see PUT_PHASE_DRAIN_SECS).
 LOADGEN_OUT="$OUT/loadgen.txt"
 LOADGEN_FORCE_KILLED=false
-PUT_PHASE_DRAIN_SECS="${PUT_PHASE_DRAIN_SECS:-5}"
+PUT_PHASE_DRAIN_SECS="${PUT_PHASE_DRAIN_SECS:-0}"
 
 while kill -0 "$LOADGEN_PID" 2>/dev/null \
       && ! _loadgen_put_summary_ready "$LOADGEN_OUT"; do
@@ -299,8 +306,21 @@ while kill -0 "$LOADGEN_PID" 2>/dev/null \
 done
 
 if _loadgen_put_summary_ready "$LOADGEN_OUT"; then
-    log "PUT summary line (#…/ AVG) seen — draining ${PUT_PHASE_DRAIN_SECS}s for in-flight PUTs to finish"
-    sleep "${PUT_PHASE_DRAIN_SECS}"
+    log "PUT summary (#…/ AVG) seen — waiting for per-interval PUT rows in ${LOADGEN_OUT##*/}"
+    spins=0
+    while kill -0 "$LOADGEN_PID" 2>/dev/null \
+          && ! _loadgen_has_put_interval_line "$LOADGEN_OUT" \
+          && [[ $spins -lt 150 ]]; do
+        sleep 0.2
+        spins=$((spins + 1))
+    done
+    if ! _loadgen_has_put_interval_line "$LOADGEN_OUT"; then
+        log "WARNING: per-interval PUT rows still absent after ~30s — continuing (analyze may rely on #/AVG line only)"
+    fi
+    if (( PUT_PHASE_DRAIN_SECS > 0 )); then
+        log "Draining ${PUT_PHASE_DRAIN_SECS}s (PUT_PHASE_DRAIN_SECS) before stopping monitors"
+        sleep "${PUT_PHASE_DRAIN_SECS}"
+    fi
     log "PUT traffic complete — stopping monitors"
     stop_monitors
     LOCAL_MONITOR_PID=""
