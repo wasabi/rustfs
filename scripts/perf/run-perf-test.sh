@@ -24,9 +24,13 @@
 # Required env (source conf/paths.env before running):
 #   LOADGEN_BIN, LOADGEN_CFG
 # Optional env:
-#   PERF_ORCHESTRATOR_HOST  short hostname for local artifact dir and meta orchestrator_host
-#                           (default: hostname -s). Peers are skipped when their SSH hostname -s
-#                           matches this (same physical host under a different DNS name).
+#   PERF_ORCHESTRATOR_LABEL  RustFS-style name for local artifacts and reports (e.g. rustfsnode1).
+#                            Overrides PERF_ORCHESTRATOR_HOST if both set. If unset, the script
+#                            may pick the PEER_NODES name that ssh-resolves to this machine.
+#   PERF_ORCHESTRATOR_HOST   Alias for PERF_ORCHESTRATOR_LABEL (backward compat).
+#   PERF_ORCHESTRATOR_MACHINE  Override physical short hostname for same-host detection only
+#                              (default: hostname -s). Use when ssh hostname -s must match this
+#                              but the report label differs (LABEL=rustfsnode1, MACHINE unchanged).
 #   PEER_NODES          space-separated peer hostnames; if empty, peer monitoring
 #                       and artifact collection are skipped (single-node run)
 #   RUSTFS_VOLUMES      informational; recorded in meta.json
@@ -86,21 +90,44 @@ if [[ -z "$OUT" ]]; then
 fi
 mkdir -p "$OUT"
 
-# Short hostname for local telemetry dir $OUT/node-<host>/ and meta orchestrator_host.
-# Override with PERF_ORCHESTRATOR_HOST when hostname -s is wrong (e.g. some containers).
-ORCH_HOST="${PERF_ORCHESTRATOR_HOST:-}"
-if [[ -z "$ORCH_HOST" ]]; then
-    ORCH_HOST="$(hostname -s 2>/dev/null || true)"
+# Physical identity on this machine (compare to ssh peer 'hostname -s' for same-host dedupe).
+ORCH_MACHINE="$(hostname -s 2>/dev/null || true)"
+[[ -n "$ORCH_MACHINE" ]] || ORCH_MACHINE="${HOSTNAME%%.*}"
+[[ -n "$ORCH_MACHINE" ]] || ORCH_MACHINE="localhost"
+[[ -n "${PERF_ORCHESTRATOR_MACHINE:-}" ]] && ORCH_MACHINE="$PERF_ORCHESTRATOR_MACHINE"
+
+# Report / artifact dir name (RustFS DNS-style, e.g. rustfsnode1); defaults to machine id.
+ORCH_LABEL="$ORCH_MACHINE"
+[[ -n "${PERF_ORCHESTRATOR_HOST:-}" ]] && ORCH_LABEL="$PERF_ORCHESTRATOR_HOST"
+[[ -n "${PERF_ORCHESTRATOR_LABEL:-}" ]] && ORCH_LABEL="$PERF_ORCHESTRATOR_LABEL"
+
+# No explicit label: if a PEER_NODES SSH target resolves to this machine (hostname -s), use
+# that DNS name for reports (rustfsnode1 vs XR5-U09) — one ssh per peer until a match.
+if [[ "$ORCH_LABEL" == "$ORCH_MACHINE" ]] \
+    && [[ -z "${PERF_ORCHESTRATOR_LABEL:-}" ]] \
+    && [[ -z "${PERF_ORCHESTRATOR_HOST:-}" ]] \
+    && [[ -n "${PEER_NODES:-}" ]]; then
+    for node in $PEER_NODES; do
+        nh="${node##*@}"
+        [[ "$nh" == "$ORCH_MACHINE" ]] && continue
+        rh="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$node" "hostname -s 2>/dev/null || hostname | cut -d. -f1" 2>/dev/null || true)"
+        rh="${rh//$'\r'/}"
+        if [[ -n "$rh" && "$rh" == "$ORCH_MACHINE" ]]; then
+            ORCH_LABEL="$nh"
+            break
+        fi
+    done
 fi
-[[ -n "$ORCH_HOST" ]] || ORCH_HOST="${HOSTNAME%%.*}"
-[[ -n "$ORCH_HOST" ]] || ORCH_HOST="localhost"
+
+# ORCH_HOST kept as an alias for ORCH_LABEL (backward compat for exported env).
+ORCH_HOST="$ORCH_LABEL"
 
 # Redirect all subsequent log output to run.log (tee keeps it on stdout too)
 exec > >(tee -a "$OUT/run.log") 2>&1
 
 log "=== run-perf-test.sh start ==="
 log "duration=${DURATION} out=${OUT}"
-log "orchestrator_host=${ORCH_HOST} (set PERF_ORCHESTRATOR_HOST to override)"
+log "orchestrator_label=${ORCH_LABEL} machine_id=${ORCH_MACHINE} (PERF_ORCHESTRATOR_LABEL / HOST / MACHINE)"
 log "no_deploy=${NO_DEPLOY} force_cleanup=${FORCE_CLEANUP} trace=${TRACE}"
 
 # ---------------------------------------------------------------------------
@@ -136,20 +163,20 @@ export RUST_LOG
 export RUSTFS_BINARY
 export DURATION
 export OUT
-export ORCH_HOST
+export ORCH_HOST ORCH_LABEL ORCH_MACHINE
 
 # True when PEER_NODES entry points at the same machine as this script (e.g. DNS rustfsnode1
-# vs hostname -s XR5-U09). Compares ORCH_HOST to ssh hostname -s on the peer.
+# vs hostname -s XR5-U09). Matches SSH target to ORCH_LABEL / ORCH_MACHINE, or ssh hostname -s to ORCH_MACHINE.
 _peer_is_orchestrator() {
     local node="$1"
     local node_host="${node##*@}"
-    if [[ "$node_host" == "$ORCH_HOST" ]]; then
+    if [[ "$node_host" == "$ORCH_LABEL" || "$node_host" == "$ORCH_MACHINE" ]]; then
         return 0
     fi
     local rh
     rh="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$node" "hostname -s 2>/dev/null || hostname | cut -d. -f1" 2>/dev/null || true)"
     rh="${rh//$'\r'/}"
-    [[ -n "$rh" && "$rh" == "$ORCH_HOST" ]]
+    [[ -n "$rh" && "$rh" == "$ORCH_MACHINE" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -269,7 +296,7 @@ meta = {
     "duration": "$DURATION",
     "trace": $( $TRACE && echo True || echo False ),
     "utc": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
-    "orchestrator_host": "${ORCH_HOST}",
+    "orchestrator_host": "${ORCH_LABEL}",
     "peer_nodes": "${PEER_NODES:-}".split(),
     "nic_interfaces": "$NIC_INTERFACES".split() if "$NIC_INTERFACES" else [],
 }
@@ -288,9 +315,9 @@ log "--- Step 3: start monitors ---"
 # Empty when PEER_NODES is not set (single-node run).
 LOCAL_PEER_SPEC="${PEER_NODES:+${PEER_NODES%% *}:9000}"
 
-# Local monitor: NODE_ID=1 filenames (mpstat-node1.txt, …); directory is node-<hostname>
-# (hostname -s on the orchestrator).
-LOCAL_NODE_DIR="$OUT/node-${ORCH_HOST}"
+# Local monitor: NODE_ID=1 filenames (mpstat-node1.txt, …); directory is node-<ORCH_LABEL>
+# (RustFS-style name when PERF_ORCHESTRATOR_LABEL / HOST is set).
+LOCAL_NODE_DIR="$OUT/node-${ORCH_LABEL}"
 NODE_ID=1
 mkdir -p "$LOCAL_NODE_DIR"
 NODE_ID=1 OUT="$LOCAL_NODE_DIR" PEER_SPEC="${LOCAL_PEER_SPEC}" \
@@ -305,10 +332,10 @@ if [[ -n "${PEER_NODES:-}" ]]; then
         # Strip optional user prefix (e.g. "ba@node2" → "node2") for directory and file names.
         node_host="${node##*@}"
         if _peer_is_orchestrator "$node"; then
-            if [[ "$node_host" == "$ORCH_HOST" ]]; then
-                log "Skipping peer monitor on $node (same hostname token as orchestrator ${ORCH_HOST})"
+            if [[ "$node_host" == "$ORCH_LABEL" || "$node_host" == "$ORCH_MACHINE" ]]; then
+                log "Skipping peer monitor on $node (same host as orchestrator; label ${ORCH_LABEL})"
             else
-                log "Skipping peer monitor on $node (SSH hostname -s matches orchestrator ${ORCH_HOST}; peer name is ${node_host})"
+                log "Skipping peer monitor on $node (peer ${node_host} resolves to machine_id ${ORCH_MACHINE}; report label ${ORCH_LABEL})"
             fi
             continue
         fi

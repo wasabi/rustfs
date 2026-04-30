@@ -87,8 +87,10 @@ the file exists).
 | Variable | Purpose |
 |----------|---------|
 | `TOPOLOGY_LABEL` | Baseline key (e.g. `two-node`, `three-node`) — must match `benchmarks/baseline.json` |
-| `PEER_NODES` | Space-separated peers for SSH monitors / deploy (empty = single-node). Prefer omitting the machine that runs this script; if it appears under another DNS name, duplicate peer monitors/collection are skipped when `ssh` `hostname -s` on that peer matches the orchestrator short hostname. Local telemetry lives under `$OUT/node-$(hostname -s)/` by default. |
-| `PERF_ORCHESTRATOR_HOST` | (Optional) Override the orchestrator short hostname used for `$OUT/node-<host>/`, `meta.json`, and peer self-detection (must match `hostname -s` on peers that are the same box). |
+| `PEER_NODES` | Space-separated peers for SSH monitors / deploy (empty = single-node). Prefer omitting the machine that runs this script; if it appears under another DNS name, duplicate peer monitors/collection are skipped when `ssh` `hostname -s` on that peer matches this machine’s physical short name (`hostname -s`, or `PERF_ORCHESTRATOR_MACHINE`). Local telemetry goes under `$OUT/node-<report-label>/` (see below). |
+| `PERF_ORCHESTRATOR_LABEL` | (Optional) RustFS-style DNS name for node1 in reports and artifact dirs (e.g. `rustfsnode1`). Defaults to `hostname -s`, or the first `PEER_NODES` entry whose `ssh hostname -s` matches this machine when label/host env vars are unset. Takes precedence over `PERF_ORCHESTRATOR_HOST` when both are set. |
+| `PERF_ORCHESTRATOR_HOST` | Alias for `PERF_ORCHESTRATOR_LABEL` (backward compat). |
+| `PERF_ORCHESTRATOR_MACHINE` | (Optional) Override the physical short hostname used only for same-host dedupe (`ssh` `hostname -s` on peers). Defaults to `hostname -s` on the orchestrator. |
 | `RUSTFS_VOLUMES` | Full volumes string for deploy template |
 | `DATA_DIRS` | Data dirs for `cleanup.sh` |
 | `LOADGEN_BIN`, `LOADGEN_CFG` | Load generator binary and config — if `LOADGEN_HOST` is set, both paths are on that host (including for `cleanup.sh` / `--force-cleanup`) |
