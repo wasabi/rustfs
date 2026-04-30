@@ -130,6 +130,9 @@ export OUT
 
 LOCAL_MONITOR_PID=""
 declare -A REMOTE_MONITOR_PIDS   # node → SSH background PID
+# Absolute path on each peer where monitor.sh writes (never reuse orchestrator $OUT on
+# peers — /tmp/smoke-* may exist there with different owner, e.g. NFS /tmp or another user).
+declare -A REMOTE_PEER_OUT         # node (PEER_NODES token) → path on that peer
 
 stop_monitors() {
     log "Stopping monitors..."
@@ -140,11 +143,14 @@ stop_monitors() {
     for node in "${!REMOTE_MONITOR_PIDS[@]}"; do
         local_ssh_pid="${REMOTE_MONITOR_PIDS[$node]}"
         local node_host="${node##*@}"
-        local pid_file="${OUT}/node-${node_host}/monitor-node${node_host}-pid.txt"
-        # Signal the remote monitor process via its saved PID file
-        if ssh "$node" "test -f '${pid_file}'"; then
-            remote_pid=$(ssh "$node" "cat '${pid_file}'")
-            ssh "$node" "kill '$remote_pid' 2>/dev/null || true" || true
+        local peer_remote="${REMOTE_PEER_OUT[$node]:-}"
+        if [[ -n "$peer_remote" ]]; then
+            local pid_file="${peer_remote}/monitor-node${node_host}-pid.txt"
+            # Signal the remote monitor process via its saved PID file
+            if ssh "$node" "test -f '${pid_file}'"; then
+                remote_pid=$(ssh "$node" "cat '${pid_file}'")
+                ssh "$node" "kill '$remote_pid' 2>/dev/null || true" || true
+            fi
         fi
         # Also kill the local SSH background job
         kill "$local_ssh_pid" 2>/dev/null || true
@@ -162,10 +168,15 @@ collect_peer_artifacts() {
     for node in $PEER_NODES; do
         local node_host="${node##*@}"
         local node_out="$OUT/node-${node_host}"
-        log "  scp ${node}:${node_out}/ → ${node_out}/"
-        # Copy the peer's subdirectory directly (avoids the "/." suffix that breaks
-        # newer OpenSSH and the "@" character that appears when PEER_NODES uses user@host).
-        scp -r -q "${node}:${node_out}" "${OUT}/" || log "  WARNING: scp from $node failed"
+        local peer_remote="${REMOTE_PEER_OUT[$node]:-}"
+        if [[ -z "$peer_remote" ]]; then
+            log "  WARNING: no REMOTE_PEER_OUT for $node — skipping scp"
+            continue
+        fi
+        log "  scp ${node}:${peer_remote}/. → ${node_out}/"
+        mkdir -p "$node_out"
+        # Staging dir on peer is owned by the SSH user; flatten into local node-* layout.
+        scp -r -q "${node}:${peer_remote}/." "${node_out}/" || log "  WARNING: scp from $node failed"
     done
 }
 
@@ -251,10 +262,15 @@ log "Local monitor started (pid=${LOCAL_MONITOR_PID})"
 
 if [[ -n "${PEER_NODES:-}" ]]; then
     PEER_NODE_ID=2
+    _out_tag="$(basename "${OUT%/}")"
     for node in $PEER_NODES; do
         # Strip optional user prefix (e.g. "ba@node2" → "node2") for directory and file names.
         node_host="${node##*@}"
-        peer_out="$OUT/node-${node_host}"
+        # Writable on the peer as the SSH user — do not nest under orchestrator $OUT on the
+        # peer (same path may exist with different owner: NFS /tmp, different login, etc.).
+        peer_out_remote="/tmp/rustfsperf-${node_host}-${_out_tag}-$$"
+        REMOTE_PEER_OUT["$node"]="$peer_out_remote"
+        peer_out_local="$OUT/node-${node_host}"
 
         # Ship the lib scripts to the peer so the remote monitor can run even if the
         # peer node does not have a local copy of the repo.
@@ -264,21 +280,20 @@ if [[ -n "${PEER_NODES:-}" ]]; then
         scp -q "$LIB/"*.sh "$node:${REMOTE_LIB}/"
 
         # Start monitor on peer; save its PID to a file on the remote for clean signalling.
-        # Note: do NOT mkdir "$peer_out" locally here — collect_peer_artifacts uses
-        # "scp -r host:$peer_out $OUT/" which would double-nest if the dir already exists.
+        # Note: do NOT mkdir "$peer_out_local" locally before collect — scp fills it from peer.
         ssh "$node" "
-            mkdir -p '${peer_out}'
+            mkdir -p '${peer_out_remote}'
             export NODE_ID=${PEER_NODE_ID}
-            export OUT='${peer_out}'
+            export OUT='${peer_out_remote}'
             export PEER_SPEC=''
             export NIC_INTERFACES='${NIC_INTERFACES:-}'
             nohup bash '${REMOTE_LIB}/monitor.sh' \
-                >>'${peer_out}/monitor-node${PEER_NODE_ID}.log' 2>&1 &
-            echo \$! > '${peer_out}/monitor-node${node_host}-pid.txt'
+                >>'${peer_out_remote}/monitor-node${PEER_NODE_ID}.log' 2>&1 &
+            echo \$! > '${peer_out_remote}/monitor-node${node_host}-pid.txt'
             disown
         " &
         REMOTE_MONITOR_PIDS["$node"]=$!
-        log "Remote monitor started on $node (node_id=${PEER_NODE_ID})"
+        log "Remote monitor on $node → ${peer_out_remote} (collects to ${peer_out_local##*/})"
         (( PEER_NODE_ID++ ))
     done
 fi

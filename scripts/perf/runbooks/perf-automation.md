@@ -251,6 +251,7 @@ See `run-perf-test.sh` step 7 for exact flags (e.g. span filter around `get_writ
 |---------|--------|
 | `LOADGEN_BIN must be set` | `source conf/paths.env` before running; file path three levels above `scripts/perf/` |
 | Empty peer telemetry | `PEER_NODES`, SSH keys, `scp` of `lib/*.sh` to peers |
+| `mkdir … Permission denied` on a peer under your `--out` path | Peers no longer reuse orchestrator `$OUT` on disk (avoids NFS `/tmp` or cross-user clashes). If you still see this, check that the SSH user can write under `/tmp` on peers. Hostnames like `rustfsnode1` vs `node1` only affect directory names, not this permission model. |
 | Regression SKIP | Missing topology key or `null` throughput in `baseline.json` |
 | No trace CSV/HTML | JSONL not produced (`RUSTFS_OBS_LOG_DIRECTORY`, permissions on obs dir), or `obs_timing_from_jsonl.py` stderr in `run.log` |
 
