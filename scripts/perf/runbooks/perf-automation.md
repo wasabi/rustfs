@@ -12,8 +12,42 @@ procedure and pass criteria, see [ab-test-runbook.md](ab-test-runbook.md).
 
 ### Software (runner / node1)
 
-- **Rust toolchain** — `cargo` available where you build RustFS (`deploy.sh` uses
-  `cargo build --release -p rustfs`).
+#### Rust toolchain
+
+Perf builds use **`cargo`** on the machine that runs **`deploy.sh`** (typically node1 or your
+dev machine if you build elsewhere). Install via **[rustup](https://rustup.rs/)** (the usual
+Rust installer on Linux and macOS):
+
+1. Follow the instructions at https://rustup.rs/ — typically:
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+
+2. Use the **default stable** toolchain unless the RustFS repo documents a specific version:
+
+   ```bash
+   rustup default stable
+   rustup update
+   ```
+
+3. Ensure your shell loads Cargo’s bin directory (rustup prints this at install time). For
+   example, add `source "$HOME/.cargo/env"` to `~/.bashrc` or `~/.zshrc`, or start a **new**
+   terminal session.
+
+4. Confirm:
+
+   ```bash
+   cargo --version
+   rustc --version
+   ```
+
+Then from the RustFS checkout root, `cargo build --release -p rustfs` (what `deploy.sh` runs)
+should succeed if OS packages required by **links** (for example OpenSSL dev headers on Linux)
+are installed—see the RustFS repo **README** or **CONTRIBUTING** for distro-specific hints.
+
+#### Other tools
+
 - **OpenSSH client** — `ssh`, `scp` to peers listed in `PEER_NODES` (and optional
   `LOADGEN_HOST`).
 - **sysstat** — `mpstat`, `iostat`, `sar` on every node that runs `lib/monitor.sh`
@@ -56,7 +90,7 @@ the file exists).
 | `PEER_NODES` | Space-separated peers for SSH monitors / deploy (empty = node1-only) |
 | `RUSTFS_VOLUMES` | Full volumes string for deploy template |
 | `DATA_DIRS` | Data dirs for `cleanup.sh` |
-| `LOADGEN_BIN`, `LOADGEN_CFG` | Load generator binary and config |
+| `LOADGEN_BIN`, `LOADGEN_CFG` | Load generator binary and config — if `LOADGEN_HOST` is set, both paths are on that host (including for `cleanup.sh` / `--force-cleanup`) |
 | `NIC_INTERFACES` | For SAR / ethtool (see [lab-setup.md](lab-setup.md)) |
 | `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` | Lab credentials (used by deploy) |
 
