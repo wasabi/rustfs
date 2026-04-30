@@ -87,7 +87,8 @@ the file exists).
 | Variable | Purpose |
 |----------|---------|
 | `TOPOLOGY_LABEL` | Baseline key (e.g. `two-node`, `three-node`) — must match `benchmarks/baseline.json` |
-| `PEER_NODES` | Space-separated peers for SSH monitors / deploy (empty = node1-only) |
+| `PEER_NODES` | Space-separated peers for SSH monitors / deploy (empty = single-node). Prefer omitting the machine that runs this script; if it appears under another DNS name, duplicate peer monitors/collection are skipped when `ssh` `hostname -s` on that peer matches the orchestrator short hostname. Local telemetry lives under `$OUT/node-$(hostname -s)/` by default. |
+| `PERF_ORCHESTRATOR_HOST` | (Optional) Override the orchestrator short hostname used for `$OUT/node-<host>/`, `meta.json`, and peer self-detection (must match `hostname -s` on peers that are the same box). |
 | `RUSTFS_VOLUMES` | Full volumes string for deploy template |
 | `DATA_DIRS` | Data dirs for `cleanup.sh` |
 | `LOADGEN_BIN`, `LOADGEN_CFG` | Load generator binary and config — if `LOADGEN_HOST` is set, both paths are on that host (including for `cleanup.sh` / `--force-cleanup`) |
@@ -250,7 +251,7 @@ See `run-perf-test.sh` step 7 for exact flags (e.g. span filter around `get_writ
 | Symptom | Check |
 |---------|--------|
 | `LOADGEN_BIN must be set` | `source conf/paths.env` before running; file path three levels above `scripts/perf/` |
-| Empty peer telemetry | `PEER_NODES`, SSH keys, `scp` of `lib/*.sh` to peers |
+| Empty peer telemetry | `PEER_NODES`, SSH keys, `scp` of `lib/*.sh` to peers; peer artifacts are pulled with **tar over ssh** (not `scp …/.`, which OpenSSH rejects) |
 | `mkdir … Permission denied` on a peer under your `--out` path | Peers no longer reuse orchestrator `$OUT` on disk (avoids NFS `/tmp` or cross-user clashes). If you still see this, check that the SSH user can write under `/tmp` on peers. Hostnames like `rustfsnode1` vs `node1` only affect directory names, not this permission model. |
 | Regression SKIP | Missing topology key or `null` throughput in `baseline.json` |
 | No trace CSV/HTML | JSONL not produced (`RUSTFS_OBS_LOG_DIRECTORY`, permissions on obs dir), or `obs_timing_from_jsonl.py` stderr in `run.log` |

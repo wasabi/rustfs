@@ -7,10 +7,10 @@ Usage:
 
 Inputs read from --out DIR:
     loadgen.txt             per-minute PUT stats from the load generator
-    node1/mpstat-node1.txt  mpstat -P ALL output for node1
-    node1/sar-net-node1.txt sar -n DEV output for node1 (canonical active window when present)
-    node-*/mpstat-nodeN.txt same for each peer node (N = 2, 3, ...)
-    node-*/sar-net-nodeN.txt
+    node-<host>/mpstat-node1.txt  orchestrator telemetry (NODE_ID=1 filenames; host from meta)
+    node-<host>/sar-net-node1.txt — canonical SAR window when meta orchestrator_host matches
+    Legacy layout node1/ is still accepted. Peers: node-<host>/ with mpstat-node2.txt, …
+    node-*/sar-net-nodeN.txt (N = NODE_ID from monitor.sh)
     meta.json               run metadata written by run-perf-test.sh
 
 Outputs written to --out DIR:
@@ -533,12 +533,18 @@ def parse_iostat(path: Path, window_fracs: Optional[tuple[float, float]] = None)
 # ---------------------------------------------------------------------------
 
 def find_node_artifacts(out_dir: Path) -> dict[str, dict[str, Path]]:
-    """Return {node_label: {mpstat: path, sar_net: path}} for all node dirs found."""
+    """Return {node_label: {mpstat, sar_net, iostat, node_id}} for all node dirs found."""
     nodes: dict[str, dict[str, Path]] = {}
 
-    # node1 lives directly under out_dir/node1/
+    def _modern_orchestrator_dir_exists() -> bool:
+        for d in out_dir.glob("node-*"):
+            if d.is_dir() and (d / "mpstat-node1.txt").exists():
+                return True
+        return False
+
+    # Legacy layout: out_dir/node1/ — skip if node-<host>/ already holds NODE_ID=1 telemetry
     node1_dir = out_dir / "node1"
-    if node1_dir.is_dir():
+    if node1_dir.is_dir() and not _modern_orchestrator_dir_exists():
         nodes["node1"] = {
             "mpstat":  node1_dir / "mpstat-node1.txt",
             "sar_net": node1_dir / "sar-net-node1.txt",
@@ -546,7 +552,7 @@ def find_node_artifacts(out_dir: Path) -> dict[str, dict[str, Path]]:
             "node_id": 1,
         }
 
-    # peers live under out_dir/node-<hostname>/
+    # Orchestrator + peers: out_dir/node-<hostname>/
     for d in sorted(out_dir.glob("node-*")):
         if not d.is_dir():
             continue
@@ -565,6 +571,19 @@ def find_node_artifacts(out_dir: Path) -> dict[str, dict[str, Path]]:
         }
 
     return nodes
+
+
+def canonical_orchestrator_label(meta: dict, nodes: dict[str, dict]) -> str:
+    """Which node label supplies the canonical SAR window (physical NIC trim)."""
+    h = meta.get("orchestrator_host")
+    if isinstance(h, str) and h and h in nodes:
+        return h
+    if "node1" in nodes:
+        return "node1"
+    for label, paths in sorted(nodes.items()):
+        if paths.get("node_id") == 1:
+            return label
+    return sorted(nodes.keys())[0] if nodes else ""
 
 
 # ---------------------------------------------------------------------------
@@ -782,9 +801,10 @@ def main() -> int:
     # --- per-node telemetry ---
     node_artifacts = find_node_artifacts(out_dir)
 
-    # One fractional [sf, ef) from node1 physical-NIC SAR trim; apply to all nodes' SAR/mpstat/iostat.
+    # One fractional [sf, ef) from orchestrator physical-NIC SAR trim; apply to all nodes.
     window_fracs: Optional[tuple[float, float]] = None
-    n1 = node_artifacts.get("node1", {})
+    orch_label = canonical_orchestrator_label(meta, node_artifacts)
+    n1 = node_artifacts.get(orch_label, {}) if orch_label else {}
     sar_node1 = n1.get("sar_net")
     if sar_node1 and Path(sar_node1).exists() and ifaces_for_sar:
         window_fracs = sar_window_fracs_from_file(Path(sar_node1), ifaces_for_sar)
@@ -827,11 +847,12 @@ def main() -> int:
     # --- assemble report.json ---
     report = {
         "meta": {
-            "git_sha":        meta.get("git_sha", "unknown"),
-            "topology":       topology,
-            "duration":       meta.get("duration", "unknown"),
-            "utc":            meta.get("utc", "unknown"),
-            "nic_interfaces": nic_interfaces,
+            "git_sha":             meta.get("git_sha", "unknown"),
+            "topology":            topology,
+            "duration":            meta.get("duration", "unknown"),
+            "utc":                 meta.get("utc", "unknown"),
+            "nic_interfaces":      nic_interfaces,
+            "orchestrator_host":   meta.get("orchestrator_host"),
         },
         "loadgen":    loadgen_data,
         "network":    network,

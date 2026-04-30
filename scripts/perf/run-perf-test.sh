@@ -19,13 +19,16 @@
 #   --force-cleanup                 after PUT traffic (see /AVG in loadgen.txt):
 #                                   kill loadgen, run cleanup.sh — skip loadgen S3 DELETE,
 #                                   remove bucket dirs on disk, restart rustfs
-#   --trace                         enable debug RUST_LOG recipe on node1; collect obs JSONL
+#   --trace                         enable debug RUST_LOG recipe on orchestrator; collect obs JSONL
 #
 # Required env (source conf/paths.env before running):
 #   LOADGEN_BIN, LOADGEN_CFG
 # Optional env:
+#   PERF_ORCHESTRATOR_HOST  short hostname for local artifact dir and meta orchestrator_host
+#                           (default: hostname -s). Peers are skipped when their SSH hostname -s
+#                           matches this (same physical host under a different DNS name).
 #   PEER_NODES          space-separated peer hostnames; if empty, peer monitoring
-#                       and artifact collection are skipped (node1-only run)
+#                       and artifact collection are skipped (single-node run)
 #   RUSTFS_VOLUMES      informational; recorded in meta.json
 #   DATA_DIRS, PEER_RUSTFS_BIN  used only by deploy.sh / cleanup.sh
 #   LOADGEN_ENDPOINT (optional), LOADGEN_HOST (optional)
@@ -83,11 +86,21 @@ if [[ -z "$OUT" ]]; then
 fi
 mkdir -p "$OUT"
 
+# Short hostname for local telemetry dir $OUT/node-<host>/ and meta orchestrator_host.
+# Override with PERF_ORCHESTRATOR_HOST when hostname -s is wrong (e.g. some containers).
+ORCH_HOST="${PERF_ORCHESTRATOR_HOST:-}"
+if [[ -z "$ORCH_HOST" ]]; then
+    ORCH_HOST="$(hostname -s 2>/dev/null || true)"
+fi
+[[ -n "$ORCH_HOST" ]] || ORCH_HOST="${HOSTNAME%%.*}"
+[[ -n "$ORCH_HOST" ]] || ORCH_HOST="localhost"
+
 # Redirect all subsequent log output to run.log (tee keeps it on stdout too)
 exec > >(tee -a "$OUT/run.log") 2>&1
 
 log "=== run-perf-test.sh start ==="
 log "duration=${DURATION} out=${OUT}"
+log "orchestrator_host=${ORCH_HOST} (set PERF_ORCHESTRATOR_HOST to override)"
 log "no_deploy=${NO_DEPLOY} force_cleanup=${FORCE_CLEANUP} trace=${TRACE}"
 
 # ---------------------------------------------------------------------------
@@ -123,6 +136,21 @@ export RUST_LOG
 export RUSTFS_BINARY
 export DURATION
 export OUT
+export ORCH_HOST
+
+# True when PEER_NODES entry points at the same machine as this script (e.g. DNS rustfsnode1
+# vs hostname -s XR5-U09). Compares ORCH_HOST to ssh hostname -s on the peer.
+_peer_is_orchestrator() {
+    local node="$1"
+    local node_host="${node##*@}"
+    if [[ "$node_host" == "$ORCH_HOST" ]]; then
+        return 0
+    fi
+    local rh
+    rh="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$node" "hostname -s 2>/dev/null || hostname | cut -d. -f1" 2>/dev/null || true)"
+    rh="${rh//$'\r'/}"
+    [[ -n "$rh" && "$rh" == "$ORCH_HOST" ]]
+}
 
 # ---------------------------------------------------------------------------
 # Track monitor PIDs for the EXIT trap
@@ -167,16 +195,24 @@ collect_peer_artifacts() {
     log "Collecting artifacts from peer nodes..."
     for node in $PEER_NODES; do
         local node_host="${node##*@}"
+        if _peer_is_orchestrator "$node"; then
+            continue
+        fi
         local node_out="$OUT/node-${node_host}"
         local peer_remote="${REMOTE_PEER_OUT[$node]:-}"
         if [[ -z "$peer_remote" ]]; then
             log "  WARNING: no REMOTE_PEER_OUT for $node — skipping scp"
             continue
         fi
-        log "  scp ${node}:${peer_remote}/. → ${node_out}/"
+        log "  pull ${node}:${peer_remote}/ → ${node_out}/ (tar)"
         mkdir -p "$node_out"
-        # Staging dir on peer is owned by the SSH user; flatten into local node-* layout.
-        scp -r -q "${node}:${peer_remote}/." "${node_out}/" || log "  WARNING: scp from $node failed"
+        # Flatten remote dir into local node-* layout. Do not use scp host:dir/. — OpenSSH's
+        # scp (SFTP mode) rejects remote paths ending in /. with "unexpected filename: .".
+        local _pr_q
+        _pr_q="$(printf '%q' "$peer_remote")"
+        if ! ssh "$node" "tar -C ${_pr_q} -cf - ." | tar -xf - -C "$node_out"; then
+            log "  WARNING: artifact pull from $node failed"
+        fi
     done
 }
 
@@ -233,6 +269,7 @@ meta = {
     "duration": "$DURATION",
     "trace": $( $TRACE && echo True || echo False ),
     "utc": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+    "orchestrator_host": "${ORCH_HOST}",
     "peer_nodes": "${PEER_NODES:-}".split(),
     "nic_interfaces": "$NIC_INTERFACES".split() if "$NIC_INTERFACES" else [],
 }
@@ -247,18 +284,19 @@ EOF
 
 log "--- Step 3: start monitors ---"
 
-# Assign NODE_IDs: node1 (local) = 1, peers in PEER_NODES order = 2, 3, ...
-NODE_ID=1
-mkdir -p "$OUT/node1"
-
-# PEER_SPEC: tcp-socket tracking target for node1's ss snapshots.
-# Empty when PEER_NODES is not set (node1-only run).
+# PEER_SPEC: tcp-socket tracking target for the first peer's ss snapshots on the orchestrator.
+# Empty when PEER_NODES is not set (single-node run).
 LOCAL_PEER_SPEC="${PEER_NODES:+${PEER_NODES%% *}:9000}"
 
-NODE_ID=1 OUT="$OUT/node1" PEER_SPEC="${LOCAL_PEER_SPEC}" \
-    bash "$LIB/monitor.sh" >> "$OUT/node1/monitor-node1.log" 2>&1 &
+# Local monitor: NODE_ID=1 filenames (mpstat-node1.txt, …); directory is node-<hostname>
+# (hostname -s on the orchestrator).
+LOCAL_NODE_DIR="$OUT/node-${ORCH_HOST}"
+NODE_ID=1
+mkdir -p "$LOCAL_NODE_DIR"
+NODE_ID=1 OUT="$LOCAL_NODE_DIR" PEER_SPEC="${LOCAL_PEER_SPEC}" \
+    bash "$LIB/monitor.sh" >> "$LOCAL_NODE_DIR/monitor-node1.log" 2>&1 &
 LOCAL_MONITOR_PID=$!
-log "Local monitor started (pid=${LOCAL_MONITOR_PID})"
+log "Local monitor started (pid=${LOCAL_MONITOR_PID}) → ${LOCAL_NODE_DIR##*/}"
 
 if [[ -n "${PEER_NODES:-}" ]]; then
     PEER_NODE_ID=2
@@ -266,6 +304,14 @@ if [[ -n "${PEER_NODES:-}" ]]; then
     for node in $PEER_NODES; do
         # Strip optional user prefix (e.g. "ba@node2" → "node2") for directory and file names.
         node_host="${node##*@}"
+        if _peer_is_orchestrator "$node"; then
+            if [[ "$node_host" == "$ORCH_HOST" ]]; then
+                log "Skipping peer monitor on $node (same hostname token as orchestrator ${ORCH_HOST})"
+            else
+                log "Skipping peer monitor on $node (SSH hostname -s matches orchestrator ${ORCH_HOST}; peer name is ${node_host})"
+            fi
+            continue
+        fi
         # Writable on the peer as the SSH user — do not nest under orchestrator $OUT on the
         # peer (same path may exist with different owner: NFS /tmp, different login, etc.).
         peer_out_remote="/tmp/rustfsperf-${node_host}-${_out_tag}-$$"
