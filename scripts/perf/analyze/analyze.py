@@ -7,7 +7,7 @@ Usage:
 
 Inputs read from --out DIR:
     loadgen.txt             per-minute PUT stats from the load generator
-    node-<host>/mpstat-node1.txt  orchestrator telemetry (NODE_ID=1 filenames; host from meta)
+    node-<host>/mpstat-node1.txt  orchestrator telemetry (NODE_ID=1 filenames; label from meta)
     node-<host>/sar-net-node1.txt — canonical SAR window when meta orchestrator_host matches
     Legacy layout node1/ is still accepted. Peers: node-<host>/ with mpstat-node2.txt, …
     node-*/sar-net-nodeN.txt (N = NODE_ID from monitor.sh)
