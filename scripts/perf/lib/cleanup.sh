@@ -20,7 +20,8 @@
 # Required env (sourced from conf/paths.env by the caller):
 #   PEER_NODES    space-separated peer hostnames
 #   DATA_DIRS     space-separated data directories on every node
-#   LOADGEN_CFG   path to the loadgen JSON config file (to read Bucket prefix)
+#   LOADGEN_CFG   path to the loadgen JSON config (to read Bucket prefix). When
+#                 LOADGEN_HOST is set, this path is on the loadgen host; otherwise local.
 #   LOADGEN_HOST  SSH target for loadgen machine; empty = local
 
 set -euo pipefail
@@ -38,14 +39,30 @@ die()  { echo "[cleanup] ERROR: $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # The loadgen names buckets as: <Bucket>-<testNum>-<1..N>
 # We match <Bucket>-* to catch all runs regardless of test number.
+#
+# LOADGEN_CFG is interpreted like loadgen-run.sh: a path on LOADGEN_HOST when
+# remote; a local path when LOADGEN_HOST is empty.
 
-[[ -f "$LOADGEN_CFG" ]] || die "LOADGEN_CFG not found: $LOADGEN_CFG"
-
-BUCKET_PREFIX="$(python3 -c "
+if [[ -n "${LOADGEN_HOST:-}" ]]; then
+    log "Reading Bucket prefix from ${LOADGEN_CFG} on ${LOADGEN_HOST}..."
+    _cfg_q="$(printf '%q' "$LOADGEN_CFG")"
+    if ! ssh "$LOADGEN_HOST" "test -f ${_cfg_q}"; then
+        die "LOADGEN_CFG not found on ${LOADGEN_HOST}: $LOADGEN_CFG"
+    fi
+    BUCKET_PREFIX="$(
+        ssh "$LOADGEN_HOST" "cat -- ${_cfg_q}" | python3 -c "
+import json, sys
+print(json.load(sys.stdin)['Bucket'])
+"
+    )" || die "Failed to read Bucket from remote ${LOADGEN_HOST}:$LOADGEN_CFG"
+else
+    [[ -f "$LOADGEN_CFG" ]] || die "LOADGEN_CFG not found: $LOADGEN_CFG"
+    BUCKET_PREFIX="$(python3 -c "
 import json, sys
 with open(sys.argv[1]) as f:
     print(json.load(f)['Bucket'])
 " "$LOADGEN_CFG")"
+fi
 
 [[ -n "$BUCKET_PREFIX" ]] || die "Could not read Bucket field from $LOADGEN_CFG"
 log "Bucket prefix: '${BUCKET_PREFIX}' (will remove '${BUCKET_PREFIX}-*' in each data dir)"
@@ -55,10 +72,13 @@ log "Bucket prefix: '${BUCKET_PREFIX}' (will remove '${BUCKET_PREFIX}-*' in each
 # ---------------------------------------------------------------------------
 
 log "Killing load generator..."
+# Pattern must not match this pkill command line (see ssh … "pkill -f …"), or pkill can
+# terminate its own remote shell and ssh exits 255. Bracket trick: only real binary paths
+# match, not the literal substring in argv.
 if [[ -n "${LOADGEN_HOST:-}" ]]; then
-    ssh "$LOADGEN_HOST" "pkill -f load-generator || true"
+    ssh "$LOADGEN_HOST" "pkill -f '[l]oad-generator' || true"
 else
-    pkill -f load-generator || true
+    pkill -f '[l]oad-generator' || true
 fi
 log "Load generator stopped"
 
