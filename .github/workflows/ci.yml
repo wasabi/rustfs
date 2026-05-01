@@ -53,6 +53,10 @@ on:
       - ".github/workflows/docker.yml"
       - ".github/workflows/audit.yml"
       - ".github/workflows/performance.yml"
+  # Merge queue runs on a synthetic merge commit; required checks must trigger here.
+  # Do not add branches/paths filters — GitHub ignores path filters for merge_group and
+  # branch filters prevent the workflow from running in the queue.
+  merge_group:
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
