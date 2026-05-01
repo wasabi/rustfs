@@ -1,8 +1,8 @@
 # Performance findings summary
 
 This doc distills the key conclusions from the two-node EC:1 PUT performance investigation
-(Apr 2026). It is the primary context document for the `perf-interpret` Skill and for
-anyone interpreting a perf report without having read the full investigation archive.
+(Apr 2026). Use it as primary context when interpreting a perf report without having read the
+full investigation archive.
 
 For deep context, code maps, and raw traces, see the RustFS performance investigation
 archive (available separately).
