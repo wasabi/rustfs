@@ -18,7 +18,7 @@
 # terminate loadgen early and skip the slower loadgen DELETE phase — same rm/restart logic.
 #
 # Required env (sourced from conf/paths.env by the caller):
-#   PEER_NODES    space-separated peer hostnames
+#   PEER_NODES    space-separated peer hostnames (optional; empty = single-node, local only)
 #   DATA_DIRS     space-separated data directories on every node
 #   LOADGEN_CFG   path to the loadgen JSON config (to read Bucket prefix). When
 #                 LOADGEN_HOST is set, this path is on the loadgen host; otherwise local.
@@ -29,10 +29,11 @@ set -euo pipefail
 log()  { printf '%s\n' "[cleanup] $(date -u '+%H:%M:%S') $*"; }
 die()  { echo "[cleanup] ERROR: $*" >&2; exit 1; }
 
-# Validate required vars before touching anything
-: "${PEER_NODES?PEER_NODES must be set (source conf/paths.env)}"
+# Validate required vars before touching anything (PEER_NODES may be unset for single-node)
 : "${DATA_DIRS?DATA_DIRS must be set (source conf/paths.env)}"
 : "${LOADGEN_CFG?LOADGEN_CFG must be set (source conf/paths.env)}"
+
+PEER_NODES="${PEER_NODES:-}"
 
 # ---------------------------------------------------------------------------
 # Derive bucket prefix from the loadgen config file
