@@ -93,7 +93,9 @@ the file exists).
 | `PERF_ORCHESTRATOR_MACHINE` | (Optional) Override the physical short hostname used only for same-host dedupe (`ssh` `hostname -s` on peers). Defaults to `hostname -s` on the orchestrator. |
 | `RUSTFS_VOLUMES` | Full volumes string for deploy template |
 | `DATA_DIRS` | Data dirs for `cleanup.sh` |
-| `LOADGEN_BIN`, `LOADGEN_CFG` | Load generator binary and config — if `LOADGEN_HOST` is set, both paths are on that host (including for `cleanup.sh` / `--force-cleanup`) |
+| `PEER_RUSTFS_BIN` | Path to the installed `rustfs` binary on **every** node (default in examples: `/usr/local/bin/rustfs`). Required by `deploy.sh` (`set -u`). |
+| `LOADGEN_BIN`, `LOADGEN_CFG` | Load generator binary and config — if `LOADGEN_HOST` is set, both paths are on that host (including for `cleanup.sh` / `--force-cleanup`). **S3 URL:** set `Server` inside `LOADGEN_CFG`; the harness does not override it from env. |
+| `LOADGEN_ENDPOINT` | Optional documentation only — **not** passed to the loadgen by `loadgen-run.sh`. Keep it aligned with the `Server` field in `LOADGEN_CFG` for your own reference. |
 | `NIC_INTERFACES` | For SAR / ethtool (see [lab-setup.md](lab-setup.md)) |
 | `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` | Lab credentials (used by deploy). Use `export` in `paths.env` so standalone `bash deploy.sh` sees them; `run-perf-test.sh` exports them when sourced. |
 

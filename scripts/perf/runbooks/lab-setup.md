@@ -74,8 +74,9 @@ two-node investigation):
 -deleteOnlyOurBuckets
 ```
 
-Server: `$LOADGEN_ENDPOINT` (default `http://127.0.0.1:9000`).
-Config file: `$LOADGEN_CFG` (your `local.cfg`).
+Server URL: the **`Server`** field inside your loadgen JSON (`LOADGEN_CFG`). The perf harness does **not** apply `LOADGEN_ENDPOINT` from `paths.env` to the binary (there is no CLI override); use `LOADGEN_ENDPOINT` only as an optional note aligned with `Server` if you like.
+
+Config file: `$LOADGEN_CFG` (e.g. `local.cfg`).
 
 ---
 
