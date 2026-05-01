@@ -95,7 +95,7 @@ the file exists).
 | `DATA_DIRS` | Data dirs for `cleanup.sh` |
 | `LOADGEN_BIN`, `LOADGEN_CFG` | Load generator binary and config — if `LOADGEN_HOST` is set, both paths are on that host (including for `cleanup.sh` / `--force-cleanup`) |
 | `NIC_INTERFACES` | For SAR / ethtool (see [lab-setup.md](lab-setup.md)) |
-| `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` | Lab credentials (used by deploy) |
+| `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` | Lab credentials (used by deploy). Use `export` in `paths.env` so standalone `bash deploy.sh` sees them; `run-perf-test.sh` exports them when sourced. |
 
 Optional: `LOADGEN_HOST` (SSH for remote loadgen), `RUSTFS_OBS_LOG_DIRECTORY` (same as the
 server env var; defaults under `/var/logs/rustfs` for `--trace`). Legacy: `RUSTFS_OBS_LOG_DIR`.

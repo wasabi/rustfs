@@ -158,6 +158,8 @@ fi
 # ---------------------------------------------------------------------------
 
 export PEER_NODES RUSTFS_VOLUMES PEER_RUSTFS_BIN DATA_DIRS
+# Required by deploy.sh subprocess (sourced paths.env assignments are not exported by default).
+export RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY
 export LOADGEN_BIN LOADGEN_CFG LOADGEN_ENDPOINT LOADGEN_HOST
 export LOADGEN_HOST NIC_INTERFACES
 export RUST_LOG
