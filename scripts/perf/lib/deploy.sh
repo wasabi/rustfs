@@ -4,9 +4,10 @@
 # Called by run-perf-test.sh unless --no-deploy is passed.
 #
 # Required env (sourced from conf/paths.env by the caller):
-#   PEER_NODES          space-separated peer hostnames
+#   PEER_NODES          space-separated peer hostnames (may be empty for single-node)
 #   PEER_RUSTFS_BIN     path to rustfs binary on peer nodes (e.g. /usr/local/bin/rustfs)
 #   RUSTFS_VOLUMES      full volumes string for this topology
+#   RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY — substituted into rustfs.env.template (no secrets in repo)
 #
 # Required env (set by run-perf-test.sh from flags / caller environment):
 #   RUST_LOG            error (normal) or debug recipe (--trace mode)
@@ -21,6 +22,8 @@
 # Output: logs to stdout (captured into run.log by the caller).
 
 set -euo pipefail
+
+PEER_NODES="${PEER_NODES:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PERF_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -102,6 +105,9 @@ fi
 
 [[ -f "$RUSTFS_BINARY" ]] || die "Binary not found: $RUSTFS_BINARY"
 
+: "${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY must be set (source conf/paths.env)}"
+: "${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY must be set (source conf/paths.env)}"
+
 # ---------------------------------------------------------------------------
 # 2. SHIP BINARY TO PEERS
 # ---------------------------------------------------------------------------
@@ -131,6 +137,8 @@ expand_template() {
     sed \
         -e "s|@@RUSTFS_VOLUMES@@|${RUSTFS_VOLUMES}|g" \
         -e "s|@@RUST_LOG@@|${RUST_LOG}|g" \
+        -e "s|@@RUSTFS_ACCESS_KEY@@|${RUSTFS_ACCESS_KEY}|g" \
+        -e "s|@@RUSTFS_SECRET_KEY@@|${RUSTFS_SECRET_KEY}|g" \
         "$CONF_TEMPLATE"
 }
 

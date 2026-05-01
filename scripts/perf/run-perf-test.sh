@@ -37,7 +37,8 @@
 #   DATA_DIRS, PEER_RUSTFS_BIN  used only by deploy.sh / cleanup.sh
 #   LOADGEN_ENDPOINT (optional), LOADGEN_HOST (optional)
 #   NIC_INTERFACES (optional, for ethtool snapshots)
-#   RUSTFS_OBS_LOG_DIR (optional, default /var/logs/rustfs — used by --trace)
+#   RUSTFS_OBS_LOG_DIRECTORY (optional, default /var/logs/rustfs — must match server;
+#                             legacy alias RUSTFS_OBS_LOG_DIR still accepted)
 #   PUT_PHASE_DRAIN_SECS (optional) extra seconds after loadgen.txt has summary + interval
 #                       rows before stopping monitors / killing loadgen; default 0 (often not needed)
 
@@ -462,11 +463,21 @@ if $TRACE; then
     log "--- Step 7: collect trace logs ---"
     TRACE_OUT="$OUT/trace"
     mkdir -p "$TRACE_OUT"
-    OBS_DIR="${RUSTFS_OBS_LOG_DIR:-/var/logs/rustfs}"
-    # Copy the most recent JSONL log (written during this run)
-    LATEST_LOG=$(ssh "127.0.0.1" "ls -t '${OBS_DIR}'/*.log 2>/dev/null | head -1" || true)
+    OBS_DIR="${RUSTFS_OBS_LOG_DIRECTORY:-${RUSTFS_OBS_LOG_DIR:-/var/logs/rustfs}}"
+    # Copy the most recent JSONL log locally (no ssh to localhost — avoids requiring sshd).
+    LATEST_LOG=""
+    if latest="$(ls -t "${OBS_DIR}"/*.log 2>/dev/null | head -1)" && [[ -n "$latest" ]]; then
+        LATEST_LOG="$latest"
+    elif latest="$(sudo ls -t "${OBS_DIR}"/*.log 2>/dev/null | head -1)" && [[ -n "$latest" ]]; then
+        LATEST_LOG="$latest"
+    fi
     if [[ -n "$LATEST_LOG" ]]; then
-        scp -q "127.0.0.1:${LATEST_LOG}" "$TRACE_OUT/node1-rustfs.log"
+        if [[ -r "$LATEST_LOG" ]]; then
+            cp -p "$LATEST_LOG" "$TRACE_OUT/node1-rustfs.log"
+        else
+            sudo cp -p "$LATEST_LOG" "$TRACE_OUT/node1-rustfs.log"
+            sudo chown "$(id -u):$(id -g)" "$TRACE_OUT/node1-rustfs.log" 2>/dev/null || true
+        fi
         log "Trace log collected: $TRACE_OUT/node1-rustfs.log"
         # Run timing analysis
         python3 "$SCRIPT_DIR/analyze/obs_timing_from_jsonl.py" \

@@ -3,7 +3,7 @@
 
 Reads template expanded text from stdin.
 
-Optional second CLI arg: path to a file holding the existing env file contents.
+Optional first CLI argument: path to a file holding the existing env file contents.
 If omitted or file unreadable / empty: output is template only.
 
 Rules:

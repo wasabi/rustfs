@@ -97,8 +97,8 @@ the file exists).
 | `NIC_INTERFACES` | For SAR / ethtool (see [lab-setup.md](lab-setup.md)) |
 | `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` | Lab credentials (used by deploy) |
 
-Optional: `LOADGEN_HOST` (SSH for remote loadgen), `RUSTFS_OBS_LOG_DIR` (defaults under
-`/var/logs/rustfs` for `--trace`).
+Optional: `LOADGEN_HOST` (SSH for remote loadgen), `RUSTFS_OBS_LOG_DIRECTORY` (same as the
+server env var; defaults under `/var/logs/rustfs` for `--trace`). Legacy: `RUSTFS_OBS_LOG_DIR`.
 
 ---
 
@@ -226,7 +226,7 @@ matching topology entry in `baseline.json` and prints a diff. Review before comm
 ## Tracing mode (`--trace`)
 
 Adds verbose `RUST_LOG` for lock/PUT tracing and collects observation JSONL from
-`RUSTFS_OBS_LOG_DIR` (default `/var/logs/rustfs` on node1). After the run, `run-perf-test.sh`
+`RUSTFS_OBS_LOG_DIRECTORY` (default `/var/logs/rustfs` on node1). After the run, `run-perf-test.sh`
 invokes `analyze/obs_timing_from_jsonl.py` to produce:
 
 - `$OUT/trace/timing_flat.csv`

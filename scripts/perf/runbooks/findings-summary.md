@@ -131,5 +131,7 @@ those experiments), matching the locks-off control. The remaining bottleneck at 
 3. **Unique-key workload:** the standard loadgen issues unique keys per PUT. The bimodal
    lock wait pattern is not explained by two concurrent PUTs to the same key — that was
    explicitly verified.
-4. **Three-node baselines:** not yet measured. The two-node numbers above do not apply
-   directly. Seed `benchmarks/baseline.json` after the first three-node run.
+4. **Three-node topology:** The throughput table above is **two-node** EC:1. A `three-node`
+   key in `benchmarks/baseline.json` is seeded from lab smoke for regression gating only —
+   it does not extend the investigation narrative in this doc. Interpret three-node reports
+   against that baseline entry, not against the two-node figures in the table.

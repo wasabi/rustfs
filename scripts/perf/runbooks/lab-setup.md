@@ -39,7 +39,8 @@ Two cluster sizes are supported. Topology is selected via `TOPOLOGY_LABEL` in
 ## RustFS environment (all nodes)
 
 These variables are the same on every node. `deploy.sh` expands
-`conf/rustfs.env.template` with `RUSTFS_VOLUMES` and `RUST_LOG` from the current run.
+`conf/rustfs.env.template` with `RUSTFS_VOLUMES`, `RUST_LOG`, `RUSTFS_ACCESS_KEY`, and
+`RUSTFS_SECRET_KEY` from `conf/paths.env` (or the environment).
 
 ```bash
 RUSTFS_ADDRESS=":9000"
