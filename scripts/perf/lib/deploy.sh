@@ -7,7 +7,8 @@
 #   PEER_NODES          space-separated peer hostnames (may be empty for single-node)
 #   PEER_RUSTFS_BIN     path to rustfs binary on peer nodes (e.g. /usr/local/bin/rustfs)
 #   RUSTFS_VOLUMES      full volumes string for this topology
-#   RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY — substituted into rustfs.env.template (no secrets in repo)
+#   RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY — substituted into rustfs.env.template (no secrets in repo).
+#     Must be exported if you only `source conf/paths.env` — plain assignment is invisible to this subprocess.
 #
 # Required env (set by run-perf-test.sh from flags / caller environment):
 #   RUST_LOG            error (normal) or debug recipe (--trace mode)
