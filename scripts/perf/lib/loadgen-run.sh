@@ -13,8 +13,10 @@
 # Required env (sourced from conf/paths.env by the caller):
 #   LOADGEN_BIN       path to the load-generator binary
 #   LOADGEN_CFG       path to the loadgen JSON config file (Server, Access, Secret, Bucket)
-#   LOADGEN_ENDPOINT  S3 endpoint URL (overrides Server in cfg when set)
 #   LOADGEN_HOST      SSH target to run loadgen remotely; empty = run locally
+#
+# Optional (documentation only — not read by this script):
+#   LOADGEN_ENDPOINT  May appear in paths.env for operator notes; S3 URL must be set as Server in LOADGEN_CFG.
 
 set -euo pipefail
 
