@@ -33,6 +33,7 @@ use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{acl, restore, select};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::*;
+use crate::trace::put_phase_span;
 use bytes::Bytes;
 use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
@@ -130,7 +131,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{Instrument, debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 struct DeadlockRequestGuard {
@@ -1959,7 +1960,10 @@ impl DefaultObjectUsecase {
             part_nonce: None,
         };
 
-        let encryption_material = match sse_encryption(encryption_request).await {
+        let encryption_material = match sse_encryption(encryption_request)
+            .instrument(put_phase_span("put_object.sse_encryption", &bucket, &key))
+            .await
+        {
             Ok(material) => material,
             Err(err) => {
                 let result = Err(err.into());
@@ -2002,6 +2006,7 @@ impl DefaultObjectUsecase {
 
         let obj_info = match store
             .put_object(&bucket, &key, &mut reader, &opts)
+            .instrument(put_phase_span("put_object.ecstore_put_object", &bucket, &key))
             .await
             .map_err(ApiError::from)
         {

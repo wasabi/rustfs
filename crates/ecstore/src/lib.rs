@@ -33,6 +33,7 @@ pub mod global;
 pub mod metrics_realtime;
 pub mod notification_sys;
 pub mod pools;
+pub(crate) mod put_trace;
 pub mod rebalance;
 pub mod rpc;
 pub mod set_disk;

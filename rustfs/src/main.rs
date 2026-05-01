@@ -26,6 +26,7 @@ mod profiling;
 mod protocols;
 mod server;
 mod storage;
+mod trace;
 mod update;
 mod version;
 

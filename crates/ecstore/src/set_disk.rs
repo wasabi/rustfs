@@ -33,6 +33,7 @@ use crate::erasure_coding::bitrot_verify;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
+use crate::put_trace;
 use crate::store_api::ListObjectVersionsInfo;
 use crate::store_api::{ListPartsInfo, ObjectOptions, ObjectToDelete};
 use crate::store_api::{ObjectInfoOrErr, WalkOptions};
@@ -120,7 +121,7 @@ use tokio::{
     time::{interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, debug_span, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
@@ -727,17 +728,15 @@ impl ObjectIO for SetDisks {
                     async {
                         let ns_lock = self
                             .new_ns_lock(bucket, object)
-                            .instrument(debug_span!(
-                                target: "rustfs_put_trace",
-                                "put_object.preconditions_new_ns_lock"
-                            ))
+                            .instrument(put_trace::span_put_phase("put_object.preconditions_new_ns_lock", bucket, object))
                             .await?;
                         ns_lock
                             .get_write_lock_with_metadata(get_lock_acquire_timeout(), pre_lock_meta)
-                            .instrument(debug_span!(
-                                target: "rustfs_put_trace",
+                            .instrument(put_trace::span_put_phase_trace(
                                 "put_object.preconditions_get_write_lock",
-                                trace_id = %pre_trace_id,
+                                bucket,
+                                object,
+                                pre_trace_id.as_str(),
                             ))
                             .await
                             .map_err(|e| {
@@ -857,10 +856,7 @@ impl ObjectIO for SetDisks {
             }
             (writers, errors)
         }
-        .instrument(debug_span!(
-            target: "rustfs_put_trace",
-            "put_object.init_bitrot_writers"
-        ))
+        .instrument(put_trace::span_put_phase("put_object.init_bitrot_writers", bucket, object))
         .await;
 
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
@@ -880,10 +876,7 @@ impl ObjectIO for SetDisks {
 
         let (reader, w_size) = match Arc::new(erasure)
             .encode(stream, &mut writers, write_quorum)
-            .instrument(debug_span!(
-                target: "rustfs_put_trace",
-                "put_object.erasure_encode"
-            ))
+            .instrument(put_trace::span_put_phase("put_object.erasure_encode", bucket, object))
             .await
         {
             Ok((r, w)) => (r, w),
@@ -894,11 +887,7 @@ impl ObjectIO for SetDisks {
         }; // TODO: delete temporary directory on error
 
         {
-            let _finalize = debug_span!(
-                target: "rustfs_put_trace",
-                "put_object.finalize_metadata"
-            )
-            .entered();
+            let _finalize = put_trace::span_put_phase("put_object.finalize_metadata", bucket, object).entered();
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
             //     error!("close_bitrot_writers err {:?}", err);
@@ -988,21 +977,15 @@ impl ObjectIO for SetDisks {
                 async {
                     let ns_lock = self
                         .new_ns_lock(bucket, object)
-                        .instrument(debug_span!(
-                            target: "rustfs_put_trace",
-                            "put_object.post_encode_new_ns_lock",
-                            bucket = %bucket,
-                            object = %object,
-                        ))
+                        .instrument(put_trace::span_put_phase("put_object.post_encode_new_ns_lock", bucket, object))
                         .await?;
                     ns_lock
                         .get_write_lock_with_metadata(get_lock_acquire_timeout(), post_lock_meta)
-                        .instrument(debug_span!(
-                            target: "rustfs_put_trace",
+                        .instrument(put_trace::span_put_phase_trace(
                             "put_object.post_encode_get_write_lock",
-                            bucket = %bucket,
-                            object = %object,
-                            trace_id = %post_trace_id,
+                            bucket,
+                            object,
+                            post_trace_id.as_str(),
                         ))
                         .await
                         .map_err(|e| {
@@ -1022,12 +1005,7 @@ impl ObjectIO for SetDisks {
             probe_opts.existing_object_lock_inline_check = false; // avoid recursion
             match self
                 .get_object_info(bucket, object, &probe_opts)
-                .instrument(debug_span!(
-                    target: "rustfs_put_trace",
-                    "put_object.existing_object_lock_inline_check",
-                    bucket = %bucket,
-                    object = %object,
-                ))
+                .instrument(put_trace::span_put_phase("put_object.existing_object_lock_inline_check", bucket, object))
                 .await
             {
                 Ok(existing) => check_existing_object_lock_for_write(&existing)?,

@@ -24,6 +24,9 @@ pub const ENV_OBS_METRIC_ENDPOINT: &str = "RUSTFS_OBS_METRIC_ENDPOINT";
 pub const ENV_OBS_LOG_ENDPOINT: &str = "RUSTFS_OBS_LOG_ENDPOINT";
 pub const ENV_OBS_PROFILING_ENDPOINT: &str = "RUSTFS_OBS_PROFILING_ENDPOINT";
 pub const ENV_OBS_USE_STDOUT: &str = "RUSTFS_OBS_USE_STDOUT";
+/// When `true`, emit detailed `tracing` spans for S3 handler duration (`s3.handling`) and PUT breakdown (`rustfs_put_trace`).
+/// Default: unset / false. Independent of OTLP export (`RUSTFS_OBS_*`).
+pub const ENV_TRACE_S3_HANDLING_ENABLED: &str = "RUSTFS_TRACE_S3_HANDLING_ENABLED";
 pub const ENV_OBS_SAMPLE_RATIO: &str = "RUSTFS_OBS_SAMPLE_RATIO";
 pub const ENV_OBS_METER_INTERVAL: &str = "RUSTFS_OBS_METER_INTERVAL";
 pub const ENV_OBS_SERVICE_NAME: &str = "RUSTFS_OBS_SERVICE_NAME";
@@ -110,6 +113,7 @@ mod tests {
         assert_eq!(ENV_OBS_LOG_ENDPOINT, "RUSTFS_OBS_LOG_ENDPOINT");
         assert_eq!(ENV_OBS_PROFILING_ENDPOINT, "RUSTFS_OBS_PROFILING_ENDPOINT");
         assert_eq!(ENV_OBS_USE_STDOUT, "RUSTFS_OBS_USE_STDOUT");
+        assert_eq!(ENV_TRACE_S3_HANDLING_ENABLED, "RUSTFS_TRACE_S3_HANDLING_ENABLED");
         assert_eq!(ENV_OBS_SAMPLE_RATIO, "RUSTFS_OBS_SAMPLE_RATIO");
         assert_eq!(ENV_OBS_METER_INTERVAL, "RUSTFS_OBS_METER_INTERVAL");
         assert_eq!(ENV_OBS_SERVICE_NAME, "RUSTFS_OBS_SERVICE_NAME");
