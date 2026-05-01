@@ -104,7 +104,7 @@ Optional: `LOADGEN_HOST` (SSH for remote loadgen), `RUSTFS_OBS_LOG_DIR` (default
 
 ## Register a self-hosted GitHub Actions runner (node1)
 
-Used when **Phase 6** (`lab-perf.yml`) runs against the lab. Adjust paths to your install location.
+Used when **Phase 5** CI (`lab-perf.yml`) runs against the lab. Adjust paths to your install location.
 
 1. On **node1**, download the Actions runner package for your OS/arch from GitHub’s runner
    releases page (same major version as your organization’s supported runners).
