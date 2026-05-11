@@ -1247,6 +1247,7 @@ mod tests {
             dst_volume: "dst-volume".to_string(),
             dst_path: "dst-path".to_string(),
             file_info: "{}".to_string(),
+            file_info_bin: vec![],
         });
 
         let response = service.rename_data(request).await;
@@ -1268,6 +1269,7 @@ mod tests {
             dst_volume: "dst-volume".to_string(),
             dst_path: "dst-path".to_string(),
             file_info: "invalid json".to_string(),
+            file_info_bin: vec![],
         });
 
         let response = service.rename_data(request).await;
