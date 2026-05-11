@@ -343,12 +343,20 @@ pub struct RenameDataRequest {
     pub src_volume: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub src_path: ::prost::alloc::string::String,
+    /// JSON-serialized FileInfo. When file_info_bin is non-empty this field has
+    /// FileInfo.data set to null to avoid double-transmitting inline shard bytes.
     #[prost(string, tag = "4")]
     pub file_info: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub dst_volume: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub dst_path: ::prost::alloc::string::String,
+    /// msgpack-encoded FileInfo; preferred over file_info when non-empty.
+    /// REQUIRES_COORDINATED_DEPLOY: old servers that ignore this field will
+    /// deserialize file_info (data=null) and silently write inline objects with
+    /// no shard content. All nodes must upgrade simultaneously.
+    #[prost(bytes = "vec", tag = "7")]
+    pub file_info_bin: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RenameDataResponse {

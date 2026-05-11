@@ -934,7 +934,14 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let file_info = serde_json::to_string(&fi)?;
+                // REQUIRES_COORDINATED_DEPLOY: file_info.data is stripped from the
+                // JSON fallback so old servers that ignore file_info_bin will deserialize
+                // a FileInfo with data=null and silently write inline objects with no
+                // shard content. All nodes must be upgraded simultaneously.
+                let file_info_bin = encode_msgpack(&fi)?;
+                let mut fi_json = fi.clone();
+                fi_json.data = None;
+                let file_info = serde_json::to_string(&fi_json)?;
                 let mut client = self
                     .get_client()
                     .await
@@ -944,6 +951,7 @@ impl DiskAPI for RemoteDisk {
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
                     file_info,
+                    file_info_bin,
                     dst_volume: dst_volume.to_string(),
                     dst_path: dst_path.to_string(),
                 });

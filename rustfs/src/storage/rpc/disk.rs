@@ -624,7 +624,7 @@ impl NodeService {
     ) -> Result<Response<RenameDataResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
+            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
                 Err(err) => {
                     return Ok(Response::new(RenameDataResponse {
@@ -1010,5 +1010,54 @@ mod tests {
                 count: 7,
             }
         );
+    }
+
+    // Tests for the rename_data msgpack migration.
+    // These verify that handle_rename_data correctly prefers file_info_bin and
+    // falls back to file_info JSON, matching the behaviour of write_metadata /
+    // update_metadata which already use the same decode_msgpack_or_json helper.
+
+    #[test]
+    fn rename_data_decode_prefers_msgpack_over_json() {
+        // Simulate a client that sends both file_info_bin (full, with data) and
+        // file_info JSON (data stripped).  The server must decode from binary.
+        let payload = SamplePayload {
+            name: "inline_shard".to_string(),
+            count: 42,
+        };
+
+        let binary = encode_msgpack(&payload, "SamplePayload").unwrap();
+        // JSON has a different "count" to prove the binary path was taken.
+        let stale_json = r#"{"name":"inline_shard","count":0}"#;
+
+        let decoded = decode_msgpack_or_json::<SamplePayload>(&binary, stale_json, "FileInfo").unwrap();
+
+        assert_eq!(decoded, payload, "server should prefer file_info_bin over file_info JSON");
+    }
+
+    #[test]
+    fn rename_data_decode_falls_back_to_json_when_no_binary() {
+        // Simulate an old client that only sends file_info JSON (no binary).
+        // The server must fall back to JSON decoding.
+        let payload = SamplePayload {
+            name: "no_binary".to_string(),
+            count: 7,
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded = decode_msgpack_or_json::<SamplePayload>(&[], &json, "FileInfo").unwrap();
+
+        assert_eq!(decoded, payload, "server should fall back to JSON when file_info_bin is empty");
+    }
+
+    #[test]
+    fn rename_data_decode_rejects_corrupt_binary() {
+        // Corrupt binary must not silently fall through to JSON.
+        let corrupt = vec![0xc1u8, 0x00, 0xff]; // invalid msgpack
+        let json = r#"{"name":"fallback","count":1}"#;
+
+        let result = decode_msgpack_or_json::<SamplePayload>(&corrupt, json, "FileInfo");
+
+        assert!(result.is_err(), "corrupt binary should return an error, not silently use JSON");
     }
 }
