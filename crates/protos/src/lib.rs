@@ -17,7 +17,8 @@ mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_common::{
-    GLOBAL_CONN_MAP, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection, internode_metrics::global_internode_metrics,
+    ConnPoolEntry, GLOBAL_CONN_MAP, GLOBAL_CONN_POOL_SIZE, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection,
+    internode_metrics::global_internode_metrics,
 };
 use std::{
     error::Error,
@@ -61,15 +62,10 @@ const RPC_TIMEOUT_SECS: u64 = 30;
 /// Default value: https://
 const RUSTFS_HTTPS_PREFIX: &str = "https://";
 
-/// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
-///
-/// This function is designed to detect dead peers quickly:
-/// - Fast connection timeout (3s instead of default 30s+)
-/// - Aggressive TCP keepalive (10s)
-/// - HTTP/2 PING every 5s, timeout at 3s
-/// - Overall RPC timeout of 30s (reduced from 60s)
-pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
-    debug!("Creating new gRPC channel to: {}", addr);
+/// Dial a single gRPC channel to `addr` with standard keepalive and TLS settings.
+/// Does not insert into the global cache — use `get_or_create_pool_channel` for that.
+async fn dial_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
+    debug!("Dialing new gRPC channel to: {}", addr);
     let dial_started_at = Instant::now();
 
     let mut connector = Endpoint::from_shared(addr.to_string())?
@@ -136,18 +132,54 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         }
     };
 
-    // Cache the new connection
+    debug!("Successfully dialed gRPC channel to: {}", addr);
+    Ok(channel)
+}
+
+/// Return a channel from the per-peer pool, creating the pool on first use.
+///
+/// Pool size N is determined by `GLOBAL_CONN_POOL_SIZE` (computed from worker thread count,
+/// overridable via `RUSTFS_RPC_CHANNEL_POOL_SIZE`). Channels are selected round-robin per
+/// peer address, distributing stream load across N independent H2 connections.
+///
+/// On eviction (`evict_connection`) the entire pool for the address is dropped; the next call
+/// rebuilds it. If two concurrent callers both find no pool entry, one set of N channels is
+/// kept and the other is dropped (last writer wins — same as the prior single-channel behavior).
+pub async fn get_or_create_pool_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
+    // Fast path: pool already exists.
     {
-        GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel.clone());
+        let map = GLOBAL_CONN_MAP.read().await;
+        if let Some(entry) = map.get(addr) {
+            debug!("Using pooled gRPC channel for: {}", addr);
+            return Ok(entry.next_channel());
+        }
     }
 
-    debug!("Successfully created and cached gRPC channel to: {}", addr);
-    Ok(channel)
+    // Slow path: dial N channels and insert a new pool entry.
+    let pool_size = *GLOBAL_CONN_POOL_SIZE;
+    debug!("Creating gRPC channel pool (size={}) for: {}", pool_size, addr);
+
+    let mut channels = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        channels.push(dial_channel(addr).await?);
+    }
+
+    let mut map = GLOBAL_CONN_MAP.write().await;
+    // If a concurrent caller inserted first, use their pool and drop ours.
+    map.entry(addr.to_string()).or_insert_with(|| ConnPoolEntry::new(channels));
+    Ok(map.get(addr).unwrap().next_channel())
+}
+
+/// Create a new gRPC channel to `addr`, caching it in the global connection pool.
+///
+/// Delegates to `get_or_create_pool_channel`. Kept for backward compatibility.
+pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
+    get_or_create_pool_channel(addr).await
 }
 
 /// Evict a connection from the cache after a failure.
 /// This should be called when an RPC fails to ensure fresh connections are tried.
 pub async fn evict_failed_connection(addr: &str) {
-    warn!("Evicting failed gRPC connection: {}", addr);
+    warn!("Evicting failed gRPC connection pool: {}", addr);
     evict_connection(addr).await;
 }

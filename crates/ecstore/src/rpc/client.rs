@@ -14,8 +14,7 @@
 
 use crate::rpc::{TONIC_RPC_PREFIX, gen_signature_headers};
 use http::Method;
-use rustfs_common::GLOBAL_CONN_MAP;
-use rustfs_protos::{create_new_channel, proto_gen::node_service::node_service_client::NodeServiceClient};
+use rustfs_protos::{get_or_create_pool_channel, proto_gen::node_service::node_service_client::NodeServiceClient};
 use std::error::Error;
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
 use tracing::debug;
@@ -26,20 +25,8 @@ pub async fn node_service_time_out_client(
     addr: &String,
     interceptor: TonicInterceptor,
 ) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>, Box<dyn Error>> {
-    // Try to get cached channel
-    let cached_channel = { GLOBAL_CONN_MAP.read().await.get(addr).cloned() };
-
-    let channel = match cached_channel {
-        Some(channel) => {
-            debug!("Using cached gRPC channel for: {}", addr);
-            channel
-        }
-        None => {
-            // No cached connection, create new one
-            create_new_channel(addr).await?
-        }
-    };
-
+    let channel = get_or_create_pool_channel(addr).await?;
+    debug!("Using pooled gRPC channel for: {}", addr);
     Ok(NodeServiceClient::with_interceptor(channel, interceptor))
 }
 
