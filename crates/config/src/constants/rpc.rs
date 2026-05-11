@@ -12,23 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod app;
-pub(crate) mod body_limits;
-pub(crate) mod capacity;
-pub(crate) mod compress;
-pub(crate) mod console;
-pub(crate) mod env;
-pub(crate) mod heal;
-pub(crate) mod object;
-pub(crate) mod oidc;
-pub(crate) mod profiler;
-pub(crate) mod protocols;
-pub(crate) mod proxy;
-pub(crate) mod quota;
-pub(crate) mod rpc;
-pub(crate) mod runtime;
-pub(crate) mod scanner;
-pub(crate) mod targets;
-pub(crate) mod tls;
-pub(crate) mod workload;
-pub(crate) mod zero_copy;
+/// Environment variable to override the per-peer gRPC channel pool size.
+///
+/// When unset, the pool size is computed from the Tokio worker thread count:
+/// one connection per four worker threads, clamped to `[1, 16]`.
+/// Set to `1` to disable pooling (equivalent to the pre-pool behavior).
+pub const ENV_RPC_CHANNEL_POOL_SIZE: &str = "RUSTFS_RPC_CHANNEL_POOL_SIZE";
+
+/// Maximum number of gRPC channels per peer regardless of thread count or override.
+pub const RPC_MAX_POOL_SIZE: usize = 16;

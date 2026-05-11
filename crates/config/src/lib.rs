@@ -39,6 +39,8 @@ pub use constants::proxy::*;
 #[cfg(feature = "constants")]
 pub use constants::quota::*;
 #[cfg(feature = "constants")]
+pub use constants::rpc::*;
+#[cfg(feature = "constants")]
 pub use constants::runtime::*;
 #[cfg(feature = "constants")]
 pub use constants::scanner::*;
