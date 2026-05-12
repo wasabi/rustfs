@@ -660,7 +660,7 @@ pub struct DiskOption {
     pub health_check: bool,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RenameDataResp {
     pub old_data_dir: Option<Uuid>,
     pub sign: Option<Vec<u8>>,

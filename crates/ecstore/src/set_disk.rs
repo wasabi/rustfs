@@ -106,7 +106,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use time::OffsetDateTime;
@@ -143,6 +143,7 @@ pub fn get_duplex_buffer_size() -> usize {
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 
+mod deferred_cleanup;
 mod heal;
 mod list;
 mod lock;
@@ -151,6 +152,9 @@ mod multipart;
 mod read;
 mod replication;
 mod write;
+
+use deferred_cleanup::{DeferredCleanupEntry, run_deferred_cleanup_gc, write_journal_entries};
+use write::CleanupCtx;
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid
@@ -178,6 +182,26 @@ pub fn is_deadlock_detection_enabled() -> bool {
         rustfs_config::ENV_OBJECT_DEADLOCK_DETECTION_ENABLE,
         rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
     )
+}
+
+/// Controls whether Phase 6 deferred-tmp-cleanup + rename-quorum early-exit is active.
+/// Set `RUSTFS_DEFERRED_TMP_CLEANUP=1` (or `true`) to enable.
+/// Disabled by default — enable explicitly for A/B perf testing.
+fn deferred_tmp_cleanup_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let enabled = match std::env::var("RUSTFS_DEFERRED_TMP_CLEANUP") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        };
+        if enabled {
+            info!(
+                deferred_tmp_cleanup_active = true,
+                "RUSTFS_DEFERRED_TMP_CLEANUP is enabled (deferred cleanup + rename quorum)"
+            );
+        }
+        enabled
+    })
 }
 
 /// Record a lock acquisition for deadlock detection.
@@ -304,7 +328,7 @@ impl SetDisks {
         format: FormatV3,
         lockers: Vec<Arc<dyn LockClient>>,
     ) -> Arc<Self> {
-        Arc::new(SetDisks {
+        let set = Arc::new(SetDisks {
             locker_owner,
             disks,
             set_drive_count,
@@ -316,7 +340,11 @@ impl SetDisks {
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
             lockers,
             local_lock_manager: rustfs_lock::get_global_lock_manager(),
-        })
+        });
+        // Spawn the deferred-cleanup GC loop: replays any orphaned journal entries left by a
+        // crash on startup, then rescans every 5 minutes.
+        tokio::spawn(run_deferred_cleanup_gc((*set).clone()));
+        set
     }
 
     // async fn cached_disk_health(&self, index: usize) -> Option<bool> {
@@ -1036,25 +1064,138 @@ impl ObjectIO for SetDisks {
             }
         }
 
-        let (online_disks, _, op_old_dir) = Self::rename_data(
-            &shuffle_disks,
-            RUSTFS_META_TMP_BUCKET,
-            tmp_dir.as_str(),
-            &parts_metadatas,
-            bucket,
-            object,
-            write_quorum,
-        )
-        .await?;
+        let rename_span = debug_span!(
+            target: "rustfs_put_trace",
+            "put_object.rename_data",
+            bucket = %bucket,
+            object = %object,
+        );
 
-        if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
+        // Use quorum-early-exit when there are enough disks to have at least 2 straggler legs
+        // (n > write_quorum + 1).  At EC:1/N=16 (write_quorum=15) this condition is false, so
+        // we fall back to the full-join path — the journal overhead is not worth it there.
+        let n = shuffle_disks.len();
+        let online_disks = if deferred_tmp_cleanup_enabled() && n > write_quorum + 1 {
+            let (online_disks, _, op_old_dir, mut barrier) = Self::rename_data_with_barrier(
+                &shuffle_disks,
+                RUSTFS_META_TMP_BUCKET,
+                tmp_dir.as_str(),
+                &parts_metadatas,
+                bucket,
+                object,
+                write_quorum,
+            )
+            .instrument(rename_span)
+            .await?;
+
+            if let Some(old_dir) = op_old_dir {
+                // Overwrite: must wait for all legs before deleting old version to avoid a
+                // window where the old data dir is gone but the new xl.meta is not committed
+                // on quorum.
+                let old_dir_str = old_dir.to_string();
+                barrier.wait_all().await?;
+                self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir_str, write_quorum)
+                    .instrument(debug_span!(
+                        target: "rustfs_put_trace",
+                        "put_object.commit_rename_data_dir",
+                        bucket = %bucket,
+                        object = %object,
+                        data_dir = %old_dir_str,
+                    ))
+                    .await?;
+                drop(object_lock_guard);
+                self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir)
+                    .instrument(debug_span!(
+                        target: "rustfs_put_trace",
+                        "put_object.delete_tmp_prefix",
+                        bucket = %bucket,
+                        object = %object,
+                        tmp_dir = %tmp_dir,
+                        tmp_cleanup_mode = "sync_after_commit",
+                    ))
+                    .await?;
+            } else {
+                // New object: write a crash-safe journal entry before returning to client,
+                // then hand off cleanup to the barrier's RAII Drop.
+                let local_disks: Vec<DiskStore> = {
+                    let disks = self.disks.read().await;
+                    disks
+                        .iter()
+                        .filter_map(|d| d.as_ref().filter(|d| d.is_local()).cloned())
+                        .collect()
+                };
+                let journal_id = Uuid::new_v4();
+                let entry = DeferredCleanupEntry {
+                    id: journal_id,
+                    tmp_prefix: tmp_dir.clone(),
+                };
+                if write_journal_entries(&local_disks, &entry).await.is_ok() {
+                    barrier.install_cleanup_ctx(CleanupCtx {
+                        store: self.clone(),
+                        local_disks,
+                        tmp_prefix: tmp_dir.clone(),
+                        journal_id,
+                        set_disk_id: format!("pool_{}_set_{}", self.pool_index, self.set_index),
+                    });
+                    drop(object_lock_guard);
+                    // barrier drops here → spawns run_straggler_cleanup in background
+                } else {
+                    // All local disk journal writes failed — fall back to synchronous cleanup.
+                    drop(object_lock_guard);
+                    barrier.wait_all().await.ok(); // drain stragglers best-effort
+                    self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir)
+                        .instrument(debug_span!(
+                            target: "rustfs_put_trace",
+                            "put_object.delete_tmp_prefix",
+                            bucket = %bucket,
+                            object = %object,
+                            tmp_dir = %tmp_dir,
+                            tmp_cleanup_mode = "sync_journal_fallback",
+                        ))
+                        .await?;
+                }
+            }
+            online_disks
+        } else {
+            // n <= write_quorum + 1: not enough stragglers to justify deferred cleanup.
+            let (online_disks, _, op_old_dir) = Self::rename_data(
+                &shuffle_disks,
+                RUSTFS_META_TMP_BUCKET,
+                tmp_dir.as_str(),
+                &parts_metadatas,
+                bucket,
+                object,
+                write_quorum,
+            )
+            .instrument(rename_span)
+            .await?;
+
+            if let Some(old_dir) = op_old_dir {
+                self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
+                    .instrument(debug_span!(
+                        target: "rustfs_put_trace",
+                        "put_object.commit_rename_data_dir",
+                        bucket = %bucket,
+                        object = %object,
+                    ))
+                    .await?;
+            }
+
+            drop(object_lock_guard);
+
+            self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir)
+                .instrument(debug_span!(
+                    target: "rustfs_put_trace",
+                    "put_object.delete_tmp_prefix",
+                    bucket = %bucket,
+                    object = %object,
+                    tmp_dir = %tmp_dir,
+                    tmp_cleanup_mode = "sync_default",
+                ))
                 .await?;
-        }
 
-        drop(object_lock_guard); // drop object lock guard to release the lock
-
-        self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
+            online_disks
+        };
 
         for (i, op_disk) in online_disks.iter().enumerate() {
             if let Some(disk) = op_disk
