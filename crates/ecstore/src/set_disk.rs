@@ -343,7 +343,9 @@ impl SetDisks {
         });
         // Spawn the deferred-cleanup GC loop: replays any orphaned journal entries left by a
         // crash on startup, then rescans every 5 minutes.
-        tokio::spawn(run_deferred_cleanup_gc((*set).clone()));
+        if deferred_tmp_cleanup_enabled() {
+            tokio::spawn(run_deferred_cleanup_gc((*set).clone()));
+        }
         set
     }
 
@@ -1142,7 +1144,18 @@ impl ObjectIO for SetDisks {
                 } else {
                     // All local disk journal writes failed — fall back to synchronous cleanup.
                     drop(object_lock_guard);
-                    barrier.wait_all().await.ok(); // drain stragglers best-effort
+                    if let Err(e) = barrier.wait_all().await {
+                        warn!(
+                            target: "rustfs_ecstore",
+                            error = ?e,
+                            set_disk_id = %format!("pool_{pool}_set_{set}", pool = self.pool_index, set = self.set_index),
+                            "deferred_cleanup: straggler rename failed in journal-fallback path; triggering heal"
+                        );
+                        let id = format!("pool_{pool}_set_{set}", pool = self.pool_index, set = self.set_index);
+                        tokio::spawn(async move {
+                            let _ = send_heal_disk(id, Some(HealChannelPriority::Normal)).await;
+                        });
+                    }
                     self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir)
                         .instrument(debug_span!(
                             target: "rustfs_put_trace",

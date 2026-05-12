@@ -18,12 +18,8 @@ mod generated;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_common::{
     ConnPoolEntry, GLOBAL_CONN_MAP, GLOBAL_CONN_POOL_SIZE, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection,
-    internode_metrics::global_internode_metrics,
 };
-use std::{
-    error::Error,
-    time::{Duration, Instant},
-};
+use std::{error::Error, time::Duration};
 use tonic::{
     Request, Status,
     service::interceptor::InterceptedService,
@@ -64,10 +60,10 @@ const RUSTFS_HTTPS_PREFIX: &str = "https://";
 
 /// Dial a single gRPC channel to `addr` with standard keepalive and TLS settings.
 /// Does not insert into the global cache — use `get_or_create_pool_channel` for that.
-async fn dial_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
-    debug!("Dialing new gRPC channel to: {}", addr);
-    let dial_started_at = Instant::now();
-
+/// Build a fully-configured `Endpoint` for `addr`, applying TCP/HTTP2 timeouts and TLS
+/// settings from globals. The endpoint can then be connected eagerly (`connect().await`) or
+/// lazily (`connect_lazy()`).
+async fn build_endpoint(addr: &str) -> Result<Endpoint, Box<dyn Error>> {
     let mut connector = Endpoint::from_shared(addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
@@ -121,19 +117,7 @@ async fn dial_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         }
     }
 
-    let channel = match connector.connect().await {
-        Ok(channel) => {
-            global_internode_metrics().record_dial_result(dial_started_at.elapsed(), true);
-            channel
-        }
-        Err(err) => {
-            global_internode_metrics().record_dial_result(dial_started_at.elapsed(), false);
-            return Err(err.into());
-        }
-    };
-
-    debug!("Successfully dialed gRPC channel to: {}", addr);
-    Ok(channel)
+    Ok(connector)
 }
 
 /// Return a channel from the per-peer pool, creating the pool on first use.
@@ -155,14 +139,15 @@ pub async fn get_or_create_pool_channel(addr: &str) -> Result<Channel, Box<dyn E
         }
     }
 
-    // Slow path: dial N channels and insert a new pool entry.
+    // Slow path: build one endpoint (reads TLS config once), then create N lazy channels.
+    // connect_lazy() returns immediately and each channel establishes its TCP/TLS connection
+    // on first use — all N connections start concurrently when the first RPCs are dispatched,
+    // avoiding the N×timeout latency of sequential eager dialing.
     let pool_size = *GLOBAL_CONN_POOL_SIZE;
     debug!("Creating gRPC channel pool (size={}) for: {}", pool_size, addr);
 
-    let mut channels = Vec::with_capacity(pool_size);
-    for _ in 0..pool_size {
-        channels.push(dial_channel(addr).await?);
-    }
+    let endpoint = build_endpoint(addr).await?;
+    let channels: Vec<Channel> = (0..pool_size).map(|_| endpoint.connect_lazy()).collect();
 
     let mut map = GLOBAL_CONN_MAP.write().await;
     // If a concurrent caller inserted first, use their pool and drop ours.
