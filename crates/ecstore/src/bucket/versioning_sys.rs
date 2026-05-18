@@ -76,12 +76,12 @@ impl BucketVersioningSys {
         }
 
         let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
-        // Read lock is correct: get_versioning_config performs no mutation.
-        // All 21 other getter functions in metadata_sys.rs use read lock for the same
-        // call chain. Write lock is required only for set_bucket_metadata, update, and
-        // delete, which are genuine mutations.
-        // BucketMetadataSys::get_config has its own inner metadata_map RwLock that
-        // handles concurrent cache hydration safely under a global read lock.
+        // Read lock is correct: no global BucketMetadataSys write access is needed.
+        // get_config may hydrate the cache on a miss, but that mutation is protected
+        // by the inner metadata_map RwLock — concurrent hydration under a global
+        // read lock is safe. All 21 other getter functions in metadata_sys.rs use
+        // the same pattern. The three legitimate write-lock sites (set_bucket_metadata,
+        // update, delete) are genuine mutations of the outer state.
         let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
         let (cfg, _) = bucket_meta_sys.get_versioning_config(bucket).await?;
@@ -98,9 +98,13 @@ mod tests {
     use s3s::dto::BucketVersioningStatus;
     use std::sync::Arc;
 
-    /// Regression test: `get_versioning_config` must return the correct config
-    /// under 20 concurrent readers. Before Fix 3, the outer write lock serialised
-    /// every call; this test confirms the read path is correct under concurrency.
+    /// Verifies that `get_versioning_config` returns correct results when called
+    /// concurrently from 20 tasks. This test operates at the `BucketMetadataSys`
+    /// level and does not exercise the global `RwLock` acquired by
+    /// `BucketVersioningSys::get` — it cannot do so without a live `ECStore`.
+    /// The lock-type change (write → read) is validated by the safety comment in
+    /// `get` and the full pre-commit gate. This test guards against correctness
+    /// regressions in the read path (e.g. a cache-miss that overwrites the result).
     #[tokio::test]
     async fn get_versioning_config_correct_under_concurrent_reads() {
         let sys = BucketMetadataSys::new_for_test();
