@@ -259,29 +259,31 @@ impl BucketMetadataSys {
         }
     }
 
-    /// Test-only constructor. Creates an instance whose `api` field is never
-    /// accessed — only valid for tests that pre-populate the cache via `set()`
-    /// before calling any getter, so `get_config` always returns from the cache
-    /// path without reaching `api`.
+    /// Test-only constructor. Only safe when ALL of the following hold:
     ///
-    /// The caller must `std::mem::forget` the returned value (or any `Arc`
-    /// wrapping it) so that `ECStore::drop` is never called on the
-    /// uninitialised allocation.
+    /// 1. The caller pre-populates the cache via `set()` for every bucket that
+    ///    will be requested, so `get_config` returns from the cache path without
+    ///    reaching `api`. Note: `initialized` does **not** prevent `api` access
+    ///    on a cache miss — `get_config` calls `load_bucket_metadata(api, …)`
+    ///    before checking `initialized`.
+    /// 2. The caller calls `std::mem::forget` on the returned value (or on the
+    ///    last `Arc` wrapping it) so that `ECStore::drop` is never invoked on
+    ///    the uninitialised `api` allocation.
+    ///
+    /// `api` is constructed from uninitialised memory via `Arc::new_uninit`/
+    /// `assume_init`. This is technically unsound; it is only tolerable here
+    /// because the invariants above ensure the memory is never read or dropped.
     #[cfg(test)]
     #[allow(unsafe_code)]
     pub fn new_for_test() -> Self {
-        // SAFETY: `api` is only dereferenced in `get_config` on a cache miss
-        // and in `get_config_from_disk`. Tests using this constructor must call
-        // `set()` to populate the cache before calling any getter.
-        // `initialized` is set to `true` so that a cache miss returns an error
-        // rather than calling `load_bucket_metadata`.
-        // The caller must `std::mem::forget` the returned value so that
-        // `ECStore::drop` is never invoked on the uninitialised allocation.
+        // SAFETY: see doc comment above — api is only safe because:
+        // (a) every tested bucket is pre-seeded in the cache via set(), and
+        // (b) the caller forgets the returned value before it is dropped.
         let api: Arc<ECStore> = unsafe { Arc::new_uninit().assume_init() };
         Self {
             metadata_map: RwLock::new(HashMap::new()),
             api,
-            initialized: RwLock::new(true),
+            initialized: RwLock::new(false),
         }
     }
 
