@@ -723,6 +723,32 @@ install_python_package() {
     local package=$1
     local error_output
 
+    # Debian/Ubuntu minimal images often have python3 but no pip (No module named pip).
+    if ! python3 -m pip --version >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            log_warn "python3 has no pip; installing python3-pip via apt..."
+            if [ "$(id -u)" -eq 0 ]; then
+                apt-get update -qq
+                DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip || {
+                    log_error "Failed to install python3-pip via apt-get"
+                    return 1
+                }
+            elif command -v sudo >/dev/null 2>&1; then
+                sudo apt-get update -qq
+                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip || {
+                    log_error "Failed to install python3-pip via apt-get"
+                    return 1
+                }
+            else
+                log_error "python3 has no pip. Install python3-pip (or ensure pip) and retry."
+                return 1
+            fi
+        else
+            log_error "python3 has no pip. Install pip (e.g. python3-pip on Debian/Ubuntu) and retry."
+            return 1
+        fi
+    fi
+
     # Try --user first (works on most Linux systems)
     error_output=$(python3 -m pip install --user --upgrade pip "${package}" 2>&1)
     if [ $? -eq 0 ]; then
