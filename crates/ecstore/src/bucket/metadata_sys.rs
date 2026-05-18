@@ -259,6 +259,32 @@ impl BucketMetadataSys {
         }
     }
 
+    /// Test-only constructor. Creates an instance whose `api` field is never
+    /// accessed — only valid for tests that pre-populate the cache via `set()`
+    /// before calling any getter, so `get_config` always returns from the cache
+    /// path without reaching `api`.
+    ///
+    /// The caller must `std::mem::forget` the returned value (or any `Arc`
+    /// wrapping it) so that `ECStore::drop` is never called on the
+    /// uninitialised allocation.
+    #[cfg(test)]
+    #[allow(unsafe_code)]
+    pub fn new_for_test() -> Self {
+        // SAFETY: `api` is only dereferenced in `get_config` on a cache miss
+        // and in `get_config_from_disk`. Tests using this constructor must call
+        // `set()` to populate the cache before calling any getter.
+        // `initialized` is set to `true` so that a cache miss returns an error
+        // rather than calling `load_bucket_metadata`.
+        // The caller must `std::mem::forget` the returned value so that
+        // `ECStore::drop` is never invoked on the uninitialised allocation.
+        let api: Arc<ECStore> = unsafe { Arc::new_uninit().assume_init() };
+        Self {
+            metadata_map: RwLock::new(HashMap::new()),
+            api,
+            initialized: RwLock::new(true),
+        }
+    }
+
     pub async fn init(&mut self, buckets: Vec<String>) {
         let _ = self.init_internal(buckets).await;
     }

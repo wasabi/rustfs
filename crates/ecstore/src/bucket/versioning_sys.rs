@@ -89,3 +89,46 @@ impl BucketVersioningSys {
         Ok(cfg)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bucket::metadata::BucketMetadata;
+    use crate::bucket::metadata_sys::BucketMetadataSys;
+    use s3s::dto::BucketVersioningStatus;
+    use std::sync::Arc;
+
+    /// Regression test: `get_versioning_config` must return the correct config
+    /// under 20 concurrent readers. Before Fix 3, the outer write lock serialised
+    /// every call; this test confirms the read path is correct under concurrency.
+    #[tokio::test]
+    async fn get_versioning_config_correct_under_concurrent_reads() {
+        let sys = BucketMetadataSys::new_for_test();
+
+        let mut bm = BucketMetadata::new("test-bucket");
+        bm.versioning_config = Some(VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            ..Default::default()
+        });
+        sys.set("test-bucket".to_string(), Arc::new(bm)).await;
+
+        let sys = Arc::new(sys);
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let s = Arc::clone(&sys);
+                tokio::spawn(async move { s.get_versioning_config("test-bucket").await })
+            })
+            .collect();
+
+        for h in handles {
+            let (cfg, _) = h.await.unwrap().unwrap();
+            assert!(cfg.enabled(), "expected versioning enabled");
+        }
+
+        // Prevent ECStore::drop from running on the uninitialised Arc allocation
+        // created by new_for_test(). Arc::try_unwrap succeeds because all spawned
+        // tasks have been joined above.
+        let inner = Arc::try_unwrap(sys).expect("all handles dropped");
+        std::mem::forget(inner);
+    }
+}
