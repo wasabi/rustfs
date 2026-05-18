@@ -76,7 +76,13 @@ impl BucketVersioningSys {
         }
 
         let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
-        let bucket_meta_sys = bucket_meta_sys_lock.write().await;
+        // Read lock is correct: get_versioning_config performs no mutation.
+        // All 21 other getter functions in metadata_sys.rs use read lock for the same
+        // call chain. Write lock is required only for set_bucket_metadata, update, and
+        // delete, which are genuine mutations.
+        // BucketMetadataSys::get_config has its own inner metadata_map RwLock that
+        // handles concurrent cache hydration safely under a global read lock.
+        let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
         let (cfg, _) = bucket_meta_sys.get_versioning_config(bucket).await?;
 
