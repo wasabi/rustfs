@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use http::{HeaderMap, HeaderValue};
+use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
@@ -25,6 +26,7 @@ use rustfs_utils::http::{
     SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header, insert_header_map,
     is_encryption_metadata_key, is_internal_key,
 };
+use s3s::dto::VersioningConfiguration;
 use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
 use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
@@ -216,8 +218,15 @@ pub async fn put_opts(
 ) -> Result<ObjectOptions> {
     ensure_wasabi_set_version_id_header_allowed(headers, bucket, object)?;
 
-    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
-    let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+    // Both prefix_enabled and prefix_suspended internally call get(), each acquiring the
+    // metadata write lock and reading from disk. Fetch once and evaluate both predicates
+    // from the same result.
+    let versioning = BucketVersioningSys::get(bucket).await.unwrap_or_else(|err| {
+        tracing::warn!("{:?}", err);
+        VersioningConfiguration::default()
+    });
+    let versioned = versioning.prefix_enabled(object);
+    let version_suspended = versioning.prefix_suspended(object);
 
     let vid = if vid.is_none() {
         get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
