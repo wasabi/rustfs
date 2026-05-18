@@ -204,13 +204,34 @@ stop_monitors() {
         local peer_remote="${REMOTE_PEER_OUT[$node]:-}"
         if [[ -n "$peer_remote" ]]; then
             local pid_file="${peer_remote}/monitor-node${node_host}-pid.txt"
-            # Signal the remote monitor process via its saved PID file
-            if ssh "$node" "test -f '${pid_file}'"; then
-                remote_pid=$(ssh "$node" "cat '${pid_file}'")
-                ssh "$node" "kill '$remote_pid' 2>/dev/null || true" || true
+            # Retry a few times: the launch SSH job is backgrounded, so the PID file
+            # may not be written yet when stop_monitors fires on a fast error path.
+            local remote_pid=""
+            local _try
+            for _try in 1 2 3; do
+                remote_pid=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+                    "cat '${pid_file}' 2>/dev/null || true")
+                remote_pid="${remote_pid//[$'\r\n ']/}"
+                [[ -n "$remote_pid" ]] && break
+                sleep 1
+            done
+            if [[ -n "$remote_pid" ]]; then
+                # setsid on launch made PGID == PID for the monitor session leader.
+                # Killing the whole process group (kill -- -PGID) reaps sar/mpstat/iostat
+                # in one shot — no orphans even if monitor.sh's own SIGTERM handler races.
+                # SIGTERM first so monitor.sh can run its T1 NIC snapshot, then SIGKILL.
+                if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "
+                    kill -TERM -- -${remote_pid} 2>/dev/null || true
+                    sleep 2
+                    kill -KILL -- -${remote_pid} 2>/dev/null || true
+                "; then
+                    log "WARNING: SSH kill failed for $node (monitor pgid=${remote_pid})"
+                fi
+            else
+                log "WARNING: PID file not found on $node (${pid_file}) after 3s — monitor processes may be orphaned"
             fi
         fi
-        # Also kill the local SSH background job
+        # Kill the local SSH background job used to start the remote monitor.
         kill "$local_ssh_pid" 2>/dev/null || true
         wait "$local_ssh_pid" 2>/dev/null || true
     done
@@ -356,6 +377,8 @@ if [[ -n "${PEER_NODES:-}" ]]; then
         scp -q "$LIB/"*.sh "$node:${REMOTE_LIB}/"
 
         # Start monitor on peer; save its PID to a file on the remote for clean signalling.
+        # setsid creates a new process group with monitor.sh as session leader (PGID == PID),
+        # so stop_monitors can kill the entire subtree (sar/mpstat/iostat) with kill -- -PGID.
         # Note: do NOT mkdir "$peer_out_local" locally before collect — scp fills it from peer.
         ssh "$node" "
             mkdir -p '${peer_out_remote}'
@@ -363,7 +386,7 @@ if [[ -n "${PEER_NODES:-}" ]]; then
             export OUT='${peer_out_remote}'
             export PEER_SPEC=''
             export NIC_INTERFACES='${NIC_INTERFACES:-}'
-            nohup bash '${REMOTE_LIB}/monitor.sh' \
+            nohup setsid bash '${REMOTE_LIB}/monitor.sh' \
                 >>'${peer_out_remote}/monitor-node${PEER_NODE_ID}.log' 2>&1 &
             echo \$! > '${peer_out_remote}/monitor-node${node_host}-pid.txt'
             disown
