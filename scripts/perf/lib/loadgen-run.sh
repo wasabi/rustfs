@@ -81,6 +81,7 @@ LOADGEN_CMD=(
     -timeout     0
     -dur     "$DURATION"
     -test    "$TEST_ID"
+    -v4
     -deleteOnlyOurBuckets
 )
 
