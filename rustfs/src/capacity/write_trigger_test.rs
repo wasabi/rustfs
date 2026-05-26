@@ -29,8 +29,8 @@ mod tests {
         manager.record_write_operation().await;
         manager.record_write_operation().await;
 
-        let frequency = manager.get_write_frequency().await;
-        assert_eq!(frequency, 3);
+        // write_window_len is maintained by the background tracker; check the exact counter.
+        assert_eq!(manager.write_count_snapshot(), 3);
     }
 
     #[tokio::test]
@@ -54,16 +54,16 @@ mod tests {
     async fn test_write_frequency_tracking() {
         let manager = HybridCapacityManager::from_env();
 
-        assert_eq!(manager.get_write_frequency().await, 0);
+        assert_eq!(manager.write_count_snapshot(), 0);
 
         for _ in 0..5 {
             manager.record_write_operation().await;
         }
 
-        assert_eq!(manager.get_write_frequency().await, 5);
+        assert_eq!(manager.write_count_snapshot(), 5);
 
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(manager.get_write_frequency().await, 5);
+        assert_eq!(manager.write_count_snapshot(), 5);
     }
 
     #[tokio::test]
