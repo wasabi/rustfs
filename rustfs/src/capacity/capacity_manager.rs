@@ -28,10 +28,12 @@ use rustfs_config::{
 };
 use rustfs_io_metrics::{record_capacity_current_bytes, record_capacity_update_completed, record_capacity_write_operation};
 use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
@@ -352,16 +354,8 @@ impl DataSource {
     }
 }
 
-/// Write record for tracking write operations
-#[derive(Debug)]
-pub struct WriteRecord {
-    /// Last write time
-    pub last_write_time: Instant,
-    /// Write count
-    pub write_count: usize,
-    /// Write time window (for frequency calculation)
-    pub write_window: Vec<Instant>,
-}
+/// Maximum number of write events tracked in the approximate 60-second sliding window.
+const MAX_WRITE_WINDOW_SIZE: usize = 10_000;
 
 /// Hybrid strategy configuration
 #[derive(Debug, Clone)]
@@ -428,8 +422,12 @@ impl Default for RefreshState {
 pub struct HybridCapacityManager {
     /// Capacity cache
     cache: Arc<RwLock<Option<CachedCapacity>>>,
-    /// Write record
-    write_record: Arc<RwLock<WriteRecord>>,
+    /// Monotonically incrementing total write counter (hot path, lock-free)
+    write_count: Arc<AtomicU64>,
+    /// UNIX epoch milliseconds of the most recent recorded write (hot path, lock-free)
+    last_write_ms: Arc<AtomicU64>,
+    /// Approximate count of writes in the last 60 s, maintained by the background tracker task
+    write_window_len: Arc<AtomicUsize>,
     /// Configuration
     config: HybridStrategyConfig,
     /// Shared singleflight refresh state
@@ -445,13 +443,12 @@ impl HybridCapacityManager {
 
     /// Create a new hybrid capacity manager
     pub fn new(config: HybridStrategyConfig) -> Self {
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         Self {
             cache: Arc::new(RwLock::new(None)),
-            write_record: Arc::new(RwLock::new(WriteRecord {
-                last_write_time: Instant::now(),
-                write_count: 0,
-                write_window: Vec::new(),
-            })),
+            write_count: Arc::new(AtomicU64::new(0)),
+            last_write_ms: Arc::new(AtomicU64::new(now_ms)),
+            write_window_len: Arc::new(AtomicUsize::new(0)),
             config,
             refresh_state: Arc::new(Mutex::new(RefreshState::default())),
         }
@@ -488,30 +485,17 @@ impl HybridCapacityManager {
         record_capacity_update_completed(source.as_metric_label(), start.elapsed(), update.total_used, update.is_estimated);
     }
 
-    /// Record write operation
+    /// Record write operation — lock-free hot path.
+    ///
+    /// Only touches atomics; the sliding-window approximation in `write_window_len`
+    /// is maintained by the background tracker started from `start_background_task`.
     pub async fn record_write_operation(&self) {
-        let mut record = self.write_record.write().await;
-        record.last_write_time = Instant::now();
-        record.write_count += 1;
-
-        // Maintain write time window (keep last 1 minute)
-        // Cap the window size to prevent unbounded memory growth at high write rates
-        const MAX_WRITE_WINDOW_SIZE: usize = 10000;
-        let now = Instant::now();
-        record
-            .write_window
-            .retain(|&t| now.duration_since(t) < Duration::from_secs(60));
-        // Only push if under the cap to prevent unbounded growth
-        if record.write_window.len() < MAX_WRITE_WINDOW_SIZE {
-            record.write_window.push(now);
-        }
-
-        record_capacity_write_operation(record.write_window.len());
-        debug!(
-            "Write operation recorded: total writes = {}, recent writes = {}",
-            record.write_count,
-            record.write_window.len()
-        );
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        self.last_write_ms.store(now_ms, Ordering::Relaxed);
+        let count = self.write_count.fetch_add(1, Ordering::Relaxed);
+        let window_len = self.write_window_len.load(Ordering::Relaxed);
+        record_capacity_write_operation(window_len);
+        debug!("Write operation recorded: total writes = {}, recent writes = {}", count + 1, window_len);
     }
 
     /// Check if fast update is needed
@@ -529,8 +513,9 @@ impl HybridCapacityManager {
                 return false;
             }
 
-            let write_record = self.write_record.read().await;
-            let time_since_write = write_record.last_write_time.elapsed();
+            let last_write_ms = self.last_write_ms.load(Ordering::Relaxed);
+            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let time_since_write = Duration::from_millis(now_ms.saturating_sub(last_write_ms));
 
             // Recent write, trigger fast update
             if time_since_write < self.config.fast_update_threshold {
@@ -538,8 +523,8 @@ impl HybridCapacityManager {
                 return true;
             }
 
-            // High write frequency, trigger update
-            let write_frequency = write_record.write_window.len();
+            // High write frequency, trigger update (approximate; updated every ~1 s by background tracker)
+            let write_frequency = self.write_window_len.load(Ordering::Relaxed);
             if write_frequency > self.config.write_frequency_threshold {
                 debug!("High write frequency detected ({} writes/min), needs fast update", write_frequency);
                 return true;
@@ -556,11 +541,11 @@ impl HybridCapacityManager {
         cache.as_ref().map(|c| c.last_update.elapsed())
     }
 
-    /// Get write frequency (writes/minute)
+    /// Get approximate write frequency (writes in the last 60 s).
+    /// Updated every ~1 s by the background tracker started from `start_background_task`.
     #[allow(dead_code)]
-    pub async fn get_write_frequency(&self) -> usize {
-        let record = self.write_record.read().await;
-        record.write_window.len()
+    pub fn get_write_frequency(&self) -> usize {
+        self.write_window_len.load(Ordering::Relaxed)
     }
 
     /// Run a singleflight refresh. Callers either join an existing in-flight refresh or become the leader.
@@ -674,6 +659,45 @@ impl HybridCapacityManager {
     pub async fn refresh_in_progress(&self) -> bool {
         self.refresh_state.lock().await.running
     }
+
+    /// Spawn the background task that maintains the approximate 60-second write-window counter.
+    ///
+    /// Call exactly once at startup via `start_background_task`. Each call spawns an independent
+    /// task, so calling it multiple times is safe but wasteful.
+    pub fn start_write_window_tracker(self: Arc<Self>) {
+        let write_count = Arc::clone(&self.write_count);
+        let write_window_len = Arc::clone(&self.write_window_len);
+        tokio::spawn(async move {
+            // Ring of (snapshot_time, cumulative_write_count) taken every second.
+            let mut snapshots: VecDeque<(Instant, u64)> = VecDeque::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let now = Instant::now();
+                let count = write_count.load(Ordering::Relaxed);
+                snapshots.push_back((now, count));
+                // Evict snapshots older than 60 seconds.
+                while snapshots
+                    .front()
+                    .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(60))
+                {
+                    snapshots.pop_front();
+                }
+                // Window = writes since the oldest retained snapshot, capped at MAX_WRITE_WINDOW_SIZE.
+                let window = snapshots
+                    .front()
+                    .map_or(0, |(_, old)| count.saturating_sub(*old) as usize)
+                    .min(MAX_WRITE_WINDOW_SIZE);
+                write_window_len.store(window, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Return the exact cumulative write count for test assertions.
+    #[cfg(test)]
+    pub fn write_count_snapshot(&self) -> u64 {
+        self.write_count.load(Ordering::Relaxed)
+    }
 }
 
 /// Global capacity manager instance
@@ -707,6 +731,7 @@ pub fn create_isolated_manager(config: HybridStrategyConfig) -> Arc<HybridCapaci
 /// Start background update task
 pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
     let manager = get_capacity_manager();
+    manager.clone().start_write_window_tracker();
     let mut interval = manager.get_config().scheduled_update_interval;
 
     // Prevent panic in tokio::time::interval when misconfigured to 0
@@ -899,8 +924,8 @@ mod tests {
 
         manager.record_write_operation().await;
 
-        let frequency = manager.get_write_frequency().await;
-        assert_eq!(frequency, 1);
+        // write_window_len is maintained by the background tracker; check the exact counter instead.
+        assert_eq!(manager.write_count_snapshot(), 1);
     }
 
     #[tokio::test]

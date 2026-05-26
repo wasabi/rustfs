@@ -57,8 +57,8 @@ mod tests {
         manager.record_write_operation().await;
         manager.record_write_operation().await;
 
-        let frequency = manager.get_write_frequency().await;
-        assert_eq!(frequency, 3);
+        // write_window_len is maintained by the background tracker; check the exact counter.
+        assert_eq!(manager.write_count_snapshot(), 3);
     }
 
     #[tokio::test]
@@ -138,8 +138,8 @@ mod tests {
             manager.record_write_operation().await;
         }
 
-        let frequency = manager.get_write_frequency().await;
-        assert_eq!(frequency, 20);
+        // write_window_len is maintained by the background tracker; check the exact counter.
+        assert_eq!(manager.write_count_snapshot(), 20);
     }
 
     #[tokio::test]
@@ -165,8 +165,8 @@ mod tests {
         let cached = manager.get_capacity().await;
         assert!(cached.is_some());
 
-        let frequency = manager.get_write_frequency().await;
-        assert_eq!(frequency, 10);
+        // write_window_len is maintained by the background tracker; check the exact counter.
+        assert_eq!(manager.write_count_snapshot(), 10);
     }
 
     #[tokio::test]
@@ -263,5 +263,23 @@ mod tests {
         let cached = manager.get_capacity().await.unwrap();
         assert_eq!(cached.total_used, 8192);
         assert!(cached.is_estimated);
+    }
+
+    #[tokio::test]
+    async fn test_write_window_tracker_updates() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        manager.clone().start_write_window_tracker();
+
+        // Yield to let the background tracker take its initial t=0 snapshot (count=0)
+        // before writes happen. The tracker's first tick fires immediately on first await.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for _ in 0..10 {
+            manager.record_write_operation().await;
+        }
+
+        // Wait for the background tracker's next 1-second tick to fire and update the window.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(manager.get_write_frequency() >= 10);
     }
 }
