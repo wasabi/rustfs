@@ -665,12 +665,18 @@ impl HybridCapacityManager {
     /// Call exactly once at startup via `start_background_task`. Each call spawns an independent
     /// task, so calling it multiple times is safe but wasteful.
     pub fn start_write_window_tracker(self: Arc<Self>) {
-        let write_count = Arc::clone(&self.write_count);
-        let write_window_len = Arc::clone(&self.write_window_len);
+        Self::spawn_write_window_tracker(Arc::clone(&self.write_count), Arc::clone(&self.write_window_len), Duration::from_secs(1));
+    }
+
+    fn spawn_write_window_tracker(write_count: Arc<AtomicU64>, write_window_len: Arc<AtomicUsize>, tick: Duration) {
         tokio::spawn(async move {
-            // Ring of (snapshot_time, cumulative_write_count) taken every second.
-            let mut snapshots: VecDeque<(Instant, u64)> = VecDeque::new();
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            // Ring of (snapshot_time, cumulative_write_count) taken every `tick`.
+            // At most 61 entries: one per second over a 60-second window plus the current one.
+            let mut snapshots: VecDeque<(Instant, u64)> = VecDeque::with_capacity(62);
+            let mut ticker = tokio::time::interval(tick);
+            // Skip missed ticks rather than bursting — if the task is starved we do not
+            // want a rapid series of back-to-back iterations inflating the snapshot count.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
                 let now = Instant::now();
@@ -683,6 +689,10 @@ impl HybridCapacityManager {
                 {
                     snapshots.pop_front();
                 }
+                // Hard cap as a defensive guard against any unexpected growth.
+                while snapshots.len() > 61 {
+                    snapshots.pop_front();
+                }
                 // Window = writes since the oldest retained snapshot, capped at MAX_WRITE_WINDOW_SIZE.
                 let window = snapshots
                     .front()
@@ -691,6 +701,15 @@ impl HybridCapacityManager {
                 write_window_len.store(window, Ordering::Relaxed);
             }
         });
+    }
+
+    /// Test helper: start the write-window tracker with a custom tick interval.
+    ///
+    /// Allows tests to use a short tick (e.g. 10 ms) so the window is populated
+    /// quickly without relying on a 1-second real sleep.
+    #[cfg(test)]
+    pub fn start_write_window_tracker_with_tick(self: Arc<Self>, tick: Duration) {
+        Self::spawn_write_window_tracker(Arc::clone(&self.write_count), Arc::clone(&self.write_window_len), tick);
     }
 
     /// Return the exact cumulative write count for test assertions.

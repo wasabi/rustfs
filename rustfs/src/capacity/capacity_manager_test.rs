@@ -268,18 +268,20 @@ mod tests {
     #[tokio::test]
     async fn test_write_window_tracker_updates() {
         let manager = Arc::new(HybridCapacityManager::from_env());
-        manager.clone().start_write_window_tracker();
+        // Use a 10 ms tick so the test completes in ~50 ms instead of 1.1 s,
+        // removing the flakiness risk of a long real-time sleep under CI load.
+        manager.clone().start_write_window_tracker_with_tick(Duration::from_millis(10));
 
-        // Yield to let the background tracker take its initial t=0 snapshot (count=0)
-        // before writes happen. The tracker's first tick fires immediately on first await.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The first tick fires immediately; wait one tick to ensure the t=0 snapshot
+        // (count=0) is recorded before writes happen.
+        tokio::time::sleep(Duration::from_millis(15)).await;
 
         for _ in 0..10 {
             manager.record_write_operation().await;
         }
 
-        // Wait for the background tracker's next 1-second tick to fire and update the window.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Wait for the next tick to update write_window_len.
+        tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(manager.get_write_frequency() >= 10);
     }
 }
