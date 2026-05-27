@@ -51,7 +51,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_frequency_tracking() {
+    async fn test_write_count_tracking() {
         let manager = HybridCapacityManager::from_env();
 
         assert_eq!(manager.write_count_snapshot(), 0);
