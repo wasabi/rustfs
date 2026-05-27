@@ -33,7 +33,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
@@ -434,6 +434,16 @@ pub struct HybridCapacityManager {
     refresh_state: Arc<Mutex<RefreshState>>,
 }
 
+/// Returns milliseconds elapsed since the first call (process-start epoch).
+///
+/// Uses a monotonic `Instant` so the value is unaffected by NTP adjustments or
+/// wall-clock steps.  Both `record_write_operation` and `needs_fast_update` call
+/// this to obtain comparable timestamps stored in `last_write_ms`.
+fn monotonic_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 impl HybridCapacityManager {
     fn max_stale_age(&self) -> Duration {
         self.config
@@ -443,7 +453,7 @@ impl HybridCapacityManager {
 
     /// Create a new hybrid capacity manager
     pub fn new(config: HybridStrategyConfig) -> Self {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now_ms = monotonic_ms();
         Self {
             cache: Arc::new(RwLock::new(None)),
             write_count: Arc::new(AtomicU64::new(0)),
@@ -490,7 +500,7 @@ impl HybridCapacityManager {
     /// Only touches atomics; the sliding-window approximation in `write_window_len`
     /// is maintained by the background tracker started from `start_background_task`.
     pub async fn record_write_operation(&self) {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now_ms = monotonic_ms();
         self.last_write_ms.store(now_ms, Ordering::Relaxed);
         let count = self.write_count.fetch_add(1, Ordering::Relaxed);
         let window_len = self.write_window_len.load(Ordering::Relaxed);
@@ -514,7 +524,7 @@ impl HybridCapacityManager {
             }
 
             let last_write_ms = self.last_write_ms.load(Ordering::Relaxed);
-            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let now_ms = monotonic_ms();
             let time_since_write = Duration::from_millis(now_ms.saturating_sub(last_write_ms));
 
             // Recent write, trigger fast update

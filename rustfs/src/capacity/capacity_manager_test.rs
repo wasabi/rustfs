@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_frequency_window() {
+    async fn test_write_count_increments() {
         let manager = HybridCapacityManager::from_env();
 
         for _ in 0..20 {
@@ -282,8 +282,15 @@ mod tests {
             manager.record_write_operation().await;
         }
 
-        // Wait for the next tick to update write_window_len.
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(manager.get_write_frequency() >= 10);
+        // Poll until the background tracker updates write_window_len, with a 500 ms
+        // deadline to stay robust against scheduler jitter without hanging the suite.
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if manager.get_write_frequency() >= 10 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for write_window_len to reach 10");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
