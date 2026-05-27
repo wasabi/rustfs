@@ -665,7 +665,11 @@ impl HybridCapacityManager {
     /// Call exactly once at startup via `start_background_task`. Each call spawns an independent
     /// task, so calling it multiple times is safe but wasteful.
     pub fn start_write_window_tracker(self: Arc<Self>) {
-        Self::spawn_write_window_tracker(Arc::clone(&self.write_count), Arc::clone(&self.write_window_len), Duration::from_secs(1));
+        Self::spawn_write_window_tracker(
+            Arc::clone(&self.write_count),
+            Arc::clone(&self.write_window_len),
+            Duration::from_secs(1),
+        );
     }
 
     fn spawn_write_window_tracker(write_count: Arc<AtomicU64>, write_window_len: Arc<AtomicUsize>, tick: Duration) {

@@ -270,7 +270,9 @@ mod tests {
         let manager = Arc::new(HybridCapacityManager::from_env());
         // Use a 10 ms tick so the test completes in ~50 ms instead of 1.1 s,
         // removing the flakiness risk of a long real-time sleep under CI load.
-        manager.clone().start_write_window_tracker_with_tick(Duration::from_millis(10));
+        manager
+            .clone()
+            .start_write_window_tracker_with_tick(Duration::from_millis(10));
 
         // The first tick fires immediately; wait one tick to ensure the t=0 snapshot
         // (count=0) is recorded before writes happen.
