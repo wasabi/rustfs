@@ -17,8 +17,7 @@ Group=rustfs
 WorkingDirectory=/opt/rustfs
 
 # environment variable configuration and main program (Option 1: Directly specify arguments)
-Environment=RUSTFS_ACCESS_KEY=rustfsadmin
-Environment=RUSTFS_SECRET_KEY=rustfsadmin
+# Credentials are loaded from /etc/default/rustfs below. Replace the sample values before deployment.
 ExecStart=/usr/local/bin/rustfs \
     --address 0.0.0.0:9000 \
     --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
@@ -26,12 +25,13 @@ ExecStart=/usr/local/bin/rustfs \
 
 # environment variable configuration (Option 2: Use environment variables)
 # rustfs example file see: `../config/rustfs.env`
-EnvironmentFile=-/etc/default/rustfs
-ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES $RUSTFS_OPTS
+EnvironmentFile=/etc/default/rustfs
+ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES
 
 # service log configuration
-StandardOutput=append:/data/deploy/rust/logs/rustfs.log
-StandardError=append:/data/deploy/rust/logs/rustfs-err.log
+LogsDirectory=rustfs
+StandardOutput=append:/var/log/rustfs/rustfs.log
+StandardError=append:/var/log/rustfs/rustfs-err.log
 
 # resource constraints
 LimitNOFILE=1048576
@@ -58,7 +58,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
-ReadWritePaths=/data/rustfs
+ReadWritePaths=/data/rustfs /var/log/rustfs
 
 [Install]
 WantedBy=multi-user.target

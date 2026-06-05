@@ -131,14 +131,23 @@ pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
 /// Environment variable for server volumes.
 pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
 
+/// Environment variable to explicitly bypass local physical disk independence checks.
+pub const ENV_UNSAFE_BYPASS_DISK_CHECK: &str = "RUSTFS_UNSAFE_BYPASS_DISK_CHECK";
+
+/// Compatibility alias used by legacy MinIO CI pipelines.
+///
+/// RustFS keeps this alias for backward compatibility only. Prefer
+/// `ENV_UNSAFE_BYPASS_DISK_CHECK` for explicit bypass control.
+pub const ENV_MINIO_CI: &str = "MINIO_CI";
+
+/// Default flag value for bypassing local physical disk independence checks.
+pub const DEFAULT_UNSAFE_BYPASS_DISK_CHECK: bool = false;
+
 /// Environment variable for server access key.
 pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
 
 /// Environment variable for server access key file.
 pub const ENV_RUSTFS_ACCESS_KEY_FILE: &str = "RUSTFS_ACCESS_KEY_FILE";
-
-/// Environment variable for server root user.
-pub const ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
 
 /// Environment variable for server secret key.
 pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
@@ -146,8 +155,11 @@ pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
 /// Environment variable for server secret key file.
 pub const ENV_RUSTFS_SECRET_KEY_FILE: &str = "RUSTFS_SECRET_KEY_FILE";
 
-/// Environment variable for server root password.
-pub const ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
+/// Environment variable to explicitly allow public default root credentials.
+///
+/// This is intended for local development only. Production startup paths should
+/// provide non-default `RUSTFS_ACCESS_KEY` and `RUSTFS_SECRET_KEY` values.
+pub const ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS: &str = "RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS";
 
 /// Environment variable for server OBS endpoint.
 pub const ENV_RUSTFS_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
@@ -171,6 +183,9 @@ pub const DEFAULT_KMS_ENABLE: bool = false;
 
 /// Environment variable for server KMS backend.
 pub const ENV_RUSTFS_KMS_BACKEND: &str = "RUSTFS_KMS_BACKEND";
+
+/// Environment variable for Vault Transit mount path.
+pub const ENV_RUSTFS_KMS_VAULT_MOUNT_PATH: &str = "RUSTFS_KMS_VAULT_MOUNT_PATH";
 
 /// Default KMS backend for server-side encryption
 /// This is the default KMS backend for server-side encryption.
@@ -219,6 +234,9 @@ pub const ENV_RUSTFS_REGION: &str = "RUSTFS_REGION";
 
 /// Environment variable for server license.
 pub const ENV_RUSTFS_LICENSE: &str = "RUSTFS_LICENSE";
+
+/// Environment variable for the RSA public key used to verify server licenses.
+pub const ENV_RUSTFS_LICENSE_PUBLIC_KEY: &str = "RUSTFS_LICENSE_PUBLIC_KEY";
 
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.
@@ -333,6 +351,7 @@ mod tests {
     fn test_environment_constants() {
         // Test environment related constants
         assert_eq!(ENVIRONMENT, "production");
+        assert_eq!(ENV_RUSTFS_LICENSE_PUBLIC_KEY, "RUSTFS_LICENSE_PUBLIC_KEY");
         assert!(
             ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
             "Environment should be a standard environment name"

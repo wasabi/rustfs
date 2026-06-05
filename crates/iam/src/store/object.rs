@@ -17,23 +17,27 @@ use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group}
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
-    manager::{extract_jwt_claims, get_default_policyes},
+    keyring,
+    manager::{extract_jwt_claims, extract_jwt_claims_allow_missing_exp, get_default_policyes},
 };
 use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
+use rustfs_ecstore::error::{StorageError, classify_system_path_failure_reason};
 use rustfs_ecstore::store_api::{ListOperations as _, ObjectInfoOrErr, WalkOptions};
 use rustfs_ecstore::{
     config::{
         RUSTFS_CONFIG_PREFIX,
-        com::{delete_config, read_config, read_config_no_lock, read_config_with_metadata, save_config},
+        com::{delete_config, read_config_no_lock, read_config_with_metadata, save_config, save_config_with_opts},
     },
     store::ECStore,
-    store_api::{ObjectInfo, ObjectOptions},
+    store_api::{HTTPPreconditions, ObjectInfo, ObjectOptions},
 };
+use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
@@ -104,6 +108,31 @@ const POLICY_DB_PREFIX: &str = "policydb/";
 const POLICY_DB_USERS_LIST_KEY: &str = "policydb/users/";
 const POLICY_DB_STS_USERS_LIST_KEY: &str = "policydb/sts-users/";
 const POLICY_DB_GROUPS_LIST_KEY: &str = "policydb/groups/";
+const IAM_LAZY_REWRITE_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecryptSource {
+    Plaintext,
+    CurrentMasterKey,
+    OldMasterKey,
+    LegacySecretKey,
+    LegacyAccessSecretKey,
+}
+
+#[derive(Debug)]
+struct DecryptOutcome {
+    plain: Vec<u8>,
+    source: DecryptSource,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+struct LazyRewriteEntry {
+    in_flight: bool,
+    cooldown_until: Option<Instant>,
+}
+
+static IAM_LAZY_REWRITE_TRACKER: LazyLock<Mutex<HashMap<String, LazyRewriteEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // split_path splits a path into a top-level directory and a child item. The
 // parent directory retains the trailing slash.
@@ -128,45 +157,179 @@ impl ObjectStore {
         Self { object_api }
     }
 
-    fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_data_with_source(data: &[u8]) -> Result<DecryptOutcome> {
         if Self::is_plaintext_json(data) {
-            return Ok(data.to_vec());
-        }
-
-        let cred = get_global_action_cred().unwrap_or_default();
-        let secret_key = cred.secret_key;
-        let mut keys: Vec<(Vec<u8>, bool)> = vec![(secret_key.clone().into_bytes(), false)];
-        if !cred.access_key.is_empty() && !secret_key.is_empty() {
-            keys.push((format!("{}:{secret_key}", cred.access_key).into_bytes(), true));
+            return Ok(DecryptOutcome {
+                plain: data.to_vec(),
+                source: DecryptSource::Plaintext,
+            });
         }
 
         const STREAM_IO_HEADER_LEN: usize = 41;
+        let cred = get_global_action_cred().unwrap_or_default();
         let mut last_err = None;
-        for (key, is_access_secret) in keys {
-            if is_access_secret
-                && data.len() >= STREAM_IO_HEADER_LEN
-                && let Ok(plain) = rustfs_crypto::decrypt_stream_io(&key, data)
+
+        let mut try_decrypt_with_key = |key: &[u8], source: DecryptSource| -> Option<DecryptOutcome> {
+            if data.len() >= STREAM_IO_HEADER_LEN
+                && let Ok(plain) = rustfs_crypto::decrypt_stream_io(key, data)
             {
-                return Ok(plain);
+                return Some(DecryptOutcome { plain, source });
             }
-            match rustfs_crypto::decrypt_data(&key, data) {
-                Ok(plain) => return Ok(plain),
-                Err(err) => last_err = Some(err),
+
+            match rustfs_crypto::decrypt_data(key, data) {
+                Ok(plain) => Some(DecryptOutcome { plain, source }),
+                Err(err) => {
+                    last_err = Some(err);
+                    None
+                }
+            }
+        };
+
+        let (current_key, old_keys) = keyring::current_key_and_old_keys();
+        if let Some(key) = current_key
+            && let Some(outcome) = try_decrypt_with_key(&key, DecryptSource::CurrentMasterKey)
+        {
+            return Ok(outcome);
+        }
+
+        for key in old_keys {
+            if let Some(outcome) = try_decrypt_with_key(&key, DecryptSource::OldMasterKey) {
+                return Ok(outcome);
+            }
+        }
+
+        let secret_key = cred.secret_key;
+        let mut legacy_keys = Vec::new();
+        if !secret_key.is_empty() {
+            legacy_keys.push((secret_key.clone().into_bytes(), DecryptSource::LegacySecretKey));
+        }
+        if !cred.access_key.is_empty() && !secret_key.is_empty() {
+            legacy_keys.push((
+                format!("{}:{secret_key}", cred.access_key).into_bytes(),
+                DecryptSource::LegacyAccessSecretKey,
+            ));
+        }
+
+        for (key, source) in legacy_keys {
+            if let Some(outcome) = try_decrypt_with_key(&key, source) {
+                return Ok(outcome);
             }
         }
 
         Err(last_err.unwrap_or(rustfs_crypto::Error::ErrUnexpectedHeader).into())
     }
 
-    fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
-        let cred = get_global_action_cred().unwrap_or_default();
-        let password = if !cred.access_key.is_empty() && !cred.secret_key.is_empty() {
-            format!("{}:{}", cred.access_key, cred.secret_key).into_bytes()
-        } else {
-            cred.secret_key.clone().into_bytes()
+    fn encrypt_data_with_master_key(data: &[u8]) -> Result<Vec<u8>> {
+        let Some(master_key) = keyring::encrypt_key() else {
+            return Err(Error::other("iam master key is not configured"));
         };
-        let en = rustfs_crypto::encrypt_stream_io(&password, data)?;
-        Ok(en)
+
+        let encrypted = rustfs_crypto::encrypt_stream_io(&master_key, data)?;
+        Ok(encrypted)
+    }
+
+    fn prepare_data_for_storage(data: &[u8]) -> Result<Vec<u8>> {
+        if keyring::encrypt_key().is_some() {
+            let encrypted = Self::encrypt_data_with_master_key(data)?;
+            return Ok(encrypted);
+        }
+
+        Ok(data.to_vec())
+    }
+
+    fn should_lazy_rewrite(source: DecryptSource) -> bool {
+        matches!(
+            source,
+            DecryptSource::Plaintext
+                | DecryptSource::OldMasterKey
+                | DecryptSource::LegacySecretKey
+                | DecryptSource::LegacyAccessSecretKey
+        )
+    }
+
+    fn begin_lazy_rewrite(path: &str) -> bool {
+        let Ok(mut tracker) = IAM_LAZY_REWRITE_TRACKER.lock() else {
+            return false;
+        };
+
+        let entry = tracker.entry(path.to_owned()).or_default();
+        if entry.in_flight {
+            return false;
+        }
+        if entry.cooldown_until.is_some_and(|deadline| deadline > Instant::now()) {
+            return false;
+        }
+
+        entry.in_flight = true;
+        entry.cooldown_until = None;
+        true
+    }
+
+    fn complete_lazy_rewrite(path: &str, success: bool) {
+        let Ok(mut tracker) = IAM_LAZY_REWRITE_TRACKER.lock() else {
+            return;
+        };
+
+        if success {
+            tracker.remove(path);
+            return;
+        }
+
+        let entry = tracker.entry(path.to_owned()).or_default();
+        entry.in_flight = false;
+        entry.cooldown_until = Some(Instant::now() + IAM_LAZY_REWRITE_COOLDOWN);
+    }
+
+    fn maybe_schedule_lazy_rewrite(&self, path: &str, outcome: &DecryptOutcome, object_info: &ObjectInfo) {
+        if !Self::should_lazy_rewrite(outcome.source) {
+            return;
+        }
+        if keyring::encrypt_key().is_none() {
+            return;
+        }
+
+        let Some(etag) = object_info.etag.clone() else {
+            return;
+        };
+
+        if !Self::begin_lazy_rewrite(path) {
+            return;
+        }
+
+        let path = path.to_owned();
+        let plain = outcome.plain.clone();
+        let store = self.clone();
+        tokio::spawn(async move {
+            let result = store.lazy_rewrite_iam_config(path.as_str(), &plain, etag.as_str()).await;
+            match result {
+                Ok(_) => {
+                    Self::complete_lazy_rewrite(path.as_str(), true);
+                }
+                Err(StorageError::PreconditionFailed) => {
+                    Self::complete_lazy_rewrite(path.as_str(), false);
+                    debug!("iam lazy rewrite skipped due to stale etag, path: {}", path);
+                }
+                Err(err) => {
+                    Self::complete_lazy_rewrite(path.as_str(), false);
+                    warn!("iam lazy rewrite failed, path: {}, err: {}", path, err);
+                }
+            }
+        });
+    }
+
+    async fn lazy_rewrite_iam_config(&self, path: &str, plain: &[u8], etag: &str) -> std::result::Result<(), StorageError> {
+        let encrypted = Self::encrypt_data_with_master_key(plain).map_err(StorageError::other)?;
+
+        let mut opts = ObjectOptions {
+            max_parity: true,
+            ..Default::default()
+        };
+        opts.http_preconditions = Some(HTTPPreconditions {
+            if_match: Some(etag.to_owned()),
+            ..Default::default()
+        });
+
+        save_config_with_opts(self.object_api.clone(), path, encrypted, &opts).await
     }
 
     fn is_plaintext_json(data: &[u8]) -> bool {
@@ -174,14 +337,17 @@ impl ObjectStore {
     }
 
     #[cfg(test)]
-    fn encrypt_data_for_test(data: &[u8]) -> Result<Vec<u8>> {
-        Self::encrypt_data(data)
+    fn prepare_data_for_storage_for_test(data: &[u8]) -> Result<Vec<u8>> {
+        Self::prepare_data_for_storage(data)
     }
 
     async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, ObjectInfo)> {
-        let (data, obj) = read_config_with_metadata(self.object_api.clone(), path.as_ref(), &ObjectOptions::default()).await?;
+        let path_ref = path.as_ref();
+        let (data, obj) = read_config_with_metadata(self.object_api.clone(), path_ref, &ObjectOptions::default()).await?;
+        let outcome = Self::decrypt_data_with_source(&data)?;
+        self.maybe_schedule_lazy_rewrite(path_ref, &outcome, &obj);
 
-        Ok((Self::decrypt_data(&data)?, obj))
+        Ok((outcome.plain, obj))
     }
 
     async fn list_iam_config_items(&self, prefix: &str, ctx: CancellationToken, sender: Sender<StringOrErr>) {
@@ -197,9 +363,22 @@ impl ObjectStore {
 
         let path = prefix.to_owned();
         tokio::spawn(async move {
-            store
+            if let Err(err) = store
                 .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, WalkOptions::default())
                 .await
+            {
+                let reason = classify_system_path_failure_reason(&err);
+                record_system_path_failure("iam_config", "walk", reason);
+                error!(
+                    path_kind = "iam_config",
+                    operation = "walk",
+                    reason,
+                    bucket = Self::BUCKET_NAME,
+                    prefix = %path,
+                    error = %err,
+                    "system path walk failed"
+                );
+            }
         });
 
         let prefix = prefix.to_owned();
@@ -245,7 +424,14 @@ impl ObjectStore {
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
-                warn!("list_iam_config_items {:?}", err);
+                warn!(
+                    path_kind = "iam_config",
+                    operation = "list_items",
+                    reason = "walk_result",
+                    error = %err,
+                    "system path list failed"
+                );
+                record_system_path_failure("iam_config", "list_items", "walk_result");
                 ctx.cancel();
 
                 return Err(err);
@@ -444,18 +630,21 @@ impl Store for ObjectStore {
         false
     }
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
-        let mut data = read_config(self.object_api.clone(), path.as_ref()).await?;
+        let path_ref = path.as_ref();
+        let (data, obj) = read_config_with_metadata(self.object_api.clone(), path_ref, &ObjectOptions::default()).await?;
 
-        data = match Self::decrypt_data(&data) {
+        let outcome = match Self::decrypt_data_with_source(&data) {
             Ok(v) => v,
             Err(err) => {
-                warn!("config decrypt failed, keeping file: {}, path: {}", err, path.as_ref());
+                warn!("config decrypt failed, keeping file: {}, path: {}", err, path_ref);
                 // keep the config file when decrypt failed - do not delete
                 return Err(Error::ConfigNotFound);
             }
         };
 
-        Ok(serde_json::from_slice(&data)?)
+        self.maybe_schedule_lazy_rewrite(path_ref, &outcome, &obj);
+
+        Ok(serde_json::from_slice(&outcome.plain)?)
     }
     /// Saves IAM configuration with a retry mechanism on failure.
     ///
@@ -473,7 +662,7 @@ impl Store for ObjectStore {
     #[tracing::instrument(skip(self, item, path))]
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()> {
         let mut data = serde_json::to_vec(&item)?;
-        data = Self::encrypt_data(&data)?;
+        data = Self::prepare_data_for_storage(&data)?;
 
         let mut attempts = 0;
         let max_attempts = 5;
@@ -565,7 +754,13 @@ impl Store for ObjectStore {
         }
 
         if !u.credentials.session_token.is_empty() {
-            match extract_jwt_claims(&u) {
+            let claims_result = if user_type == UserType::Svc && u.credentials.expiration.is_none() {
+                extract_jwt_claims_allow_missing_exp(&u)
+            } else {
+                extract_jwt_claims(&u)
+            };
+
+            match claims_result {
                 Ok(claims) => {
                     u.credentials.claims = Some(claims);
                 }
@@ -1207,8 +1402,11 @@ impl Store for ObjectStore {
 
 #[cfg(test)]
 mod tests {
-    use super::ObjectStore;
+    use super::{DecryptSource, ObjectStore};
+    use crate::keyring;
     use rustfs_credentials::{Credentials, get_global_action_cred, init_global_action_credentials};
+    use serial_test::serial;
+    use temp_env::with_vars;
 
     fn test_cred() -> Credentials {
         if let Some(cred) = get_global_action_cred() {
@@ -1221,8 +1419,9 @@ mod tests {
     #[test]
     fn test_decrypt_data_accepts_plaintext_json() {
         let raw = br#"{"Version":1,"policy":"readonly"}"#;
-        let out = ObjectStore::decrypt_data(raw).expect("plaintext json should pass through");
-        assert_eq!(out, raw);
+        let out = ObjectStore::decrypt_data_with_source(raw).expect("plaintext json should pass through");
+        assert_eq!(out.plain, raw);
+        assert_eq!(out.source, DecryptSource::Plaintext);
     }
 
     #[test]
@@ -1230,8 +1429,8 @@ mod tests {
         let cred = test_cred();
         let plain = br#"{"accessKey":"ak","secretKey":"sk"}"#;
         let encrypted = rustfs_crypto::encrypt_data(cred.secret_key.as_bytes(), plain).expect("encrypt with rustfs secret");
-        let out = ObjectStore::decrypt_data(&encrypted).expect("decrypt rustfs legacy encryption");
-        assert_eq!(out, plain);
+        let out = ObjectStore::decrypt_data_with_source(&encrypted).expect("decrypt rustfs legacy encryption");
+        assert_eq!(out.plain, plain);
     }
 
     #[test]
@@ -1240,8 +1439,8 @@ mod tests {
         let plain = br#"{"Version":1,"updatedAt":"2025-03-07T12:00:00Z"}"#;
         let root_cred = format!("{}:{}", cred.access_key, cred.secret_key);
         let encrypted = rustfs_crypto::encrypt_stream_io(root_cred.as_bytes(), plain).expect("encrypt with stream_io");
-        let out = ObjectStore::decrypt_data(&encrypted).expect("decrypt stream_io");
-        assert_eq!(out, plain);
+        let out = ObjectStore::decrypt_data_with_source(&encrypted).expect("decrypt stream_io");
+        assert_eq!(out.plain, plain);
     }
 
     #[test]
@@ -1253,34 +1452,91 @@ mod tests {
         if encrypted.len() > 50 {
             encrypted[50] ^= 0xFF; // corrupt one byte
         }
-        let result = ObjectStore::decrypt_data(&encrypted);
+        let result = ObjectStore::decrypt_data_with_source(&encrypted);
         assert!(result.is_err(), "corrupt stream_io data should fail decrypt");
     }
 
     #[test]
     fn test_decrypt_data_short_data_fails() {
         let short = &[0x00u8; 40]; // less than 41-byte stream_io header, not valid JSON
-        let result = ObjectStore::decrypt_data(short);
+        let result = ObjectStore::decrypt_data_with_source(short);
         assert!(result.is_err(), "short non-JSON data should fail decrypt");
     }
 
     #[test]
-    fn test_encrypt_data_produces_stream_io_format() {
-        let _ = test_cred();
+    #[serial]
+    fn test_prepare_data_defaults_to_plaintext_without_iam_master_key() {
         let plain = br#"{"Version":1,"policy":"readonly"}"#;
-        let encrypted = ObjectStore::encrypt_data_for_test(plain).expect("encrypt should succeed");
-        // stream_io header: salt(32) + alg_id(1) + nonce_prefix(8) = 41 bytes
-        const STREAM_IO_HEADER_LEN: usize = 41;
-        assert!(
-            encrypted.len() >= STREAM_IO_HEADER_LEN,
-            "encrypted should have at least 41-byte stream_io header"
+
+        with_vars(
+            [
+                (keyring::ENV_IAM_MASTER_KEY, None::<&str>),
+                (keyring::ENV_IAM_MASTER_KEY_OLD_KEYS, None::<&str>),
+            ],
+            || {
+                let stored = ObjectStore::prepare_data_for_storage_for_test(plain).expect("store bytes should build");
+                assert_eq!(stored, plain);
+
+                let decrypted = ObjectStore::decrypt_data_with_source(&stored).expect("plaintext should load");
+                assert_eq!(plain, decrypted.plain.as_slice());
+                assert_eq!(decrypted.source, DecryptSource::Plaintext);
+            },
         );
-        assert!(
-            encrypted[32] == 0x00 || encrypted[32] == 0x01 || encrypted[32] == 0x02,
-            "alg_id should be 0x00, 0x01, or 0x02"
+    }
+
+    #[test]
+    #[serial]
+    fn test_prepare_data_uses_iam_master_key_roundtrip() {
+        let _ = test_cred();
+        let plain = br#"{"Version":1,"policy":"master-key"}"#;
+        let master_key = "iam-master-key-roundtrip";
+
+        with_vars(
+            [
+                (keyring::ENV_IAM_MASTER_KEY, Some(master_key)),
+                (keyring::ENV_IAM_MASTER_KEY_OLD_KEYS, None),
+            ],
+            || {
+                let encrypted = ObjectStore::prepare_data_for_storage_for_test(plain).expect("encrypt with iam master key");
+
+                let by_master =
+                    rustfs_crypto::decrypt_stream_io(master_key.as_bytes(), &encrypted).expect("decrypt via master key");
+                assert_eq!(by_master, plain);
+
+                let by_object_store = ObjectStore::decrypt_data_with_source(&encrypted).expect("decrypt via object store");
+                assert_eq!(by_object_store.plain, plain);
+                assert_eq!(by_object_store.source, DecryptSource::CurrentMasterKey);
+            },
         );
-        // Round-trip: encrypt then decrypt
-        let decrypted = ObjectStore::decrypt_data(&encrypted).expect("decrypt should succeed");
-        assert_eq!(plain, decrypted.as_slice());
+    }
+
+    #[test]
+    #[serial]
+    fn test_decrypt_data_uses_iam_old_keys_fallback_during_rotation() {
+        let _ = test_cred();
+        let plain = br#"{"Version":1,"policy":"rotation-fallback"}"#;
+        let current_key = "iam-master-key-new";
+        let old_key_used_for_data = "iam-master-key-old-2";
+        let old_keys = format!("iam-master-key-old-1,{old_key_used_for_data}");
+
+        let encrypted = rustfs_crypto::encrypt_stream_io(old_key_used_for_data.as_bytes(), plain)
+            .expect("encrypt with old iam key for rotation simulation");
+
+        assert!(
+            rustfs_crypto::decrypt_stream_io(current_key.as_bytes(), &encrypted).is_err(),
+            "current master key should not decrypt old-key encrypted data in this test"
+        );
+
+        with_vars(
+            [
+                (keyring::ENV_IAM_MASTER_KEY, Some(current_key)),
+                (keyring::ENV_IAM_MASTER_KEY_OLD_KEYS, Some(old_keys.as_str())),
+            ],
+            || {
+                let decrypted = ObjectStore::decrypt_data_with_source(&encrypted).expect("decrypt via old-key fallback");
+                assert_eq!(decrypted.plain, plain);
+                assert_eq!(decrypted.source, DecryptSource::OldMasterKey);
+            },
+        );
     }
 }

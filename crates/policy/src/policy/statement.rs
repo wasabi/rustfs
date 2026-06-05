@@ -14,7 +14,8 @@
 
 use super::{
     ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
-    action::Action,
+    action::{Action, S3Action},
+    function::key_name::{KeyName, S3KeyName},
     variables::{VariableContext, VariableResolver},
 };
 use crate::error::{Error, Result};
@@ -56,6 +57,36 @@ pub(crate) fn variable_resolver_for_policy_args(args: &Args<'_>) -> VariableReso
     VariableResolver::new(context)
 }
 
+fn build_resource(action: &Action, bucket: &str, object: &str, bucket_resource_only: bool) -> String {
+    let bucket_resource_only = matches!(
+        action,
+        Action::S3Action(
+            S3Action::ListBucketAction | S3Action::ListBucketVersionsAction | S3Action::ListBucketMultipartUploadsAction
+        )
+    ) && bucket_resource_only;
+
+    let mut resource = String::from(bucket);
+    if bucket_resource_only || object.is_empty() {
+        resource.push('/');
+        return resource;
+    }
+
+    if !object.starts_with('/') {
+        resource.push('/');
+    }
+    resource.push_str(object);
+    resource
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionFamily {
+    S3,
+    Admin,
+    Sts,
+    Kms,
+    Mixed,
+}
+
 impl Statement {
     fn is_kms(&self) -> bool {
         for act in self.actions.iter() {
@@ -87,6 +118,48 @@ impl Statement {
         false
     }
 
+    fn action_family(&self) -> Option<ActionFamily> {
+        if self.actions.is_empty() {
+            return None;
+        }
+
+        let mut saw_s3 = false;
+        let mut saw_admin = false;
+        let mut saw_sts = false;
+        let mut saw_kms = false;
+
+        for action in self.actions.iter() {
+            match action {
+                Action::S3Action(_) => saw_s3 = true,
+                Action::AdminAction(_) => saw_admin = true,
+                Action::StsAction(_) => saw_sts = true,
+                Action::KmsAction(_) => saw_kms = true,
+                Action::None => {}
+            }
+        }
+
+        let family_count = saw_s3 as u8 + saw_admin as u8 + saw_sts as u8 + saw_kms as u8;
+
+        if family_count != 1 {
+            return Some(ActionFamily::Mixed);
+        }
+
+        if saw_s3 {
+            return Some(ActionFamily::S3);
+        }
+        if saw_admin {
+            return Some(ActionFamily::Admin);
+        }
+        if saw_sts {
+            return Some(ActionFamily::Sts);
+        }
+        if saw_kms {
+            return Some(ActionFamily::Kms);
+        }
+
+        Some(ActionFamily::Mixed)
+    }
+
     /// Returns true when this statement would reach `conditions.evaluate_with_resolver` in
     /// [`Statement::is_allowed`] (including the KMS shortcut path). Does not evaluate conditions.
     pub(crate) async fn request_reaches_condition_eval(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
@@ -94,16 +167,12 @@ impl Statement {
             return false;
         }
 
-        let mut resource = String::from(args.bucket);
-        if !args.object.is_empty() {
-            if !args.object.starts_with('/') {
-                resource.push('/');
-            }
-
-            resource.push_str(args.object);
-        } else {
-            resource.push('/');
-        }
+        let resource = build_resource(
+            &args.action,
+            args.bucket,
+            args.object,
+            self.conditions.references_key_name(&KeyName::S3(S3KeyName::S3Prefix)),
+        );
 
         if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
             return true;
@@ -168,9 +237,25 @@ impl Validator for Statement {
             return Err(IamError::BothActionAndNotAction.into());
         }
 
-        // policy must contain either Resource or NotResource (but not both), and cannot have both empty.
+        let action_family = if self.not_actions.is_empty() {
+            match self.action_family() {
+                Some(ActionFamily::Mixed) => return Err(IamError::MixedActionFamilies.into()),
+                family => family,
+            }
+        } else {
+            None
+        };
+
+        // Policy must contain either Resource or NotResource (but not both), unless
+        // the statement is Action-mode Admin/STS/KMS.
         if self.resources.is_empty() && self.not_resources.is_empty() {
-            return Err(IamError::NonResource.into());
+            let allow_empty_resource = matches!(
+                action_family,
+                Some(ActionFamily::Admin) | Some(ActionFamily::Sts) | Some(ActionFamily::Kms)
+            );
+            if !allow_empty_resource {
+                return Err(IamError::NonResource.into());
+            }
         }
 
         if !self.resources.is_empty() && !self.not_resources.is_empty() {
@@ -230,16 +315,12 @@ impl BPStatement {
             return false;
         }
 
-        let mut resource = String::from(args.bucket);
-        if !args.object.is_empty() {
-            if !args.object.starts_with('/') {
-                resource.push('/');
-            }
-
-            resource.push_str(args.object);
-        } else {
-            resource.push('/');
-        }
+        let resource = build_resource(
+            &args.action,
+            args.bucket,
+            args.object,
+            self.conditions.references_key_name(&KeyName::S3(S3KeyName::S3Prefix)),
+        );
 
         if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions).await {
             return false;

@@ -196,7 +196,10 @@ pub struct ServerOpts {
     )]
     pub console_address: String,
 
-    /// Observability endpoint for trace, metrics and logs,only support grpc mode.
+    /// Root OTLP endpoint for traces, metrics, and logs.
+    /// For the current observability pipeline this should be an OTLP/HTTP base
+    /// URL such as `http://otel-collector:4318` or
+    /// `http://host.docker.internal:4318`.
     #[arg(
         long,
         default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(),
@@ -218,7 +221,7 @@ pub struct ServerOpts {
     #[arg(long, default_value_t = false, env = "RUSTFS_KMS_ENABLE")]
     pub kms_enable: bool,
 
-    /// KMS backend type (local or vault)
+    /// KMS backend type: local, vault or vault-kv2 (Vault KV2+Transit), vault-transit
     #[arg(long, default_value_t = rustfs_config::DEFAULT_KMS_BACKEND.to_string(), env = "RUSTFS_KMS_BACKEND")]
     pub kms_backend: String,
 
@@ -233,6 +236,10 @@ pub struct ServerOpts {
     /// Vault token for vault backend
     #[arg(long, env = "RUSTFS_KMS_VAULT_TOKEN")]
     pub kms_vault_token: Option<String>,
+
+    /// Vault mount path for vault or vault-transit backend
+    #[arg(long, env = "RUSTFS_KMS_VAULT_MOUNT_PATH")]
+    pub kms_vault_mount_path: Option<String>,
 
     /// Default KMS key ID for encryption
     #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
@@ -284,6 +291,7 @@ pub fn default_server_opts() -> ServerOpts {
         kms_key_dir: None,
         kms_vault_address: None,
         kms_vault_token: None,
+        kms_vault_mount_path: None,
         kms_default_key_id: None,
         buffer_profile_disable: false,
         buffer_profile: "GeneralPurpose".to_string(),

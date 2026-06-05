@@ -16,7 +16,6 @@ use crate::{
     ChecksumAlgo, FileMeta, FileMetaShallowVersion, FileMetaVersion, MetaDeleteMarker, MetaObject, Result, S3VersionId,
     VersionType,
 };
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -108,7 +107,8 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     fm.versions.push(legacy_shallow);
 
     // Sort by modification time (newest first)
-    fm.versions.sort_by_key(|v| Reverse(v.header.mod_time));
+    fm.versions
+        .sort_by_key(|v| (v.header.mod_time.is_none(), std::cmp::Reverse(v.header.mod_time)));
 
     fm.marshal_msg()
 }
@@ -147,6 +147,11 @@ pub fn create_issue_2265_legacy_meta_v2_object_xlmeta() -> Result<Vec<u8>> {
 /// Legacy config xl.meta captured in issue #2265. Header/meta versions are 3/2.
 pub fn create_issue_2265_legacy_meta_v2_config_xlmeta() -> Result<Vec<u8>> {
     decode_hex_fixture(include_str!("../tests/fixtures/issue_2265_legacy_meta_v2_config.hex"))
+}
+
+/// Legacy pool xl.meta captured in issue #2434. Header/meta versions are 3/2.
+pub fn create_issue_2434_legacy_meta_v2_pool_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/issue_2434_legacy_meta_v2_pool.hex"))
 }
 
 fn write_legacy_time(wr: &mut Vec<u8>, ts: OffsetDateTime) {
@@ -262,11 +267,11 @@ pub fn create_legacy_v1_object_xlmeta() -> Result<Vec<u8>> {
     wr.extend_from_slice(&[0xc6, 0, 0, 0, 0]);
 
     let offset = wr.len();
-    rmp::encode::write_uint(&mut wr, 1).unwrap();
-    rmp::encode::write_uint(&mut wr, 1).unwrap();
-    rmp::encode::write_sint(&mut wr, 1).unwrap();
-    rmp::encode::write_bin(&mut wr, &header).unwrap();
-    rmp::encode::write_bin(&mut wr, &body).unwrap();
+    rmp::encode::write_uint(&mut wr, 1)?;
+    rmp::encode::write_uint(&mut wr, 1)?;
+    rmp::encode::write_sint(&mut wr, 1)?;
+    rmp::encode::write_bin(&mut wr, &header)?;
+    rmp::encode::write_bin(&mut wr, &body)?;
 
     let data_len = (wr.len() - offset) as u32;
     wr[offset - 4..offset].copy_from_slice(&data_len.to_be_bytes());
@@ -349,7 +354,8 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
     }
 
     // Sort by modification time (newest first)
-    fm.versions.sort_by_key(|v| Reverse(v.header.mod_time));
+    fm.versions
+        .sort_by_key(|v| (v.header.mod_time.is_none(), std::cmp::Reverse(v.header.mod_time)));
 
     fm.marshal_msg()
 }

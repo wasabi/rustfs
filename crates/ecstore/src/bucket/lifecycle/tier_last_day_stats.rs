@@ -18,7 +18,7 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use rustfs_common::data_usage::TierStats;
+use rustfs_data_usage::TierStats;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::ops::Sub;
@@ -83,7 +83,7 @@ impl LastDayTierStats {
     #[allow(dead_code)]
     fn merge(&self, m: LastDayTierStats) -> LastDayTierStats {
         let mut cl = self.clone();
-        let mut cm = m.clone();
+        let mut cm = m;
         let mut merged = LastDayTierStats::default();
 
         if cl.updated_at.unix_timestamp() > cm.updated_at.unix_timestamp() {

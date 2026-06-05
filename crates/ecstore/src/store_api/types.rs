@@ -34,6 +34,23 @@ pub struct HTTPPreconditions {
     pub if_unmodified_since: Option<OffsetDateTime>,
 }
 
+impl HTTPPreconditions {
+    pub(crate) fn if_match_value(&self) -> Option<&str> {
+        non_empty_condition_value(self.if_match.as_deref())
+    }
+
+    pub(crate) fn if_none_match_value(&self) -> Option<&str> {
+        non_empty_condition_value(self.if_none_match.as_deref())
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ObjectLockRetentionOptions {
+    pub mode: Option<String>,
+    pub retain_until: Option<OffsetDateTime>,
+    pub bypass_governance: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -70,6 +87,7 @@ pub struct ObjectOptions {
     pub lifecycle_audit_event: LcAuditEvent,
 
     pub eval_metadata: Option<HashMap<String, String>>,
+    pub object_lock_retention: Option<ObjectLockRetentionOptions>,
 
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
@@ -85,6 +103,7 @@ pub struct ObjectOptions {
     /// post-encode Exclusive guard instead of the distributed Shared preflight.
     /// Set by the `Auto` branch of `preflight_mode()` in `execute_put_object`.
     pub existing_object_lock_inline_check: bool,
+    pub capacity_scope_token: Option<Uuid>,
 }
 
 impl ObjectOptions {
@@ -176,7 +195,10 @@ impl ObjectOptions {
         }
 
         if let Some(pre) = &self.http_preconditions {
-            if let Some(if_none_match) = &pre.if_none_match
+            let if_none_match = pre.if_none_match_value();
+            let if_match = pre.if_match_value();
+
+            if let Some(if_none_match) = if_none_match
                 && let Some(etag) = &obj_info.etag
                 && is_etag_equal(etag, if_none_match)
             {
@@ -191,7 +213,7 @@ impl ObjectOptions {
                 return Err(Error::NotModified);
             }
 
-            if let Some(if_match) = &pre.if_match {
+            if let Some(if_match) = if_match {
                 if let Some(etag) = &obj_info.etag {
                     if !is_etag_equal(etag, if_match) {
                         return Err(Error::PreconditionFailed);
@@ -201,7 +223,7 @@ impl ObjectOptions {
                 }
             }
             if has_valid_mod_time
-                && pre.if_match.is_none()
+                && if_match.is_none()
                 && let Some(if_unmodified_since) = &pre.if_unmodified_since
                 && let Some(mod_time) = &obj_info.mod_time
                 && is_modified_since(mod_time, if_unmodified_since)
@@ -212,6 +234,10 @@ impl ObjectOptions {
 
         Ok(())
     }
+}
+
+fn non_empty_condition_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn is_etag_equal(etag1: &str, etag2: &str) -> bool {
@@ -388,6 +414,37 @@ impl ObjectInfo {
         self.etag.as_ref().is_some_and(|v| v.len() != 32)
     }
 
+    pub fn is_encrypted(&self) -> bool {
+        use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
+
+        self.user_defined
+            .keys()
+            .any(|key| rustfs_utils::http::is_encryption_metadata_key(key))
+            || self.user_defined.contains_key(SSEC_ALGORITHM_HEADER)
+            || self.user_defined.contains_key(SSEC_KEY_HEADER)
+            || self.user_defined.contains_key(SSEC_KEY_MD5_HEADER)
+    }
+
+    pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
+        if let Some(size_str) = self
+            .user_defined
+            .get("x-rustfs-encryption-original-size")
+            .or_else(|| self.user_defined.get("x-amz-server-side-encryption-customer-original-size"))
+            && !size_str.is_empty()
+        {
+            let size = size_str
+                .parse::<i64>()
+                .map_err(|e| std::io::Error::other(format!("Failed to parse encryption original size: {e}")))?;
+            return Ok(Some(size));
+        }
+
+        Ok(None)
+    }
+
+    pub fn decrypted_size(&self) -> std::io::Result<i64> {
+        Ok(self.encryption_original_size()?.unwrap_or(self.size))
+    }
+
     pub fn get_actual_size(&self) -> std::io::Result<i64> {
         if self.actual_size > 0 {
             return Ok(self.actual_size);
@@ -415,15 +472,7 @@ impl ObjectInfo {
         // Check if object is encrypted
         // Managed SSE stores original size in x-rustfs-encryption-original-size metadata
         // SSE-C stores original size in x-amz-server-side-encryption-customer-original-size
-        if let Some(size_str) = self
-            .user_defined
-            .get("x-rustfs-encryption-original-size")
-            .or_else(|| self.user_defined.get("x-amz-server-side-encryption-customer-original-size"))
-            && !size_str.is_empty()
-        {
-            let size = size_str
-                .parse::<i64>()
-                .map_err(|e| std::io::Error::other(format!("Failed to parse encryption original size: {e}")))?;
+        if let Some(size) = self.encryption_original_size()? {
             return Ok(size);
         }
 
@@ -476,6 +525,11 @@ impl ObjectInfo {
             .replication_state_internal
             .as_ref()
             .and_then(|v| v.version_purge_status_internal.clone());
+        let replication_decision = fi
+            .replication_state_internal
+            .as_ref()
+            .map(|v| v.replicate_decision_str.clone())
+            .unwrap_or_default();
 
         let mut replication_status = fi.replication_status();
         if replication_status.is_empty()
@@ -572,6 +626,7 @@ impl ObjectInfo {
             replication_status,
             version_purge_status_internal,
             version_purge_status,
+            replication_decision,
             ..Default::default()
         }
     }
@@ -1040,6 +1095,7 @@ pub struct ObjectInfoOrErr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_filemeta::ReplicationState;
 
     #[test]
     fn get_actual_size_prefers_actual_size_field() {
@@ -1087,6 +1143,40 @@ mod tests {
         };
 
         assert_eq!(info.get_actual_size().unwrap(), 77);
+    }
+
+    #[test]
+    fn precondition_check_ignores_empty_etag_conditions() {
+        let opts = ObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some(String::new()),
+                if_none_match: Some(" ".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let info = ObjectInfo {
+            mod_time: Some(OffsetDateTime::now_utc()),
+            etag: Some("\"abc\"".to_string()),
+            ..Default::default()
+        };
+
+        assert!(opts.precondition_check(&info).is_ok());
+    }
+
+    #[test]
+    fn from_file_info_preserves_replication_decision() {
+        let fi = rustfs_filemeta::FileInfo {
+            replication_state_internal: Some(ReplicationState {
+                replicate_decision_str: "arn=true;false;arn:replication::1:dest;rule-id".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "object", true);
+
+        assert_eq!(info.replication_decision, "arn=true;false;arn:replication::1:dest;rule-id");
     }
 
     #[test]

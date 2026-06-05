@@ -12,12 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::disk_store::get_drive_walkdir_stall_timeout;
 use crate::disk::error::DiskError;
 use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
 use futures::future::join_all;
+use metrics::counter;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
-use std::{future::Future, pin::Pin};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+use tokio::io::AsyncRead;
 use tokio::spawn;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -25,6 +35,30 @@ pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()
 pub type PartialFn =
     Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 type FinishedFn = Box<dyn Fn(&[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+
+#[derive(Debug)]
+enum PeekOutcome {
+    Ready(Option<MetaCacheEntry>),
+    Error(rustfs_filemeta::Error),
+    TimedOut,
+}
+
+async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>, timeout_duration: Duration) -> PeekOutcome {
+    match timeout(timeout_duration, reader.peek()).await {
+        Ok(Ok(entry)) => PeekOutcome::Ready(entry),
+        Ok(Err(err)) => PeekOutcome::Error(err),
+        Err(_) => PeekOutcome::TimedOut,
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) enum TestReaderBehavior {
+    Eof,
+    Stall,
+    ProducerError(DiskError),
+    PartialThenTimeout(Vec<MetaCacheEntry>),
+}
 
 #[derive(Default)]
 pub struct ListPathRawOptions {
@@ -41,6 +75,10 @@ pub struct ListPathRawOptions {
     pub agreed: Option<AgreedFn>,
     pub partial: Option<PartialFn>,
     pub finished: Option<FinishedFn>,
+    #[cfg(test)]
+    pub(crate) test_reader_behaviors: Vec<TestReaderBehavior>,
+    #[cfg(test)]
+    pub(crate) peek_timeout: Option<Duration>,
     // pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
     // pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
     // pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
@@ -59,6 +97,10 @@ impl Clone for ListPathRawOptions {
             min_disks: self.min_disks,
             report_not_found: self.report_not_found,
             per_disk_limit: self.per_disk_limit,
+            #[cfg(test)]
+            test_reader_behaviors: self.test_reader_behaviors.clone(),
+            #[cfg(test)]
+            peek_timeout: self.peek_timeout,
             ..Default::default()
         }
     }
@@ -66,23 +108,52 @@ impl Clone for ListPathRawOptions {
 
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
     if opts.disks.is_empty() {
-        return Err(DiskError::other("list_path_raw: 0 drives provided"));
+        return Err(DiskError::ErasureReadQuorum);
     }
 
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
-    let fds = opts.fallback_disks.iter().flatten().cloned().collect::<Vec<_>>();
+    let fds = opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>();
+    let max_disk_failures = opts.disks.len().saturating_sub(opts.min_disks);
+    let producer_errs: Arc<[OnceLock<DiskError>]> = (0..opts.disks.len()).map(|_| OnceLock::new()).collect::<Vec<_>>().into();
 
     let cancel_rx = CancellationToken::new();
 
-    for disk in opts.disks.iter() {
+    for (disk_idx, disk) in opts.disks.iter().enumerate() {
         let opdisk = disk.clone();
         let opts_clone = opts.clone();
         let mut fds_clone = fds.clone();
         let cancel_rx_clone = cancel_rx.clone();
-        let (rd, mut wr) = tokio::io::duplex(64);
+        let producer_errs_clone = producer_errs.clone();
+        let (rd, wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
         jobs.push(spawn(async move {
+            #[cfg(test)]
+            if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
+                match behavior {
+                    TestReaderBehavior::Eof => return Ok(()),
+                    TestReaderBehavior::Stall => {
+                        let _held_writer = wr;
+                        cancel_rx_clone.cancelled().await;
+                        return Ok(());
+                    }
+                    TestReaderBehavior::ProducerError(err) => {
+                        record_producer_error(&producer_errs_clone, disk_idx, &err);
+                        return Err(err);
+                    }
+                    TestReaderBehavior::PartialThenTimeout(entries) => {
+                        let mut wr = wr;
+                        let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                        let err = DiskError::Timeout;
+                        record_producer_error(&producer_errs_clone, disk_idx, &err);
+                        let _ = out.write(&entries).await;
+                        drop(out);
+                        return Err(err);
+                    }
+                }
+            }
+
+            let mut wr = wr;
             let wakl_opts = WalkDirOptions {
                 bucket: opts_clone.bucket.clone(),
                 base_dir: opts_clone.path.clone(),
@@ -95,15 +166,18 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             };
 
             let mut need_fallback = false;
+            let mut last_err = None;
             if let Some(disk) = opdisk {
                 match disk.walk_dir(wakl_opts, &mut wr).await {
                     Ok(_res) => {}
                     Err(err) => {
                         info!("walk dir err {:?}", &err);
+                        last_err = Some(err);
                         need_fallback = true;
                     }
                 }
             } else {
+                last_err = Some(DiskError::DiskNotFound);
                 need_fallback = true;
             }
 
@@ -113,18 +187,19 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             }
 
             while need_fallback {
-                let disk_op = {
-                    if fds_clone.is_empty() {
-                        None
-                    } else {
-                        let disk = fds_clone.remove(0);
-                        if disk.is_online().await { Some(disk.clone()) } else { None }
+                let mut disk_op = None;
+                while let Some(disk) = fds_clone.pop_front() {
+                    if disk.is_online().await {
+                        disk_op = Some(disk);
+                        break;
                     }
-                };
+                }
 
                 let Some(disk) = disk_op else {
                     warn!("list_path_raw: fallback disk is none");
-                    break;
+                    let err = last_err.unwrap_or(DiskError::DiskNotFound);
+                    record_producer_error(&producer_errs_clone, disk_idx, &err);
+                    return Err(err);
                 };
 
                 match disk
@@ -146,12 +221,17 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 {
                     Ok(_r) => {
                         need_fallback = false;
+                        last_err = None;
                     }
                     Err(err) => {
                         error!("walk dir2 err {:?}", &err);
-                        break;
+                        last_err = Some(err);
                     }
                 }
+            }
+
+            if need_fallback {
+                return Err(last_err.unwrap_or(DiskError::DiskNotFound));
             }
 
             // warn!("list_path_raw: while need_fallback done");
@@ -160,6 +240,10 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     }
 
     let revjob = spawn(async move {
+        #[cfg(test)]
+        let peek_timeout = opts.peek_timeout.unwrap_or_else(get_drive_walkdir_stall_timeout);
+        #[cfg(not(test))]
+        let peek_timeout = get_drive_walkdir_stall_timeout();
         let mut errs: Vec<Option<DiskError>> = Vec::with_capacity(readers.len());
         for _ in 0..readers.len() {
             errs.push(None);
@@ -191,19 +275,30 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                     continue;
                 }
 
-                let entry = match r.peek().await {
-                    Ok(res) => {
+                let entry = match peek_with_timeout(r, peek_timeout).await {
+                    PeekOutcome::Ready(res) => {
                         if let Some(entry) = res {
                             // info!("read entry disk: {}, name: {}", i, entry.name);
                             entry
                         } else {
+                            if let Some(err) = producer_error(&producer_errs, i) {
+                                has_err += 1;
+                                errs[i] = Some(err);
+                                continue;
+                            }
                             // eof
                             at_eof += 1;
                             // warn!("list_path_raw: peek eof, disk: {}", i);
                             continue;
                         }
                     }
-                    Err(err) => {
+                    PeekOutcome::Error(err) => {
+                        if let Some(err) = producer_error(&producer_errs, i) {
+                            has_err += 1;
+                            errs[i] = Some(err);
+                            continue;
+                        }
+
                         if err == rustfs_filemeta::Error::Unexpected {
                             at_eof += 1;
                             // warn!("list_path_raw: peek err eof, disk: {}", i);
@@ -235,6 +330,31 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                             // warn!("list_path_raw: peek err, disk: {}", i);
                             continue;
                         }
+                    }
+                    PeekOutcome::TimedOut => {
+                        has_err += 1;
+                        errs[i] = Some(DiskError::Timeout);
+                        let endpoint = opts
+                            .disks
+                            .get(i)
+                            .and_then(|disk| disk.as_ref().map(|disk| disk.endpoint().to_string()))
+                            .unwrap_or_else(|| "missing".to_string());
+                        counter!(
+                            "rustfs_list_path_raw_stall_total",
+                            "drive" => endpoint.clone()
+                        )
+                        .increment(1);
+                        warn!(
+                            drive = %endpoint,
+                            bucket = %opts.bucket,
+                            path = %opts.path,
+                            timeout_ms = peek_timeout.as_millis(),
+                            "list_path_raw reader peek timed out; excluding drive from current merge"
+                        );
+                        let (detached_rd, write_half) = tokio::io::duplex(1);
+                        drop(write_half);
+                        *r = MetacacheReader::new(detached_rd);
+                        continue;
                     }
                 };
 
@@ -288,6 +408,15 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 if let Some(finished_fn) = opts.finished.as_ref() {
                     finished_fn(&errs).await;
                 }
+                if errs.iter().flatten().any(|err| *err == DiskError::Timeout) {
+                    return Err(DiskError::Timeout);
+                }
+                let mut err_iter = errs.iter().flatten();
+                if let Some(err) = err_iter.next()
+                    && err_iter.next().is_none()
+                {
+                    return Err(err.clone());
+                }
                 let mut combined_err = Vec::new();
                 errs.iter().zip(opts.disks.iter()).for_each(|(err, disk)| match (err, disk) {
                     (Some(err), Some(disk)) => {
@@ -312,6 +441,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                     && let Some(finished_fn) = opts.finished.as_ref()
                 {
                     finished_fn(&errs).await;
+                }
+                if errs.iter().flatten().any(|err| *err == DiskError::Timeout) {
+                    return Err(DiskError::Timeout);
                 }
 
                 // error!("list_path_raw: at_eof + has_err == readers.len() break {:?}", &errs);
@@ -355,12 +487,151 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     }
 
     let results = join_all(jobs).await;
+    let mut job_errs = Vec::new();
     for result in results {
-        if let Err(err) = result {
-            error!("list_path_raw err {:?}", err);
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                error!("list_path_raw producer err {:?}", err);
+                job_errs.push(err);
+            }
+            Err(err) => {
+                error!("list_path_raw join err {:?}", err);
+                job_errs.push(err.into());
+            }
         }
+    }
+
+    if job_errs.len() > max_disk_failures {
+        return Err(job_errs.remove(0));
     }
 
     // warn!("list_path_raw: done");
     Ok(())
+}
+
+#[inline]
+fn record_producer_error(producer_errs: &[OnceLock<DiskError>], idx: usize, err: &DiskError) {
+    let _ = producer_errs[idx].set(err.clone());
+}
+
+#[inline]
+fn producer_error(producer_errs: &[OnceLock<DiskError>], idx: usize) -> Option<DiskError> {
+    producer_errs[idx].get().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_filemeta::MetacacheWriter;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn list_path_raw_empty_disks_returns_read_quorum() {
+        let err = list_path_raw(CancellationToken::new(), ListPathRawOptions::default())
+            .await
+            .expect_err("empty drive list should fail");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_returns_timeout_when_reader_stalls_before_completion() {
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::Stall, TestReaderBehavior::Eof],
+                peek_timeout: Some(Duration::from_millis(20)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("stalled reader should make listing fail explicitly");
+
+        assert_eq!(err, DiskError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_returns_timeout_when_producer_fails_after_partial_entry() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::PartialThenTimeout(vec![MetaCacheEntry {
+                    name: "bucket/object".to_string(),
+                    metadata: vec![1, 2, 3],
+                    cached: None,
+                    reusable: false,
+                }])],
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    let seen = seen_clone.clone();
+                    Box::pin(async move {
+                        seen.lock().expect("seen mutex poisoned").push(entry.name);
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("producer timeout after partial output must fail the listing");
+
+        assert_eq!(err, DiskError::Timeout);
+        assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &["bucket/object".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn peek_with_timeout_times_out_on_silent_reader() {
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = MetacacheReader::new(reader);
+
+        let outcome = peek_with_timeout(&mut reader, Duration::from_millis(20)).await;
+        assert!(matches!(outcome, PeekOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn peek_with_timeout_reads_entry_before_deadline() {
+        let (reader, writer) = tokio::io::duplex(256);
+        let mut metacache_reader = MetacacheReader::new(reader);
+
+        tokio::spawn(async move {
+            let mut writer = MetacacheWriter::new(writer);
+            let entry = MetaCacheEntry {
+                name: "bucket/object".to_string(),
+                metadata: vec![1, 2, 3],
+                cached: None,
+                reusable: false,
+            };
+            writer.write(&[entry]).await.expect("entry should be written");
+            writer.close().await.expect("writer should close");
+        });
+
+        let outcome = peek_with_timeout(&mut metacache_reader, Duration::from_secs(1)).await;
+        match outcome {
+            PeekOutcome::Ready(Some(entry)) => assert_eq!(entry.name, "bucket/object"),
+            other => panic!("expected ready entry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_propagates_producer_access_denied() {
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::ProducerError(DiskError::FileAccessDenied)],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("producer access failure must not be treated as an empty listing");
+
+        assert_eq!(err, DiskError::FileAccessDenied);
+    }
 }

@@ -18,13 +18,15 @@ use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
-use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::rpc::client::{
+    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
+};
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
     disk::{
         self, VolumeInfo,
-        disk_store::{CHECK_EVERY, CHECK_TIMEOUT_DURATION, DiskHealthTracker},
+        disk_store::{DiskHealthTracker, get_drive_active_check_interval, get_drive_active_check_timeout},
     },
     endpoints::{EndpointServerPools, Node},
     store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
@@ -46,6 +48,32 @@ use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
+
+fn pool_participant_errors(clients: &[Client], errors: &[Option<Error>], pool_idx: usize) -> Vec<Option<Error>> {
+    clients
+        .iter()
+        .zip(errors.iter())
+        .filter_map(|(client, err)| {
+            if client.get_pools().unwrap_or_default().contains(&pool_idx) {
+                Some(err.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn pool_write_quorum(participant_count: usize) -> usize {
+    (participant_count / 2) + 1
+}
+
+fn reduce_pool_write_quorum_errs(per_pool_errs: &[Option<Error>]) -> Option<Error> {
+    if per_pool_errs.is_empty() {
+        return Some(Error::ErasureWriteQuorum);
+    }
+
+    reduce_write_quorum_errs(per_pool_errs, BUCKET_OP_IGNORED_ERRS, pool_write_quorum(per_pool_errs.len()))
+}
 
 #[async_trait]
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
@@ -188,18 +216,8 @@ impl S3PeerSys {
         }
 
         for i in 0..self.pools_count {
-            let mut per_pool_errs = vec![None; self.clients.len()];
-            for (j, cli) in self.clients.iter().enumerate() {
-                let pools = cli.get_pools();
-                let idx = i;
-                if pools.unwrap_or_default().contains(&idx) {
-                    per_pool_errs[j] = errors[j].clone();
-                }
-            }
-
-            if let Some(pool_err) =
-                reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, (per_pool_errs.len() / 2) + 1)
-            {
+            let per_pool_errs = pool_participant_errors(&self.clients, &errors, i);
+            if let Some(pool_err) = reduce_pool_write_quorum_errs(&per_pool_errs) {
                 tracing::error!("make_bucket per_pool_errs: {per_pool_errs:?}");
                 tracing::error!("make_bucket reduce_write_quorum_errs: {pool_err}");
                 return Err(pool_err);
@@ -357,7 +375,7 @@ impl S3PeerSys {
 
         ress.into_iter()
             .filter(|op| op.is_some())
-            .find_map(|op| op.clone())
+            .find_map(|op| op)
             .ok_or(Error::VolumeNotFound)
     }
 
@@ -575,7 +593,7 @@ pub struct RemotePeerS3Client {
 
 impl RemotePeerS3Client {
     pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
-        let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default().to_string();
+        let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default();
         let client = Self {
             node,
             pools,
@@ -613,7 +631,7 @@ impl RemotePeerS3Client {
 
     /// Monitor remote peer health periodically
     async fn monitor_remote_peer_health(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
-        let mut interval = time::interval(CHECK_EVERY);
+        let mut interval = time::interval(get_drive_active_check_interval());
 
         loop {
             tokio::select! {
@@ -682,7 +700,7 @@ impl RemotePeerS3Client {
         let port = url.port_or_known_default().unwrap_or(80);
 
         // Try to establish TCP connection
-        match timeout(CHECK_TIMEOUT_DURATION, TcpStream::connect((host, port))).await {
+        match timeout(get_drive_active_check_timeout(), TcpStream::connect((host, port))).await {
             Ok(Ok(_)) => Ok(()),
             _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
         }
@@ -717,14 +735,37 @@ impl RemotePeerS3Client {
                     self.health.log_success();
                 }
                 self.health.decrement_waiting();
+                if let Err(err) = &operation_result
+                    && is_network_like_disk_error(err)
+                {
+                    self.mark_faulty_and_start_recovery("operation_network_error").await;
+                }
                 operation_result
             }
             Err(_) => {
                 // Timeout occurred, mark peer as potentially faulty
                 self.health.decrement_waiting();
+                self.mark_faulty_and_start_recovery("operation_timeout").await;
                 warn!("Remote peer operation timeout after {:?}", timeout_duration);
                 Err(Error::other(format!("Remote peer operation timeout after {timeout_duration:?}")))
             }
+        }
+    }
+
+    async fn mark_faulty_and_start_recovery(&self, reason: &'static str) {
+        if self.health.swap_ok_to_faulty() {
+            warn!(
+                addr = %self.addr,
+                reason,
+                "Remote peer marked faulty after network failure"
+            );
+
+            let health = Arc::clone(&self.health);
+            let cancel_token = self.cancel_token.clone();
+            let addr = self.addr.clone();
+            tokio::spawn(async move {
+                Self::monitor_remote_peer_recovery(addr, health, cancel_token).await;
+            });
         }
     }
 }
@@ -1000,4 +1041,167 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
 
 async fn clone_drives() -> Vec<Option<DiskStore>> {
     GLOBAL_LOCAL_DISK_MAP.read().await.values().cloned().collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestPeerS3Client {
+        pools: Option<Vec<usize>>,
+        make_bucket_result: Result<()>,
+    }
+
+    #[async_trait]
+    impl PeerS3Client for TestPeerS3Client {
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
+            unreachable!("not used by quorum tests")
+        }
+
+        async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
+            self.make_bucket_result.clone()
+        }
+
+        async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+            unreachable!("not used by quorum tests")
+        }
+
+        async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+            unreachable!("not used by quorum tests")
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+            unreachable!("not used by quorum tests")
+        }
+
+        fn get_pools(&self) -> Option<Vec<usize>> {
+            self.pools.clone()
+        }
+    }
+
+    fn test_peer(pools: &[usize]) -> Client {
+        test_peer_with_make_bucket(pools, Ok(()))
+    }
+
+    fn test_peer_with_make_bucket(pools: &[usize], make_bucket_result: Result<()>) -> Client {
+        Arc::new(Box::new(TestPeerS3Client {
+            pools: Some(pools.to_vec()),
+            make_bucket_result,
+        }))
+    }
+
+    fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
+        let node = Node {
+            url: url::Url::parse(addr).expect("test peer URL should parse"),
+            pools: vec![0],
+            is_local: false,
+            grid_host: addr.to_string(),
+        };
+
+        RemotePeerS3Client {
+            node: Some(node),
+            pools: Some(vec![0]),
+            addr: addr.to_string(),
+            health: Arc::new(DiskHealthTracker::new()),
+            cancel_token: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_marks_remote_peer_faulty_on_network_like_error() {
+        let client = test_remote_peer("http://peer-network-error:9000");
+
+        let err = client
+            .execute_with_timeout(
+                || async {
+                    Err::<(), Error>(DiskError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    )))
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("network-like error should fail");
+
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io network error, got {other:?}"),
+            },
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert!(client.health.is_faulty(), "network-like errors should mark remote peer faulty");
+
+        client.cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_keeps_remote_peer_online_for_business_error() {
+        let client = test_remote_peer("http://peer-business-error:9000");
+
+        let err = client
+            .execute_with_timeout(|| async { Err::<(), Error>(DiskError::FileNotFound) }, Duration::from_secs(1))
+            .await
+            .expect_err("business error should fail");
+
+        assert_eq!(err, DiskError::FileNotFound);
+        assert!(!client.health.is_faulty(), "business errors should not mark remote peer faulty");
+
+        client.cancel_token.cancel();
+    }
+
+    #[test]
+    fn test_reduce_pool_write_quorum_uses_only_pool_participants() {
+        let clients = vec![
+            test_peer(&[0]),
+            test_peer(&[0]),
+            test_peer(&[0]),
+            test_peer(&[0]),
+            test_peer(&[1]),
+            test_peer(&[1]),
+            test_peer(&[1]),
+            test_peer(&[1]),
+        ];
+        let errors = vec![
+            Some(Error::VolumeExists),
+            Some(Error::VolumeExists),
+            Some(Error::VolumeExists),
+            Some(Error::VolumeExists),
+            None,
+            None,
+            None,
+            None,
+        ];
+
+        let per_pool_errs = pool_participant_errors(&clients, &errors, 0);
+        let err = reduce_pool_write_quorum_errs(&per_pool_errs).expect("all pool participants returned VolumeExists");
+
+        assert_eq!(err, Error::VolumeExists);
+    }
+
+    #[tokio::test]
+    async fn test_make_bucket_reduces_quorum_by_pool_participants() {
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer(&[1]),
+                test_peer(&[1]),
+                test_peer(&[1]),
+                test_peer(&[1]),
+            ],
+            pools_count: 2,
+        };
+
+        let err = peer_sys
+            .make_bucket("existing-bucket", &MakeBucketOptions::default())
+            .await
+            .expect_err("existing bucket should surface as VolumeExists, not quorum failure");
+
+        assert_eq!(err, Error::VolumeExists);
+    }
 }

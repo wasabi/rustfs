@@ -51,12 +51,11 @@ use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
+use rustfs_concurrency::workers::Workers;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
-use rustfs_workers::workers::Workers;
+use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 #[cfg(test)]
@@ -141,6 +140,13 @@ fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn decommission_meta_bucket_options() -> MakeBucketOptions {
+    MakeBucketOptions {
+        force_create: true,
+        ..Default::default()
+    }
 }
 
 fn is_decommission_active(complete: bool, failed: bool, canceled: bool) -> bool {
@@ -987,25 +993,11 @@ impl PoolMeta {
 }
 
 pub fn path2_bucket_object(name: &str) -> (String, String) {
-    path2_bucket_object_with_base_path("", name)
+    path_to_bucket_object(name)
 }
 
 pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
-    // Trim the base path and leading slash
-    let trimmed_path = path
-        .strip_prefix(base_path)
-        .unwrap_or(path)
-        .strip_prefix(SLASH_SEPARATOR)
-        .unwrap_or(path);
-    // Find the position of the first '/'
-    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR) else {
-        return (trimmed_path.to_string(), "".to_string());
-    };
-    // Split into bucket and prefix
-    let bucket = &trimmed_path[0..pos];
-    let prefix = &trimmed_path[pos + 1..]; // +1 to skip the '/' character if it exists
-
-    (bucket.to_string(), prefix.to_string())
+    path_to_bucket_object_with_base_path(base_path, path)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1406,7 +1398,8 @@ impl ECStore {
 
         let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
 
-        fivs.versions.sort_by_key(|b| Reverse(b.mod_time));
+        fivs.versions
+            .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
@@ -2050,9 +2043,10 @@ impl ECStore {
             path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)]),
         ];
 
+        let meta_bucket_opts = decommission_meta_bucket_options();
         for bk in meta_buckets.iter() {
             if let Err(err) = self
-                .make_bucket(bk.to_string_lossy().to_string().as_str(), &MakeBucketOptions::default())
+                .make_bucket(bk.to_string_lossy().to_string().as_str(), &meta_bucket_opts)
                 .await
                 && !is_err_bucket_exists(&err)
             {
@@ -2751,12 +2745,13 @@ mod pools_tests {
     use super::{
         DecomBucketInfo, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolStatus, bind_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
-        decommission_cancel_signal_result, decommission_item_size, decommission_start_guard_state, dedup_indices,
-        ensure_decommission_cancel_allowed, ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing,
-        ensure_decommission_start_allowed, ensure_decommission_terminal_operation_supported,
-        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
-        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
+        decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed,
+        ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
+        ensure_decommission_terminal_operation_supported, ensure_valid_decommission_pool_index, get_by_index,
+        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
+        load_decommission_entry_versions, mark_decommission_bucket_done, require_decommission_store,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
         resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
@@ -3391,6 +3386,13 @@ mod pools_tests {
     }
 
     #[test]
+    fn test_decommission_meta_bucket_options_are_idempotent() {
+        let opts = decommission_meta_bucket_options();
+
+        assert!(opts.force_create);
+    }
+
+    #[test]
     fn test_is_decommission_active_true_only_when_not_terminal() {
         assert!(is_decommission_active(false, false, false));
         assert!(!is_decommission_active(true, false, false));
@@ -3685,7 +3687,7 @@ mod pools_tests {
     #[test]
     fn test_take_decommission_canceler_takes_and_clears_slot() {
         let token = CancellationToken::new();
-        let mut cancelers = vec![Some(token.clone())];
+        let mut cancelers = vec![Some(token)];
 
         let taken = take_decommission_canceler(cancelers.as_mut_slice(), 0);
         assert!(taken.is_some());
@@ -3745,5 +3747,14 @@ mod pools_tests {
             err.to_string()
                 .contains("failed to start decommission routines: scheduled 1 of 2 expected workers")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_path2_bucket_object_with_base_path_supports_windows_separators() {
+        let (bucket, object) = super::path2_bucket_object_with_base_path("C:\\data", "C:\\data\\my-bucket\\nested\\object.txt");
+
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(object, "nested/object.txt");
     }
 }

@@ -4,9 +4,6 @@
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml">
     <img src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" alt="CI Status" />
   </a>
-  <a href="https://docs.rs/rustfs-io-metrics">
-    <img src="https://docs.rs/rustfs-io-metrics/badge.svg" alt="Documentation" />
-  </a>
   <a href="https://crates.io/crates/rustfs-io-metrics">
     <img src="https://img.shields.io/crates/v/rustfs-io-metrics.svg" alt="Crates.io" />
   </a>
@@ -14,7 +11,7 @@
 
 <p align="center">
   · <a href="https://github.com/rustfs/rustfs">🏠 主页</a>
-  · <a href="https://docs.rs/rustfs-io-metrics">📚 文档</a>
+  · <a href="#-文档">📚 文档</a>
   · <a href="https://github.com/rustfs/rustfs/issues">🐛 问题</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">💬 讨论</a>
 </p>
@@ -31,6 +28,7 @@
 - **带宽监控**：实时带宽观测和分析
 - **性能指标**：I/O 性能指标收集
 - **统一配置**：集中式配置管理
+- **导出边界**：通过 `metrics` 主动上报，由 `rustfs-obs` 负责 OTEL 导出，不提供 Prometheus HTTP 端点
 
 ## ✨ 核心功能
 
@@ -237,15 +235,6 @@ println!("最大并发读: {}", config.scheduler.max_concurrent_reads);
 
 ## 🔧 配置
 
-### 环境变量
-
-| 变量名 | 描述 | 默认值 |
-|--------|------|--------|
-| `RUSTFS_CACHE_MAX_CAPACITY` | 缓存最大容量 | 10000 |
-| `RUSTFS_CACHE_TTL_SECS` | 缓存 TTL 秒数 | 300 |
-| `RUSTFS_CACHE_MAX_MEMORY` | 缓存最大内存 | 104857600 |
-| `RUSTFS_ADAPTIVE_TTL_ENABLED` | 启用自适应 TTL | true |
-
 ### 代码配置
 
 ```rust
@@ -289,15 +278,27 @@ cargo test --package rustfs-io-metrics
 cargo test --package rustfs-io-metrics --lib adaptive_ttl
 
 # 运行基准测试
-cargo bench --package rustfs-io-metrics
+cargo bench --package rustfs-io-metrics --bench metrics_pipeline
 ```
 
 ## 📚 文档
 
-- [API 文档](https://docs.rs/rustfs-io-metrics)
-- [自适应 TTL 设计](./docs/adaptive-ttl-design.md)
-- [指标收集指南](./docs/metrics-guide.md)
-- [配置参考](./docs/config-reference.md)
+此 crate 通过 Rust `metrics` crate 记录指标，并由 `rustfs-obs` 或应用层可观测性管线负责导出。
+它本身不提供 Prometheus 兼容的 HTTP 端点，例如 `/rustfs/v2/metrics/cluster`
+或 `/rustfs/v2/metrics/node`。
+
+可以在本地生成 API 文档：
+
+```bash
+cargo doc --package rustfs-io-metrics --no-deps --open
+```
+
+相关源码入口：
+
+- [Crate API 概览](./src/lib.rs)
+- [指标示例](./examples/metrics_example.rs)
+- [配置模块](./src/config.rs)
+- [自适应 TTL 模块](./src/adaptive_ttl.rs)
 
 ## 🔗 相关模块
 

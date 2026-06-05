@@ -19,6 +19,7 @@ pub mod error_conv;
 pub mod error_reduce;
 pub mod format;
 pub mod fs;
+pub mod health_state;
 pub mod local;
 pub mod os;
 
@@ -33,8 +34,10 @@ pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::disk::disk_store::LocalDiskWrapper;
+use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
 use crate::rpc::RemoteDisk;
+use crate::rpc::build_internode_data_transport_from_env;
 use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
@@ -411,6 +414,53 @@ impl DiskAPI for Disk {
 }
 
 impl Disk {
+    pub fn runtime_state(&self) -> RuntimeDriveHealthState {
+        match self {
+            Disk::Local(local_disk) => local_disk.runtime_state(),
+            Disk::Remote(remote_disk) => remote_disk.runtime_state(),
+        }
+    }
+
+    pub fn offline_duration_secs(&self) -> Option<u64> {
+        match self {
+            Disk::Local(local_disk) => local_disk.offline_duration_secs(),
+            Disk::Remote(remote_disk) => remote_disk.offline_duration_secs(),
+        }
+    }
+
+    pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
+        match self {
+            Disk::Local(local_disk) => local_disk.last_capacity_snapshot(),
+            Disk::Remote(remote_disk) => remote_disk.last_capacity_snapshot(),
+        }
+    }
+
+    pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
+        match self {
+            Disk::Local(local_disk) => local_disk.record_capacity_probe(total, used, free),
+            Disk::Remote(remote_disk) => remote_disk.record_capacity_probe(total, used, free),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
+        match self {
+            Disk::Local(local_disk) => local_disk.force_runtime_state_for_test(state),
+            Disk::Remote(remote_disk) => remote_disk.force_runtime_state_for_test(state),
+        }
+    }
+}
+
+impl Disk {
+    /// Reset drive health so `connect_load_init_formats` retries are not blocked by a prior
+    /// transient mark-faulty (same disk handles are reused across retries).
+    pub fn reset_health_for_store_init_retry(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.reset_health_for_store_init_retry(),
+            Disk::Remote(remote_disk) => remote_disk.reset_health_for_store_init_retry(),
+        }
+    }
+
     /// Enable health monitoring on this disk.
     /// Called after startup format loading completes so that remote peers
     /// have time to come online before being marked as faulty.
@@ -427,7 +477,8 @@ pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
         Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(s), opt.health_check)))))
     } else {
-        let remote_disk = RemoteDisk::new(ep, opt).await?;
+        let data_transport = build_internode_data_transport_from_env();
+        let remote_disk = RemoteDisk::new(ep, opt, data_transport?).await?;
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
     }
 }
@@ -533,6 +584,7 @@ pub struct CheckPartsResp {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct UpdateMetadataOpts {
     pub no_persistence: bool,
+    pub replace_user_metadata: bool,
 }
 
 pub struct DiskLocation {
@@ -570,6 +622,8 @@ pub struct DiskInfo {
     pub scanning: bool,
     pub endpoint: String,
     pub mount_path: String,
+    /// Leaf physical block devices backing this mount path when available.
+    pub physical_device_ids: Vec<String>,
     pub id: Option<Uuid>,
     pub rotational: bool,
     pub metrics: DiskMetrics,
@@ -746,7 +800,6 @@ mod tests {
     use endpoint::Endpoint;
     use local::LocalDisk;
     use rustfs_filemeta::S3VersionId;
-    use std::path::PathBuf;
     use tokio::fs;
     use uuid::Uuid;
 
@@ -895,9 +948,13 @@ mod tests {
     /// Test UpdateMetadataOpts structure
     #[test]
     fn test_update_metadata_opts() {
-        let opts = UpdateMetadataOpts { no_persistence: true };
+        let opts = UpdateMetadataOpts {
+            no_persistence: true,
+            ..Default::default()
+        };
 
         assert!(opts.no_persistence);
+        assert!(!opts.replace_user_metadata);
     }
 
     /// Test DiskOption structure
@@ -1047,7 +1104,7 @@ mod tests {
         assert!(disk.is_ok());
 
         let disk = disk.unwrap();
-        assert_eq!(disk.path(), PathBuf::from(test_dir).canonicalize().unwrap());
+        assert_eq!(disk.path(), rustfs_utils::canonicalize(test_dir).unwrap());
         assert!(disk.is_local());
         // Note: is_online() might return false for local disks without proper initialization
         // This is expected behavior for test environments
@@ -1085,5 +1142,42 @@ mod tests {
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn reset_health_for_store_init_retry_delegates_to_disk_variants() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_path = local_dir.path().to_str().expect("tempdir path should be utf8");
+        let mut local_endpoint = Endpoint::try_from(local_path).expect("local endpoint should parse");
+        local_endpoint.set_pool_index(0);
+        local_endpoint.set_set_index(0);
+        local_endpoint.set_disk_index(0);
+        let local_disk = LocalDisk::new(&local_endpoint, false).await.unwrap();
+        let local_disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
+
+        let mut remote_endpoint = Endpoint::try_from("http://remote-server:9000/data").expect("remote endpoint should parse");
+        remote_endpoint.set_pool_index(0);
+        remote_endpoint.set_set_index(0);
+        remote_endpoint.set_disk_index(1);
+        let remote_disk = RemoteDisk::new(
+            &remote_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(crate::rpc::TcpHttpInternodeDataTransport),
+        )
+        .await
+        .unwrap();
+        let remote_disk = Disk::Remote(Box::new(remote_disk));
+
+        for disk in [&local_disk, &remote_disk] {
+            disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Offline);
+
+            disk.reset_health_for_store_init_retry();
+
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+        }
     }
 }

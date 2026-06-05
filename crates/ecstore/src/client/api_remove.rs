@@ -25,7 +25,7 @@ use hyper::body::Bytes;
 use rustfs_utils::HashAlgorithm;
 use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
-use s3s::header::X_AMZ_BYPASS_GOVERNANCE_RETENTION;
+use s3s::header::{X_AMZ_BYPASS_GOVERNANCE_RETENTION, X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use serde::Deserialize;
 use std::fmt::Display;
 use std::{
@@ -111,8 +111,9 @@ impl TransitionClient {
             .await?;
 
         {
-            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-            bucket_loc_cache.delete(bucket_name);
+            if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                bucket_loc_cache.delete(bucket_name);
+            }
         }
         Ok(())
     }
@@ -142,8 +143,9 @@ impl TransitionClient {
             .await?;
 
         {
-            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-            bucket_loc_cache.delete(bucket_name);
+            if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                bucket_loc_cache.delete(bucket_name);
+            }
         }
 
         Ok(())
@@ -168,7 +170,7 @@ impl TransitionClient {
         let mut headers = HeaderMap::new();
 
         if opts.governance_bypass {
-            headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, "true".parse().expect("err")); //amzBypassGovernance
+            headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, HeaderValue::from_static("true")); //amzBypassGovernance
         }
 
         let resp = self
@@ -197,13 +199,12 @@ impl TransitionClient {
         Ok(RemoveObjectResult {
             object_name: object_name.to_string(),
             object_version_id: opts.version_id,
-            delete_marker: resp.headers().get("x-amz-delete-marker").expect("err") == "true",
+            delete_marker: resp.headers().get(X_AMZ_DELETE_MARKER).map_or(false, |v| v == "true"),
             delete_marker_version_id: resp
                 .headers()
-                .get("x-amz-version-id")
-                .expect("err")
-                .to_str()
-                .expect("err")
+                .get(X_AMZ_VERSION_ID)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
                 .to_string(),
             ..Default::default()
         })
@@ -290,15 +291,15 @@ impl TransitionClient {
                             bucket_name,
                             &object.name,
                             RemoveObjectOptions {
-                                version_id: object.version_id.expect("err").to_string(),
+                                version_id: object.version_id.map(|id| id.to_string()).unwrap_or_default(),
                                 governance_bypass: opts.governance_bypass,
                                 ..Default::default()
                             },
                         )
                         .await?;
                     let remove_result_clone = remove_result.clone();
-                    if !remove_result.err.is_none() {
-                        match to_error_response(&remove_result.err.expect("err")).code {
+                    if let Some(err) = &remove_result.err {
+                        match to_error_response(err).code {
                             S3ErrorCode::InvalidArgument | S3ErrorCode::NoSuchVersion => {
                                 continue;
                             }
@@ -326,7 +327,7 @@ impl TransitionClient {
 
             let mut headers = HeaderMap::new();
             if opts.governance_bypass {
-                headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, "true".parse().expect("err"));
+                headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, HeaderValue::from_static("true"));
             }
 
             let remove_bytes = generate_remove_multi_objects_request(&batch);
@@ -339,7 +340,7 @@ impl TransitionClient {
                         content_body: ReaderImpl::Body(Bytes::from(remove_bytes.clone())),
                         content_length: remove_bytes.len() as i64,
                         content_md5_base64: base64_encode(&HashAlgorithm::Md5.hash_encode(&remove_bytes).as_ref()),
-                        content_sha256_hex: base64_encode(&HashAlgorithm::SHA256.hash_encode(&remove_bytes).as_ref()),
+                        content_sha256_hex: rustfs_utils::hex(HashAlgorithm::SHA256.hash_encode(&remove_bytes)),
                         custom_header: headers,
                         object_name: "".to_string(),
                         stream_sha256: false,
@@ -423,23 +424,20 @@ impl TransitionClient {
                         request_id: resp
                             .headers()
                             .get("x-amz-request-id")
-                            .expect("err")
-                            .to_str()
-                            .expect("err")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
                             .to_string(),
                         host_id: resp
                             .headers()
                             .get("x-amz-id-2")
-                            .expect("err")
-                            .to_str()
-                            .expect("err")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
                             .to_string(),
                         region: resp
                             .headers()
                             .get("x-amz-bucket-region")
-                            .expect("err")
-                            .to_str()
-                            .expect("err")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
                             .to_string(),
                         ..Default::default()
                     };
@@ -472,10 +470,11 @@ pub struct RemoveObjectError {
 
 impl Display for RemoveObjectError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        if self.err.is_none() {
-            return write!(f, "unexpected remove object error result");
+        if let Some(err) = &self.err {
+            write!(f, "{}", err.to_string())
+        } else {
+            write!(f, "unexpected remove object error result")
         }
-        write!(f, "{}", self.err.as_ref().expect("err").to_string())
     }
 }
 
@@ -742,4 +741,116 @@ pub async fn process_remove_multi_objects_response(
 
 fn has_invalid_xml_char(str: &str) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{
+        credentials::{Credentials, SignatureType, Static, Value},
+        transition_api::{BucketLookupType, Options},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    async fn capture_delete_objects_sha256_header() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "connection closed before request headers were received");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let request = String::from_utf8_lossy(&request);
+            let sha256_header = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("x-amz-content-sha256")
+                        .then(|| value.trim().to_string())
+                })
+                .expect("delete objects request should include X-Amz-Content-Sha256");
+
+            let response_body = r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>object.txt</Key></Deleted></DeleteResult>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            sha256_header
+        });
+
+        (endpoint, task)
+    }
+
+    #[tokio::test]
+    async fn multi_object_delete_request_uses_lowercase_hex_sha256_header() {
+        let objects = vec![ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object.txt".to_string(),
+            ..Default::default()
+        }];
+        let body = generate_remove_multi_objects_request(&objects);
+        let expected = rustfs_utils::hex(HashAlgorithm::SHA256.hash_encode(&body));
+        let (endpoint, header_task) = capture_delete_objects_sha256_header().await;
+        let client = TransitionClient::new(
+            &endpoint,
+            Options {
+                creds: Credentials::new(Static(Value {
+                    access_key_id: "access-key".to_string(),
+                    secret_access_key: "secret-key".to_string(),
+                    signer_type: SignatureType::SignatureV4,
+                    ..Default::default()
+                })),
+                region: "us-east-1".to_string(),
+                bucket_lookup: BucketLookupType::BucketLookupPath,
+                max_retries: 1,
+                ..Default::default()
+            },
+            "",
+        )
+        .await
+        .unwrap();
+        let (objects_tx, objects_rx) = mpsc::channel(1);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+
+        objects_tx.send(objects[0].clone()).await.unwrap();
+        drop(objects_tx);
+
+        client
+            .remove_objects_inner(
+                "bucket",
+                objects_rx,
+                &result_tx,
+                RemoveObjectsOptions {
+                    governance_bypass: false,
+                },
+            )
+            .await
+            .unwrap();
+        drop(result_tx);
+
+        let header = header_task.await.unwrap();
+
+        assert_eq!(header, expected);
+        assert_eq!(header.len(), 64);
+        assert!(
+            header
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(header, base64_encode(&HashAlgorithm::SHA256.hash_encode(&body).as_ref()));
+        assert!(result_rx.recv().await.is_some());
+    }
 }

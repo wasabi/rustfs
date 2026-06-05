@@ -165,13 +165,13 @@ impl AtomicLockState {
     }
 
     /// Increment waiting readers count
-    pub fn inc_readers_waiting(&self) {
+    pub fn inc_readers_waiting(&self) -> bool {
         loop {
             let current = self.state.load(Ordering::Acquire);
             let waiting = self.readers_waiting(current);
 
             if waiting == 0xFFFF {
-                break; // Max waiting readers
+                return false; // Max waiting readers
             }
 
             let new_state = current + (1 << READERS_WAITING_SHIFT);
@@ -181,7 +181,7 @@ impl AtomicLockState {
                 .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                break;
+                return true;
             }
         }
     }
@@ -209,13 +209,13 @@ impl AtomicLockState {
     }
 
     /// Increment waiting writers count
-    pub fn inc_writers_waiting(&self) {
+    pub fn inc_writers_waiting(&self) -> bool {
         loop {
             let current = self.state.load(Ordering::Acquire);
             let waiting = self.writers_waiting(current);
 
             if waiting == 0xFFFF {
-                break; // Max waiting writers
+                return false; // Max waiting writers
             }
 
             let new_state = current + (1 << WRITERS_WAITING_SHIFT);
@@ -225,7 +225,7 @@ impl AtomicLockState {
                 .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                break;
+                return true;
             }
         }
     }
@@ -299,6 +299,18 @@ impl AtomicLockState {
     fn writers_waiting(&self, state: u64) -> u16 {
         ((state & WRITERS_WAITING_MASK) >> WRITERS_WAITING_SHIFT) as u16
     }
+
+    #[cfg(test)]
+    pub fn readers_waiting_count(&self) -> u16 {
+        let state = self.state.load(Ordering::Acquire);
+        self.readers_waiting(state)
+    }
+
+    #[cfg(test)]
+    pub fn writers_waiting_count(&self) -> u16 {
+        let state = self.state.load(Ordering::Acquire);
+        self.writers_waiting(state)
+    }
 }
 
 /// Object lock state with version support - optimized memory layout
@@ -364,13 +376,7 @@ impl ObjectLockState {
     }
 
     /// Try fast path shared lock acquisition. `trace_id` / `operation_id` are stored for holder diagnostics.
-    pub fn try_acquire_shared_fast(
-        &self,
-        owner: &Arc<str>,
-        lock_timeout: Duration,
-        trace_id: Option<Arc<str>>,
-        operation_id: Option<Arc<str>>,
-    ) -> bool {
+    pub fn try_acquire_shared_fast(&self, owner: &Arc<str>, lock_timeout: Duration) -> bool {
         if !self.atomic_state.try_acquire_shared() {
             return false;
         }
@@ -381,16 +387,14 @@ impl ObjectLockState {
             entry.count = entry.count.saturating_add(1);
             entry.acquired_at = SystemTime::now();
             entry.lock_timeout = lock_timeout;
-            entry.trace_id = trace_id;
-            entry.operation_id = operation_id;
         } else {
             shared.push(SharedOwnerEntry {
                 owner: owner.clone(),
                 count: 1,
                 acquired_at: SystemTime::now(),
                 lock_timeout,
-                trace_id,
-                operation_id,
+                trace_id: None,
+                operation_id: None,
             });
         }
         true
@@ -612,8 +616,8 @@ mod tests {
         // Test shared locks
         let timeout = Duration::from_secs(30);
 
-        assert!(state.try_acquire_shared_fast(&owner1, timeout, None, None));
-        assert!(state.try_acquire_shared_fast(&owner2, timeout, None, None));
+        assert!(state.try_acquire_shared_fast(&owner1, timeout));
+        assert!(state.try_acquire_shared_fast(&owner2, timeout));
         assert!(!state.try_acquire_exclusive_fast(&owner1, timeout));
 
         assert!(state.release_shared(&owner1));
@@ -621,7 +625,7 @@ mod tests {
 
         // Test exclusive lock
         assert!(state.try_acquire_exclusive_fast(&owner1, timeout));
-        assert!(!state.try_acquire_shared_fast(&owner2, timeout, None, None));
+        assert!(!state.try_acquire_shared_fast(&owner2, timeout));
         assert!(state.release_exclusive(&owner1));
     }
 
@@ -629,14 +633,12 @@ mod tests {
     fn test_shared_correlation_in_waiter_snapshot() {
         let state = ObjectLockState::new();
         let owner = Arc::from("read-owner-1");
-        let op: Arc<str> = Arc::from("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
-        let tr: Arc<str> = Arc::from("feedface-cafe-4242-4242-424242424242");
         let timeout = Duration::from_secs(30);
-        assert!(state.try_acquire_shared_fast(&owner, timeout, Some(tr.clone()), Some(op.clone())));
+        assert!(state.try_acquire_shared_fast(&owner, timeout));
         let snap = state.waiter_contention_snapshot();
         assert_eq!(snap.shared_readers.len(), 1);
         let b = &snap.shared_readers[0];
-        assert_eq!(b.operation_id.as_ref().map(|a| a.as_ref()), Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
-        assert_eq!(b.trace_id.as_ref().map(|a| a.as_ref()), Some("feedface-cafe-4242-4242-424242424242"));
+        assert!(b.operation_id.is_none());
+        assert!(b.trace_id.is_none());
     }
 }

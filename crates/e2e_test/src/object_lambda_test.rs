@@ -25,7 +25,7 @@ use std::error::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 
 #[derive(Debug)]
@@ -172,6 +172,28 @@ async fn spawn_object_lambda_webhook_server_with_response(
     Ok((webhook_url, request_rx, handle))
 }
 
+async fn read_request_path(stream: &mut tokio::net::TcpStream) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+
+    let header_end = loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err("request ended before headers were fully received".into());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(pos) = find_header_terminator(&buffer) {
+            break pos;
+        }
+    };
+
+    let header_text = std::str::from_utf8(&buffer[..header_end])?;
+    let request_line = header_text.lines().next().ok_or("missing request line")?;
+    let path = request_line.split_whitespace().nth(1).ok_or("missing request path")?;
+
+    Ok(path.to_string())
+}
+
 async fn presigned_get_request(
     url: &str,
     access_key: &str,
@@ -313,6 +335,39 @@ async fn list_target_arns(env: &RustFSTestEnvironment) -> Result<Vec<String>, Bo
     Ok(serde_json::from_slice(&body)?)
 }
 
+async fn delete_webhook_target(env: &RustFSTestEnvironment, target_name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/target/notify_webhook/{target_name}/reset", env.url);
+    let response = signed_request(http::Method::DELETE, &url, &env.access_key, &env.secret_key, None, None).await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status != StatusCode::OK {
+        return Err(format!("failed to delete webhook target {target_name}: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
+fn notification_target_is_listed(targets: &serde_json::Value, target_name: &str) -> bool {
+    notification_target_entry(targets, target_name).is_some()
+}
+
+fn notification_target_entry<'a>(targets: &'a serde_json::Value, target_name: &str) -> Option<&'a serde_json::Value> {
+    targets["notification_endpoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry["account_id"].as_str() == Some(target_name)
+                && entry["service"]
+                    .as_str()
+                    .is_some_and(|service| service == "webhook" || service.starts_with("webhook-"))
+        })
+}
+
+fn notification_target_status<'a>(targets: &'a serde_json::Value, target_name: &str) -> Option<&'a str> {
+    notification_target_entry(targets, target_name).and_then(|entry| entry["status"].as_str())
+}
+
 async fn wait_for_target_visibility(
     env: &RustFSTestEnvironment,
     target_name: &str,
@@ -324,18 +379,7 @@ async fn wait_for_target_visibility(
         last_targets = list_notification_targets(env).await?;
         last_arns = list_target_arns(env).await?;
 
-        let listed = last_targets["notification_endpoints"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|entry| {
-                entry["account_id"].as_str() == Some(target_name)
-                    && entry["service"]
-                        .as_str()
-                        .is_some_and(|service| service == "webhook" || service.starts_with("webhook-"))
-            });
-
-        if listed {
+        if notification_target_is_listed(&last_targets, target_name) {
             return Ok((last_targets, last_arns));
         }
 
@@ -345,10 +389,79 @@ async fn wait_for_target_visibility(
     Err(format!("target {target_name} did not become visible in admin APIs; targets={last_targets}, arns={last_arns:?}").into())
 }
 
+async fn wait_for_target_absence(
+    env: &RustFSTestEnvironment,
+    target_name: &str,
+) -> Result<(serde_json::Value, Vec<String>), Box<dyn Error + Send + Sync>> {
+    let mut last_targets = serde_json::Value::Null;
+    let mut last_arns = Vec::new();
+
+    for _ in 0..20 {
+        last_targets = list_notification_targets(env).await?;
+        last_arns = list_target_arns(env).await?;
+
+        let listed = notification_target_is_listed(&last_targets, target_name);
+        let arn_listed = last_arns.iter().any(|arn| arn.ends_with(&format!(":{target_name}:webhook")));
+        if !listed && !arn_listed {
+            return Ok((last_targets, last_arns));
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!("target {target_name} remained visible in admin APIs; targets={last_targets}, arns={last_arns:?}").into())
+}
+
+async fn restart_rustfs_server(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn Error + Send + Sync>> {
+    env.stop_server();
+    env.start_rustfs_server_without_cleanup(vec![]).await
+}
+
+async fn spawn_http_origin_probe_server() -> Result<
+    (
+        String,
+        mpsc::Receiver<String>,
+        tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
+    ),
+    Box<dyn Error + Send + Sync>,
+> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let webhook_url = format!("http://{address}/hook");
+    let (path_tx, path_rx) = mpsc::channel(1);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            let path = timeout(Duration::from_secs(2), read_request_path(&mut stream)).await??;
+            let _ = path_tx.try_send(path.clone());
+            if path == "/" {
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                stream.write_all(response).await?;
+            }
+        }
+    });
+
+    Ok((webhook_url, path_rx, handle))
+}
+
 async fn read_persisted_server_config(env: &RustFSTestEnvironment) -> String {
     let path = format!("{}/.rustfs.sys/config/config.json", env.temp_dir);
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::IsADirectory => {
+            let mut entries = Vec::new();
+            match tokio::fs::read_dir(&path).await {
+                Ok(mut dir) => {
+                    while let Ok(Some(entry)) = dir.next_entry().await {
+                        entries.push(entry.file_name().to_string_lossy().to_string());
+                    }
+                    entries.sort();
+                    format!("persisted config stored as object directory at {path}; entries={entries:?}")
+                }
+                Err(dir_err) => format!("persisted config directory exists at {path} but could not be listed: {dir_err}"),
+            }
+        }
         Err(err) => format!("failed to read persisted config at {path}: {err}"),
     }
 }
@@ -398,6 +511,100 @@ async fn read_listen_notification_event(
             }
         }
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_notification_target_persists_across_restart_and_delete() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, _request_rx, webhook_handle) = spawn_object_lambda_webhook_server().await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let target_name = "restart-target";
+    configure_webhook_target(&env, target_name, &webhook_url, "secret-token").await?;
+
+    let (visible_targets, visible_arns) = wait_for_target_visibility(&env, target_name).await?;
+    assert!(notification_target_is_listed(&visible_targets, target_name));
+    assert!(
+        visible_arns
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN missing after initial configure: {visible_arns:?}"
+    );
+
+    restart_rustfs_server(&mut env).await?;
+
+    let (targets_after_restart, arns_after_restart) = wait_for_target_visibility(&env, target_name).await?;
+    assert!(notification_target_is_listed(&targets_after_restart, target_name));
+    assert!(
+        arns_after_restart
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN missing after restart: {arns_after_restart:?}"
+    );
+
+    delete_webhook_target(&env, target_name).await?;
+    let (targets_after_delete, arns_after_delete) = wait_for_target_absence(&env, target_name).await?;
+    assert!(!notification_target_is_listed(&targets_after_delete, target_name));
+    assert!(
+        !arns_after_delete
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN still visible after delete: {arns_after_delete:?}"
+    );
+
+    restart_rustfs_server(&mut env).await?;
+
+    let (targets_after_delete_restart, arns_after_delete_restart) = wait_for_target_absence(&env, target_name).await?;
+    assert!(!notification_target_is_listed(&targets_after_delete_restart, target_name));
+    assert!(
+        !arns_after_delete_restart
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN still visible after delete + restart: {arns_after_delete_restart:?}"
+    );
+
+    webhook_handle.abort();
+    let _ = webhook_handle.await;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_notification_target_with_path_is_online_via_transport_probe() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, mut probe_rx, probe_handle) = spawn_http_origin_probe_server().await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "true")])
+        .await?;
+
+    let target_name = "path-probe";
+    configure_webhook_target(&env, target_name, &webhook_url, "secret-token").await?;
+
+    let (visible_targets, visible_arns) = wait_for_target_visibility(&env, target_name).await?;
+    assert_eq!(notification_target_status(&visible_targets, target_name), Some("online"));
+    let observed_path = timeout(Duration::from_secs(10), probe_rx.recv())
+        .await
+        .map_err(|_| "probe server timed out waiting for a request")?
+        .ok_or("probe server did not observe a request")?;
+    assert_eq!(observed_path, "/");
+    assert!(
+        visible_arns
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN missing for reachable path endpoint: {visible_arns:?}"
+    );
+
+    probe_handle.abort();
+    let _ = probe_handle.await;
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -934,6 +1141,41 @@ async fn test_listen_notification_emits_after_put_object() -> Result<(), Box<dyn
         .bucket(bucket)
         .key(key)
         .body(ByteStream::from_static(b"listen notification body"))
+        .send()
+        .await?;
+
+    let payload = timeout(Duration::from_secs(12), read_task).await???;
+    assert!(!payload.is_empty(), "listen_notification payload should not be empty");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_listen_notification_emits_on_empty_bucket_when_notify_disabled() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "false")])
+        .await?;
+
+    let bucket = "listen-empty-bucket-e2e";
+    let key = "seed/object.txt";
+    let client = env.create_s3_client();
+
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let listen_url = format!("{}/{bucket}?events={}&ping=1", env.url, urlencoding::encode("s3:ObjectCreated:*"),);
+    let response = signed_request(http::Method::GET, &listen_url, &env.access_key, &env.secret_key, None, None).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let read_task = tokio::spawn(read_listen_notification_event(response, key));
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"empty bucket watch body"))
         .send()
         .await?;
 

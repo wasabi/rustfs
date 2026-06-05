@@ -15,61 +15,28 @@
 //! Admin application use-case contracts.
 
 use crate::app::context::{AppContext, get_global_app_context};
-use crate::capacity::capacity_manager::{
-    CapacityUpdate, DataSource, get_capacity_manager, get_enable_dynamic_timeout, get_follow_symlinks, get_max_files_threshold,
-    get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stall_timeout, get_stat_timeout,
-};
+use crate::capacity::resolve_admin_used_capacity;
 use crate::error::ApiError;
-use rustfs_common::data_usage::DataUsageInfo;
+use rustfs_data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::pools::{PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
+use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_io_metrics::{
-    record_capacity_dynamic_timeout, record_capacity_scan_sampling, record_capacity_stall_detected, record_capacity_symlink,
-    record_capacity_timeout_fallback,
-};
-use rustfs_madmin::{InfoMessage, StorageInfo};
+use rustfs_madmin::{Disk, InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-use walkdir::WalkDir;
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryServerInfoRequest {
     pub include_pools: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct CapacityScanResult {
-    pub used_bytes: u64,
-    pub file_count: usize,
-    pub sampled_count: usize,
-    pub is_estimated: bool,
-    pub scan_duration: Duration,
-    pub had_partial_errors: bool,
-}
-
-impl CapacityScanResult {
-    fn with_partial_errors(mut self) -> Self {
-        self.had_partial_errors = true;
-        self
-    }
-
-    pub(crate) fn to_capacity_update(self) -> CapacityUpdate {
-        if self.is_estimated {
-            CapacityUpdate::estimated(self.used_bytes, self.file_count)
-        } else {
-            CapacityUpdate::exact(self.used_bytes, self.file_count)
-        }
-    }
 }
 
 pub struct QueryServerInfoResponse {
@@ -94,471 +61,26 @@ pub struct QueryPoolStatusRequest {
     pub by_id: bool,
 }
 
-/// Calculate actual used capacity of all data directories
-pub(crate) async fn calculate_data_dir_used_capacity(
-    disks: &[rustfs_madmin::Disk],
-) -> Result<CapacityScanResult, Box<dyn std::error::Error + Send + Sync>> {
-    let start = Instant::now();
-    let mut total_used = 0u64;
-    let mut total_files = 0usize;
-    let mut total_sampled = 0usize;
-    let mut has_failure = false;
-    let mut has_success = false;
-    let mut is_estimated = false;
-
-    for disk in disks {
-        let path = Path::new(&disk.drive_path);
-
-        if !path.exists() {
-            warn!("Data directory does not exist: {}", disk.drive_path);
-            has_failure = true;
-            continue;
-        }
-
-        match get_dir_size_async(path).await {
-            Ok(scan) => {
-                debug!(
-                    "Data directory {} size: {} bytes, files={}, sampled={}, estimated={}",
-                    disk.drive_path, scan.used_bytes, scan.file_count, scan.sampled_count, scan.is_estimated
-                );
-                total_used += scan.used_bytes;
-                total_files += scan.file_count;
-                total_sampled += scan.sampled_count;
-                is_estimated |= scan.is_estimated;
-                has_failure |= scan.had_partial_errors;
-                has_success = true;
-            }
-            Err(e) => {
-                warn!("Failed to get size for directory {}: {:?}", disk.drive_path, e);
-                has_failure = true;
-            }
-        }
-    }
-
-    if !has_success {
-        return Err("All directories failed to calculate size".into());
-    }
-
-    if has_failure {
-        warn!("Some directories failed to calculate size, result may be incomplete");
-    }
-
-    let mut result = CapacityScanResult {
-        used_bytes: total_used,
-        file_count: total_files,
-        sampled_count: total_sampled,
-        is_estimated,
-        scan_duration: start.elapsed(),
-        had_partial_errors: false,
-    };
-
-    if has_failure {
-        result = result.with_partial_errors();
-    }
-
-    Ok(result)
-}
-
-// ============================================================================
-// Symlink Tracker for Circular Reference Detection
-// ============================================================================
-
-/// Tracker for symlink resolution with circular reference detection
-struct SymlinkTracker {
-    /// Set of visited symlink paths to detect circular references
-    visited: HashSet<PathBuf>,
-    /// Count of symlinks encountered
-    symlink_count: usize,
-    /// Total size of symlink targets
-    symlink_size: u64,
-    /// Maximum symlink depth to follow
-    max_depth: u8,
-}
-
-impl SymlinkTracker {
-    /// Create a new symlink tracker
-    fn new(max_depth: u8) -> Self {
-        Self {
-            visited: HashSet::new(),
-            symlink_count: 0,
-            symlink_size: 0,
-            max_depth,
-        }
-    }
-
-    /// Check if we should follow a symlink at the given depth
-    fn should_follow(&self, path: &Path, depth: u8) -> bool {
-        if depth >= self.max_depth {
-            debug!("Symlink depth limit reached: {} >= {}, not following {:?}", depth, self.max_depth, path);
-            return false;
-        }
-
-        if self.visited.contains(path) {
-            warn!("Circular symlink reference detected: {:?}, skipping", path);
-            return false;
-        }
-
-        true
-    }
-
-    /// Record a visited symlink path and update metrics
-    fn record_symlink(&mut self, path: PathBuf, size: u64) {
-        self.visited.insert(path);
-        self.symlink_count += 1;
-        self.symlink_size += size;
-        record_capacity_symlink(size);
-    }
-
-    /// Get symlink statistics
-    fn get_stats(&self) -> (usize, u64) {
-        (self.symlink_count, self.symlink_size)
-    }
-}
-
-// ============================================================================
-// Progress Monitor for Timeout and Stall Detection
-// ============================================================================
-
-/// Monitor for directory traversal progress with timeout and stall detection
-struct ProgressMonitor {
-    /// Start time of the operation
-    start_time: Instant,
-    /// Last check time for stall detection
-    last_check: Instant,
-    /// Number of files processed at last checkpoint
-    last_checkpoint_files: usize,
-    /// Base timeout for this operation
-    timeout: Duration,
-    /// Minimum allowed timeout
-    min_timeout: Duration,
-    /// Maximum allowed timeout
-    max_timeout: Duration,
-    /// Stall detection timeout
-    stall_timeout: Duration,
-    /// Enable dynamic timeout calculation
-    enable_dynamic_timeout: bool,
-    /// Track if dynamic timeout was used
-    used_dynamic_timeout: bool,
-}
-
-impl ProgressMonitor {
-    /// Create a new progress monitor
-    fn new(
-        base_timeout: Duration,
-        min_timeout: Duration,
-        max_timeout: Duration,
-        stall_timeout: Duration,
-        enable_dynamic: bool,
-    ) -> Self {
-        Self {
-            start_time: Instant::now(),
-            last_check: Instant::now(),
-            last_checkpoint_files: 0,
-            timeout: base_timeout,
-            min_timeout,
-            max_timeout,
-            stall_timeout,
-            enable_dynamic_timeout: enable_dynamic,
-            used_dynamic_timeout: false,
-        }
-    }
-
-    /// Calculate dynamic timeout based on directory characteristics
-    fn calculate_dynamic_timeout(&mut self, file_count: usize, avg_file_size: u64) -> Duration {
-        if !self.enable_dynamic_timeout {
-            return self.timeout;
-        }
-
-        // Mark that we're using dynamic timeout
-        self.used_dynamic_timeout = true;
-
-        // Calculate multipliers based on directory characteristics
-        let file_factor = (file_count as f64).sqrt() * 0.01; // File count influence
-        let size_factor = if avg_file_size > 0 {
-            (avg_file_size as f64).log(10.0) * 0.05 // File size influence
-        } else {
-            0.0
-        };
-
-        let multiplier = 1.0 + file_factor + size_factor;
-        let adjusted_timeout = self.timeout.mul_f64(multiplier.min(5.0)); // Max 5x multiplier
-
-        // Clamp to min/max bounds
-        let clamped_timeout = adjusted_timeout.max(self.min_timeout).min(self.max_timeout);
-
-        debug!(
-            "Dynamic timeout calculation: files={}, avg_size={}, multiplier={:.2}, base_timeout={:?}, adjusted_timeout={:?}, clamped_timeout={:?}",
-            file_count, avg_file_size, multiplier, self.timeout, adjusted_timeout, clamped_timeout
-        );
-
-        clamped_timeout
-    }
-
-    /// Update and check for timeout or stall
-    fn update_and_check_timeout(&mut self, files_processed: usize, avg_file_size: u64) -> Result<(), std::io::Error> {
-        let elapsed = self.start_time.elapsed();
-
-        // Calculate dynamic timeout based on current state
-        let dynamic_timeout = if self.enable_dynamic_timeout {
-            self.calculate_dynamic_timeout(files_processed, avg_file_size)
-        } else {
-            self.timeout
-        };
-
-        // Check for hard timeout
-        if elapsed >= dynamic_timeout {
-            warn!(
-                "Directory size calculation timeout after {} files, elapsed: {:?}, timeout: {:?}",
-                files_processed, elapsed, dynamic_timeout
-            );
-
-            if self.enable_dynamic_timeout {
-                record_capacity_dynamic_timeout(dynamic_timeout);
-            }
-
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("Timeout after {} files", files_processed),
-            ));
-        }
-
-        // Check for stall (no progress)
-        let now = Instant::now();
-        if now.duration_since(self.last_check) >= self.stall_timeout {
-            let files_per_checkpoint = files_processed.saturating_sub(self.last_checkpoint_files);
-
-            if files_per_checkpoint == 0 && files_processed > 0 {
-                // No progress for stall_timeout duration
-                warn!(
-                    "No progress detected for {:?}, possible stall at {} files",
-                    self.stall_timeout, files_processed
-                );
-
-                record_capacity_stall_detected();
-
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("Stall detected at {} files", files_processed),
-                ));
-            }
-
-            self.last_check = now;
-            self.last_checkpoint_files = files_processed;
-        }
-
-        Ok(())
-    }
-
-    /// Record timeout fallback to sampling
-    fn record_timeout_fallback(&self) {
-        record_capacity_timeout_fallback();
-    }
-}
-
-/// Asynchronously get directory size with enhanced symlink handling and dynamic timeout
-async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::Error> {
-    let path = path.to_path_buf();
-
-    let max_files_threshold = get_max_files_threshold();
-    let base_timeout = get_stat_timeout();
-    let min_timeout = get_min_timeout();
-    let max_timeout = get_max_timeout();
-    let stall_timeout = get_stall_timeout();
-    let sample_rate = get_sample_rate();
-    let enable_dynamic_timeout = get_enable_dynamic_timeout();
-    let follow_symlinks = get_follow_symlinks();
-    let max_symlink_depth = get_max_symlink_depth();
-
-    let effective_sample_rate = if sample_rate == 0 {
-        warn!("Invalid sampling configuration: sample_rate=0. Clamping to 1 to avoid panic.");
-        1
-    } else {
-        sample_rate
-    };
-
-    if !path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Directory not found: {:?}", path),
-        ));
-    }
-
-    tokio::task::spawn_blocking(move || {
-        let start_time = Instant::now();
-        let mut exact_prefix_bytes = 0u64;
-        let mut overflow_sampled_bytes = 0u64;
-        let mut file_count = 0usize;
-        let mut sampled_count = 0usize;
-        let mut had_partial_errors = false;
-
-        let mut symlink_tracker = if follow_symlinks {
-            Some(SymlinkTracker::new(max_symlink_depth))
-        } else {
-            None
-        };
-
-        let mut progress_monitor =
-            ProgressMonitor::new(base_timeout, min_timeout, max_timeout, stall_timeout, enable_dynamic_timeout);
-
-        let mut walker_builder = WalkDir::new(&path);
-        if !follow_symlinks {
-            walker_builder = walker_builder.follow_links(false);
-        }
-        let walker = walker_builder.into_iter();
-
-        for entry_result in walker {
-            let entry = match entry_result {
-                Ok(entry) => entry,
-                Err(err) => {
-                    warn!("Failed to traverse directory entry under {:?}: {}", path, err);
-                    had_partial_errors = true;
-                    continue;
-                }
-            };
-
-            let metadata = match entry.metadata() {
-                Ok(meta) => meta,
-                Err(err) => {
-                    warn!("Failed to get metadata for {:?}: {}", entry.path(), err);
-                    had_partial_errors = true;
-                    continue;
-                }
-            };
-
-            if metadata.is_symlink() {
-                if let Some(ref mut tracker) = symlink_tracker
-                    && let Ok(target) = std::fs::read_link(entry.path())
-                    && tracker.should_follow(&target, 0)
-                {
-                    tracker.record_symlink(target, metadata.len());
-                }
-                continue;
-            }
-
-            if !metadata.is_file() {
-                continue;
-            }
-
-            file_count += 1;
-            let exact_count = file_count.min(max_files_threshold);
-            let avg_size = if exact_count > 0 {
-                exact_prefix_bytes / exact_count as u64
-            } else {
-                0
-            };
-
-            if let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
-                if sampled_count > 0 {
-                    let overflow_count = file_count.saturating_sub(max_files_threshold);
-                    let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
-                    let estimated_total = exact_prefix_bytes.saturating_add(estimated_overflow);
-                    info!(
-                        "Timeout/stall at {} files, using sampled estimate: exact_prefix={} overflow_estimate={} sampled={}",
-                        file_count, exact_prefix_bytes, estimated_overflow, sampled_count
-                    );
-                    progress_monitor.record_timeout_fallback();
-                    record_capacity_scan_sampling(sampled_count, true);
-                    return Ok(CapacityScanResult {
-                        used_bytes: estimated_total,
-                        file_count,
-                        sampled_count,
-                        is_estimated: true,
-                        scan_duration: start_time.elapsed(),
-                        had_partial_errors,
-                    });
-                }
-                return Err(e);
-            }
-
-            if file_count <= max_files_threshold {
-                exact_prefix_bytes += metadata.len();
-            } else {
-                let overflow_index = file_count - max_files_threshold;
-                if overflow_index.is_multiple_of(effective_sample_rate) {
-                    overflow_sampled_bytes += metadata.len();
-                    sampled_count += 1;
-                }
-
-                if file_count.is_multiple_of(100_000) {
-                    debug!(
-                        "Processed {} files, exact_prefix_bytes={}, sampled_overflow={} files/{} bytes",
-                        file_count, exact_prefix_bytes, sampled_count, overflow_sampled_bytes
-                    );
-                }
-            }
-        }
-
-        if let Some(tracker) = symlink_tracker {
-            let (count, size) = tracker.get_stats();
-            if count > 0 {
-                info!("Symlink tracking: {} symlinks processed, total target size: {} bytes", count, size);
-            }
-        }
-
-        if file_count > max_files_threshold && sampled_count > 0 {
-            let overflow_count = file_count - max_files_threshold;
-            let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
-            let estimated_size = exact_prefix_bytes.saturating_add(estimated_overflow);
-            info!(
-                "Large directory detected: {} files, estimated size: {} bytes (exact prefix: {}, sampled overflow {}/{})",
-                file_count, estimated_size, exact_prefix_bytes, sampled_count, overflow_count
-            );
-            record_capacity_scan_sampling(sampled_count, true);
-            Ok(CapacityScanResult {
-                used_bytes: estimated_size,
-                file_count,
-                sampled_count,
-                is_estimated: true,
-                scan_duration: start_time.elapsed(),
-                had_partial_errors,
-            })
-        } else if file_count > max_files_threshold {
-            // sampled_count == 0: too few overflow files to reach the sample rate threshold.
-            // Fall back to estimating the overflow using the average file size from the exact
-            // prefix so that overflow files are not silently dropped from the total.
-            let overflow_count = file_count - max_files_threshold;
-            // Use the actual number of files counted in the exact prefix, not the threshold
-            // value, to avoid a divide-by-zero or incorrect average when fewer files were
-            // processed than max_files_threshold.
-            let exact_prefix_count = file_count.min(max_files_threshold) as u64;
-            let avg_prefix_size = exact_prefix_bytes
-                .checked_div(exact_prefix_count)
-                .unwrap_or(0);
-            let estimated_overflow = avg_prefix_size.saturating_mul(overflow_count as u64);
-            let estimated_size = exact_prefix_bytes.saturating_add(estimated_overflow);
-            info!(
-                "Large directory detected: {} files, estimated size: {} bytes (no overflow samples, used prefix average {} bytes/file)",
-                file_count, estimated_size, avg_prefix_size
-            );
-            record_capacity_scan_sampling(0, true);
-            Ok(CapacityScanResult {
-                used_bytes: estimated_size,
-                file_count,
-                sampled_count: 0,
-                is_estimated: true,
-                scan_duration: start_time.elapsed(),
-                had_partial_errors,
-            })
-        } else {
-            record_capacity_scan_sampling(0, false);
-            debug!(
-                "Directory size calculation completed: {} files, {} bytes, took {:?}",
-                file_count,
-                exact_prefix_bytes,
-                start_time.elapsed()
-            );
-            Ok(CapacityScanResult {
-                used_bytes: exact_prefix_bytes,
-                file_count,
-                sampled_count,
-                is_estimated: false,
-                scan_duration: start_time.elapsed(),
-                had_partial_errors,
-            })
-        }
-    })
-    .await
-    .map_err(std::io::Error::other)?
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminPoolListItem {
+    #[serde(rename = "id")]
+    pub id: usize,
+    #[serde(rename = "cmdline")]
+    pub cmd_line: String,
+    #[serde(rename = "lastUpdate", with = "time::serde::rfc3339")]
+    pub last_update: time::OffsetDateTime,
+    #[serde(rename = "totalSize")]
+    pub total_size: usize,
+    #[serde(rename = "currentSize")]
+    pub current_size: usize,
+    #[serde(rename = "usedSize")]
+    pub used_size: usize,
+    #[serde(rename = "used")]
+    pub used: f64,
+    #[serde(rename = "status")]
+    pub status: String,
+    #[serde(rename = "decommissionInfo")]
+    pub decommission: Option<PoolDecommissionInfo>,
 }
 
 #[derive(Clone, Default)]
@@ -566,7 +88,22 @@ pub struct DefaultAdminUsecase {
     context: Option<Arc<AppContext>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StorageReadinessCacheEntry {
+    captured_at: Instant,
+    storage_ready: bool,
+}
+
 impl DefaultAdminUsecase {
+    const DISK_STATE_OK: &'static str = "ok";
+    const DISK_STATE_UNFORMATTED: &'static str = "unformatted";
+    const RUNTIME_STATE_RETURNING: &'static str = "returning";
+    const POOL_STATUS_ACTIVE: &'static str = "active";
+    const POOL_STATUS_CANCELED: &'static str = "canceled";
+    const POOL_STATUS_COMPLETE: &'static str = "complete";
+    const POOL_STATUS_FAILED: &'static str = "failed";
+    const POOL_STATUS_RUNNING: &'static str = "running";
+
     #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
@@ -596,19 +133,11 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let info = get_server_info(req.include_pools).await;
         Ok(QueryServerInfoResponse { info })
     }
 
     pub async fn execute_query_storage_info(&self) -> AdminUsecaseResult<StorageInfo> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let Some(store) = new_object_layer_fn() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
@@ -617,10 +146,6 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_query_data_usage_info(&self) -> AdminUsecaseResult<DataUsageInfo> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let Some(store) = new_object_layer_fn() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
@@ -686,115 +211,8 @@ impl DefaultAdminUsecase {
             info.total_free_capacity = free_u64;
         }
 
-        // Use hybrid strategy for capacity calculation
-        let capacity_manager = get_capacity_manager();
-
-        // Check if we have a valid cache
-        if let Some(cached) = capacity_manager.get_capacity().await {
-            let cache_age = cached.last_update.elapsed();
-            let fast_update_threshold = capacity_manager.get_config().fast_update_threshold;
-
-            // If cache is fresh (< fast_update_threshold), use it directly
-            if cache_age < fast_update_threshold {
-                info.total_used_capacity = cached.total_used;
-                debug!(
-                    "Using cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={})",
-                    cached.total_used, cache_age, cached.source, cached.file_count, cached.is_estimated
-                );
-            } else {
-                // Cache is stale, check if we need fast update
-                let needs_update = capacity_manager.needs_fast_update().await;
-                let should_block = capacity_manager.should_block_on_refresh(cache_age);
-
-                if needs_update && should_block {
-                    let start = Instant::now();
-                    match capacity_manager
-                        .refresh_or_join(DataSource::WriteTriggered, || async {
-                            calculate_data_dir_used_capacity(&storage_info.disks)
-                                .await
-                                .map(|scan| scan.to_capacity_update())
-                                .map_err(|e| e.to_string())
-                        })
-                        .await
-                    {
-                        Ok(update) => {
-                            info.total_used_capacity = update.total_used;
-
-                            let elapsed = start.elapsed();
-                            debug!(
-                                "Foreground capacity refresh completed in {:?} (files={}, estimated={})",
-                                elapsed, update.file_count, update.is_estimated
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Foreground capacity refresh failed: {}, using cached value", e);
-                            info.total_used_capacity = cached.total_used;
-                        }
-                    }
-                } else {
-                    info.total_used_capacity = cached.total_used;
-                    debug!(
-                        "Using stale cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={}, needs_update={}, blocking={})",
-                        cached.total_used,
-                        cache_age,
-                        cached.source,
-                        cached.file_count,
-                        cached.is_estimated,
-                        needs_update,
-                        should_block
-                    );
-
-                    let disks = storage_info.disks.clone();
-                    let manager = capacity_manager.clone();
-                    if manager
-                        .clone()
-                        .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
-                            calculate_data_dir_used_capacity(&disks)
-                                .await
-                                .map(|scan| scan.to_capacity_update())
-                                .map_err(|e| e.to_string())
-                        })
-                        .await
-                    {
-                        debug!("Background capacity update started");
-                    } else {
-                        debug!("Background update already in progress, skipping spawn");
-                    }
-                }
-            }
-        } else {
-            // No cache, perform initial calculation
-            let start = Instant::now();
-            match capacity_manager
-                .refresh_or_join(DataSource::RealTime, || async {
-                    calculate_data_dir_used_capacity(&storage_info.disks)
-                        .await
-                        .map(|scan| scan.to_capacity_update())
-                        .map_err(|e| e.to_string())
-                })
-                .await
-            {
-                Ok(update) => {
-                    info.total_used_capacity = update.total_used;
-
-                    let elapsed = start.elapsed();
-                    info!(
-                        "Initial capacity calculation completed: {} bytes in {:?} (files={}, estimated={})",
-                        update.total_used, elapsed, update.file_count, update.is_estimated
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to calculate data directory used capacity: {}, falling back to disk used capacity",
-                        e
-                    );
-                    info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
-                    capacity_manager
-                        .update_capacity(CapacityUpdate::fallback(info.total_used_capacity), DataSource::Fallback)
-                        .await;
-                }
-            }
-        }
+        info.total_used_capacity =
+            resolve_admin_used_capacity(&storage_info.disks, info.total_capacity.saturating_sub(info.total_free_capacity)).await;
         debug!(
             "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
             info.total_capacity as f64 / (1024.0_f64.powi(4)),
@@ -806,10 +224,6 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_list_pool_statuses(&self) -> AdminUsecaseResult<Vec<PoolStatus>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let Some(store) = new_object_layer_fn() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
@@ -831,11 +245,12 @@ impl DefaultAdminUsecase {
         Ok(pool_statuses)
     }
 
-    pub async fn execute_query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<PoolStatus> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
+    pub async fn execute_list_pools(&self) -> AdminUsecaseResult<Vec<AdminPoolListItem>> {
+        let pool_statuses = self.execute_list_pool_statuses().await?;
+        Ok(pool_statuses.into_iter().map(Self::pool_list_item_from_status).collect())
+    }
 
+    pub async fn execute_query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<PoolStatus> {
         let Some(endpoints) = self.endpoints() else {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         };
@@ -863,19 +278,201 @@ impl DefaultAdminUsecase {
         store.status(idx).await.map_err(ApiError::from)
     }
 
-    pub fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
-        let iam_ready = self
-            .context
-            .as_ref()
-            .map(|context| {
-                let _ = context.object_store();
-                context.iam().is_ready()
-            })
-            .unwrap_or(false);
+    fn pool_list_item_from_status(status: PoolStatus) -> AdminPoolListItem {
+        let PoolStatus {
+            id,
+            cmd_line,
+            last_update,
+            decommission,
+        } = status;
+        let total_size = decommission.as_ref().map(|info| info.total_size).unwrap_or_default();
+        let current_size = decommission.as_ref().map(|info| info.current_size).unwrap_or_default();
+        let used_size = total_size.saturating_sub(current_size);
+
+        AdminPoolListItem {
+            id,
+            cmd_line,
+            last_update,
+            total_size,
+            current_size,
+            used_size,
+            used: Self::used_ratio(total_size, used_size),
+            status: Self::pool_list_status(decommission.as_ref()).to_string(),
+            decommission,
+        }
+    }
+
+    fn pool_list_status(decommission: Option<&PoolDecommissionInfo>) -> &'static str {
+        match decommission {
+            Some(info) if info.complete => Self::POOL_STATUS_COMPLETE,
+            Some(info) if info.failed => Self::POOL_STATUS_FAILED,
+            Some(info) if info.canceled => Self::POOL_STATUS_CANCELED,
+            Some(info) if info.start_time.is_some() => Self::POOL_STATUS_RUNNING,
+            _ => Self::POOL_STATUS_ACTIVE,
+        }
+    }
+
+    fn used_ratio(total_size: usize, used_size: usize) -> f64 {
+        if total_size == 0 {
+            return 0.0;
+        }
+
+        used_size as f64 / total_size as f64
+    }
+
+    fn disk_is_online_for_readiness(disk: &Disk) -> bool {
+        let state_is_acceptable = disk.state.eq_ignore_ascii_case(Self::DISK_STATE_OK)
+            || disk.state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
+            || disk.state.eq_ignore_ascii_case(Self::DISK_STATE_UNFORMATTED);
+
+        if let Some(runtime_state) = disk.runtime_state.as_deref() {
+            let runtime_state_is_acceptable = runtime_state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
+                || runtime_state.eq_ignore_ascii_case(Self::RUNTIME_STATE_RETURNING);
+            return runtime_state_is_acceptable && state_is_acceptable;
+        }
+
+        state_is_acceptable
+    }
+
+    fn health_readiness_cache_ttl() -> Duration {
+        Duration::from_millis(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS,
+            rustfs_config::DEFAULT_HEALTH_READINESS_CACHE_TTL_MS,
+        ))
+    }
+
+    fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry>> {
+        static CACHE: OnceLock<Mutex<Option<StorageReadinessCacheEntry>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(None))
+    }
+
+    async fn load_cached_storage_readiness() -> Option<bool> {
+        let ttl = Self::health_readiness_cache_ttl();
+        if ttl.is_zero() {
+            return None;
+        }
+
+        let cache = Self::storage_readiness_cache().lock().await;
+        let entry = cache.as_ref()?;
+        if entry.captured_at.elapsed() <= ttl {
+            return Some(entry.storage_ready);
+        }
+
+        None
+    }
+
+    async fn update_storage_readiness_cache(storage_ready: bool) {
+        if Self::health_readiness_cache_ttl().is_zero() {
+            return;
+        }
+
+        let mut cache = Self::storage_readiness_cache().lock().await;
+        *cache = Some(StorageReadinessCacheEntry {
+            captured_at: Instant::now(),
+            storage_ready,
+        });
+    }
+
+    fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> usize {
+        if set_drive_count == 0 {
+            return 1;
+        }
+
+        let data_drives = info
+            .backend
+            .standard_sc_data
+            .get(pool_idx)
+            .copied()
+            .filter(|count| *count > 0)
+            .unwrap_or_else(|| (set_drive_count / 2).max(1));
+
+        let parity_drives = if let Some(drives_per_set) = info.backend.drives_per_set.get(pool_idx).copied() {
+            drives_per_set.saturating_sub(data_drives)
+        } else if let Some(parity) = info.backend.standard_sc_parities.get(pool_idx).copied() {
+            parity
+        } else if let Some(parity) = info.backend.standard_sc_parity {
+            parity
+        } else {
+            set_drive_count.saturating_sub(data_drives)
+        };
+
+        let mut write_quorum = data_drives;
+        if data_drives == parity_drives {
+            write_quorum += 1;
+        }
+        write_quorum.max(1)
+    }
+
+    fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
+        if info.disks.is_empty() {
+            return false;
+        }
+
+        let mut total_online = 0usize;
+        let mut set_online_counts: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut set_drive_counts: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut seen_disks: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
+
+        for disk in &info.disks {
+            if disk.pool_index < 0 || disk.set_index < 0 {
+                continue;
+            }
+
+            let dedup_key = (
+                disk.endpoint.clone(),
+                disk.drive_path.clone(),
+                disk.pool_index,
+                disk.set_index,
+                disk.disk_index,
+            );
+            if !seen_disks.insert(dedup_key) {
+                continue;
+            }
+
+            let pool_idx = disk.pool_index as usize;
+            let set_idx = disk.set_index as usize;
+            let key = (pool_idx, set_idx);
+            *set_drive_counts.entry(key).or_default() += 1;
+
+            if Self::disk_is_online_for_readiness(disk) {
+                total_online += 1;
+                *set_online_counts.entry(key).or_default() += 1;
+            }
+        }
+
+        if total_online == 0 {
+            return false;
+        }
+
+        if set_drive_counts.is_empty() {
+            return false;
+        }
+
+        set_drive_counts.into_iter().all(|((pool_idx, set_idx), set_drive_count)| {
+            let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
+            let write_quorum = Self::pool_write_quorum(info, pool_idx, set_drive_count);
+            online >= write_quorum
+        })
+    }
+
+    pub async fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
+        let iam_ready = self.context.as_ref().map(|context| context.iam().is_ready()).unwrap_or(false);
+        let storage_ready = if let Some(cached) = Self::load_cached_storage_readiness().await {
+            cached
+        } else {
+            let computed = if let Some(store) = new_object_layer_fn() {
+                let storage_info = store.storage_info().await;
+                Self::storage_ready_from_runtime_state(&storage_info)
+            } else {
+                false
+            };
+            Self::update_storage_readiness_cache(computed).await;
+            computed
+        };
 
         DependencyReadiness {
-            storage_ready: new_object_layer_fn().is_some(),
-            iam_ready,
+            storage_ready,
+            iam_ready: iam_ready && storage_ready,
         }
     }
 }
@@ -883,7 +480,8 @@ impl DefaultAdminUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus};
+    use time::OffsetDateTime;
 
     #[tokio::test]
     async fn execute_query_storage_info_returns_internal_error_when_store_uninitialized() {
@@ -901,91 +499,240 @@ mod tests {
         assert_eq!(err.code, S3ErrorCode::InternalError);
     }
 
-    #[test]
-    fn execute_collect_dependency_readiness_returns_state_flags() {
+    #[tokio::test]
+    async fn execute_collect_dependency_readiness_returns_state_flags() {
         let usecase = DefaultAdminUsecase::without_context();
 
-        let readiness = usecase.execute_collect_dependency_readiness();
+        let readiness = usecase.execute_collect_dependency_readiness().await;
         let _ = readiness.storage_ready;
         let _ = readiness.iam_ready;
     }
 
-    // Tests for directory size calculation functions
-    #[tokio::test]
-    async fn test_get_dir_size_async_empty_directory() {
-        use tempfile::TempDir;
+    #[test]
+    fn storage_ready_from_runtime_state_returns_false_when_all_disks_faulty() {
+        let info = StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![1],
+                drives_per_set: vec![1],
+                ..Default::default()
+            },
+            disks: vec![Disk {
+                pool_index: 0,
+                set_index: 0,
+                state: "offline".to_string(),
+                runtime_state: Some("offline".to_string()),
+                ..Default::default()
+            }],
+        };
 
-        let temp_dir = TempDir::new().unwrap();
-        let size = get_dir_size_async(temp_dir.path()).await.unwrap();
-        assert_eq!(size.used_bytes, 0);
-        assert_eq!(size.file_count, 0);
+        assert!(!DefaultAdminUsecase::storage_ready_from_runtime_state(&info));
     }
 
-    #[tokio::test]
-    async fn test_get_dir_size_async_single_file() {
-        use std::fs::File;
-        use std::io::Write;
-        use tempfile::TempDir;
+    #[test]
+    fn storage_ready_from_runtime_state_returns_true_when_set_meets_write_quorum() {
+        let info = StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![1],
+                drives_per_set: vec![1],
+                ..Default::default()
+            },
+            disks: vec![Disk {
+                pool_index: 0,
+                set_index: 0,
+                state: "ok".to_string(),
+                runtime_state: Some("online".to_string()),
+                ..Default::default()
+            }],
+        };
 
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("test.txt");
-        let mut file = File::create(&file_path).unwrap();
-        file.write_all(b"Hello, World!").unwrap();
-
-        let size = get_dir_size_async(temp_dir.path()).await.unwrap();
-        assert_eq!(size.used_bytes, 13);
-        assert_eq!(size.file_count, 1);
+        assert!(DefaultAdminUsecase::storage_ready_from_runtime_state(&info));
     }
 
-    #[tokio::test]
-    async fn test_get_dir_size_async_multiple_files() {
-        use std::fs::File;
-        use std::io::Write;
-        use tempfile::TempDir;
+    #[test]
+    fn storage_ready_from_runtime_state_deduplicates_duplicate_disk_rows() {
+        let duplicate_disk = Disk {
+            endpoint: "127.0.0.1:9000".to_string(),
+            drive_path: "/data0".to_string(),
+            pool_index: 0,
+            set_index: 0,
+            disk_index: 0,
+            state: "ok".to_string(),
+            runtime_state: Some("online".to_string()),
+            ..Default::default()
+        };
+        let info = StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![2],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: vec![duplicate_disk.clone(), duplicate_disk],
+        };
 
-        let temp_dir = TempDir::new().unwrap();
-
-        // Create multiple files
-        for i in 0..10 {
-            let file_path = temp_dir.path().join(format!("file_{}.txt", i));
-            let mut file = File::create(&file_path).unwrap();
-            file.write_all(b"test").unwrap();
-        }
-
-        let size = get_dir_size_async(temp_dir.path()).await.unwrap();
-        assert_eq!(size.used_bytes, 40); // 10 files * 4 bytes
-        assert_eq!(size.file_count, 10);
+        assert!(
+            !DefaultAdminUsecase::storage_ready_from_runtime_state(&info),
+            "duplicate rows must not satisfy write quorum"
+        );
     }
 
-    #[tokio::test]
-    async fn test_get_dir_size_async_nested_directories() {
-        use std::fs::File;
-        use std::io::Write;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-
-        // Create nested directories and files
-        let subdir = temp_dir.path().join("subdir");
-        std::fs::create_dir(&subdir).unwrap();
-
-        let file1 = temp_dir.path().join("file1.txt");
-        let mut f1 = File::create(&file1).unwrap();
-        f1.write_all(b"content1").unwrap();
-
-        let file2 = subdir.join("file2.txt");
-        let mut f2 = File::create(&file2).unwrap();
-        f2.write_all(b"content2").unwrap();
-
-        let size = get_dir_size_async(temp_dir.path()).await.unwrap();
-        assert_eq!(size.used_bytes, 16); // "content1" (8) + "content2" (8)
-        assert_eq!(size.file_count, 2);
+    #[test]
+    fn disk_online_for_readiness_requires_runtime_and_state_both_acceptable() {
+        let disk = Disk {
+            state: "disk io error".to_string(),
+            runtime_state: Some("online".to_string()),
+            ..Default::default()
+        };
+        assert!(!DefaultAdminUsecase::disk_is_online_for_readiness(&disk));
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn test_get_dir_size_async_nonexistent_directory() {
-        let result = get_dir_size_async(Path::new("/nonexistent/path")).await;
-        assert!(result.is_err());
+    #[test]
+    fn storage_ready_from_runtime_state_requires_all_sets_meet_quorum() {
+        let info = StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![1],
+                drives_per_set: vec![2],
+                ..Default::default()
+            },
+            disks: vec![
+                Disk {
+                    endpoint: "127.0.0.1:9000".to_string(),
+                    drive_path: "/set0d0".to_string(),
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index: 0,
+                    state: "ok".to_string(),
+                    runtime_state: Some("online".to_string()),
+                    ..Default::default()
+                },
+                Disk {
+                    endpoint: "127.0.0.1:9000".to_string(),
+                    drive_path: "/set1d0".to_string(),
+                    pool_index: 0,
+                    set_index: 1,
+                    disk_index: 0,
+                    state: "offline".to_string(),
+                    runtime_state: Some("offline".to_string()),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        assert!(
+            !DefaultAdminUsecase::storage_ready_from_runtime_state(&info),
+            "if any set fails write quorum, readiness must be false"
+        );
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_capacity_and_active_status() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let pool = PoolStatus {
+            id: 2,
+            cmd_line: "http://node{1...4}/disk{1...4}".to_string(),
+            last_update: now,
+            decommission: Some(PoolDecommissionInfo {
+                total_size: 1_000,
+                current_size: 250,
+                ..Default::default()
+            }),
+        };
+
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+
+        assert_eq!(item.id, 2);
+        assert_eq!(item.total_size, 1_000);
+        assert_eq!(item.current_size, 250);
+        assert_eq!(item.used_size, 750);
+        assert!((item.used - 0.75).abs() < f64::EPSILON);
+        assert_eq!(item.status, "active");
+    }
+
+    #[test]
+    fn admin_pool_list_item_serializes_admin_api_fields() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(PoolStatus {
+            id: 1,
+            cmd_line: "pool-1".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: None,
+        });
+
+        let value = serde_json::to_value(item).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": 1,
+                "cmdline": "pool-1",
+                "lastUpdate": "1970-01-01T00:00:00Z",
+                "totalSize": 0,
+                "currentSize": 0,
+                "usedSize": 0,
+                "used": 0.0,
+                "status": "active",
+                "decommissionInfo": null
+            })
+        );
+    }
+
+    #[test]
+    fn admin_pool_list_item_saturates_used_size_when_current_exceeds_total() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                total_size: 100,
+                current_size: 150,
+                ..Default::default()
+            }),
+        };
+
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+
+        assert_eq!(item.total_size, 100);
+        assert_eq!(item.current_size, 150);
+        assert_eq!(item.used_size, 0);
+        assert_eq!(item.used, 0.0);
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_running_decommission_status() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                total_size: 1_000,
+                current_size: 500,
+                start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            }),
+        };
+
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+
+        assert_eq!(item.status, "running");
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_terminal_decommission_statuses() {
+        let complete = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+            complete: true,
+            ..Default::default()
+        }));
+        let failed = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+            failed: true,
+            ..Default::default()
+        }));
+        let canceled = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+            canceled: true,
+            ..Default::default()
+        }));
+        let idle = DefaultAdminUsecase::pool_list_status(None);
+
+        assert_eq!(complete, "complete");
+        assert_eq!(failed, "failed");
+        assert_eq!(canceled, "canceled");
+        assert_eq!(idle, "active");
     }
 }

@@ -58,6 +58,13 @@ impl KeystoneClient {
         admin_domain: String,
         verify_ssl: bool,
     ) -> Self {
+        if !verify_ssl {
+            warn!(
+                "Keystone client for '{}' is configured to skip TLS certificate verification. This permits MITM attacks and should not be used in production.",
+                auth_url
+            );
+        }
+
         let client = Client::builder()
             .danger_accept_invalid_certs(!verify_ssl)
             .timeout(std::time::Duration::from_secs(30))
@@ -240,7 +247,7 @@ impl KeystoneClient {
         let _body: serde_json::Value = response.json().await.map_err(|e| KeystoneError::ParseError(e.to_string()))?;
 
         // Parse access key to extract user_id and project_id
-        let (user_id, project_id) = EC2Credential::parse_access_key(access_key).unwrap_or((access_key.to_string(), None));
+        let (user_id, project_id) = EC2Credential::parse_access_key(access_key).unwrap_or_else(|| (access_key.to_string(), None));
 
         Ok(EC2Credential {
             access: access_key.to_string(),

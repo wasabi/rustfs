@@ -35,6 +35,7 @@ pub use policy::*;
 pub use principal::Principal;
 pub use resource::ResourceSet;
 pub use statement::Statement;
+pub use utils::{ClaimLookup, get_claim_case_insensitive};
 
 #[derive(thiserror::Error, Debug)]
 #[cfg_attr(test, derive(Eq, PartialEq))]
@@ -65,6 +66,9 @@ pub enum Error {
 
     #[error("invalid action: '{0}'")]
     InvalidAction(String),
+
+    #[error("'Action' contains mixed action families in the same statement")]
+    MixedActionFamilies,
 
     #[error("invalid resource, type: '{0}', pattern: '{1}'")]
     InvalidResource(String, String),

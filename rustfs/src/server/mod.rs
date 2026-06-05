@@ -13,30 +13,42 @@
 // limitations under the License.
 
 mod audit;
-mod cert;
 mod compress;
 pub mod cors;
 mod event;
 mod http;
 mod hybrid;
 mod layer;
+mod module_switch;
 mod prefix;
 mod readiness;
 mod runtime;
 mod service_state;
+pub mod tls_material;
 
-pub(crate) use audit::{start_audit_system, stop_audit_system};
-pub(crate) use cert::init_cert;
-pub(crate) use event::{init_event_notifier, shutdown_event_notifier};
-pub(crate) use http::start_http_server;
-pub(crate) use prefix::*;
+// Items used by main.rs (binary crate) and/or embedded.rs — must be fully pub.
+pub use audit::{is_audit_module_enabled, refresh_audit_module_enabled, start_audit_system, stop_audit_system};
+pub use event::{init_event_notifier, is_notify_module_enabled, refresh_notify_module_enabled, shutdown_event_notifier};
+pub use http::start_http_server;
+pub use prefix::LOGO;
+pub use runtime::build_tokio_runtime;
+pub use service_state::SHUTDOWN_TIMEOUT;
+pub use service_state::ServiceState;
+pub use service_state::ServiceStateManager;
+pub use service_state::ShutdownSignal;
+pub use service_state::wait_for_shutdown;
+
+// Items only used within the library crate (admin handlers, server/http.rs, etc.).
+pub(crate) use http::active_http_requests;
+pub(crate) use module_switch::{
+    ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches, current_module_switch_snapshot,
+    refresh_persisted_module_switches_from_store, save_persisted_module_switches_to_store, validate_module_switch_update,
+};
+pub(crate) use prefix::{
+    ADMIN_PREFIX, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, MINIO_ADMIN_PREFIX,
+    MINIO_ADMIN_V3_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TONIC_PREFIX, VERSION,
+};
 pub(crate) use readiness::ReadinessGateLayer;
-pub(crate) use runtime::build_tokio_runtime;
-pub(crate) use service_state::SHUTDOWN_TIMEOUT;
-pub(crate) use service_state::ServiceState;
-pub(crate) use service_state::ServiceStateManager;
-pub(crate) use service_state::ShutdownSignal;
-pub(crate) use service_state::wait_for_shutdown;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RemoteAddr(pub std::net::SocketAddr);

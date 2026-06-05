@@ -28,11 +28,14 @@ use rustfs_config::observability::{
     DEFAULT_OBS_LOG_DRY_RUN, DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_MATCH_MODE,
     DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS,
     DEFAULT_OBS_LOG_PARALLEL_COMPRESS, DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL,
-    DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, DEFAULT_OBS_LOG_ZSTD_WORKERS, ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT,
-    ENV_OBS_LOG_CLEANUP_INTERVAL_SECONDS, ENV_OBS_LOG_COMPRESS_OLD_FILES, ENV_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS,
-    ENV_OBS_LOG_COMPRESSION_ALGORITHM, ENV_OBS_LOG_DELETE_EMPTY_FILES, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_DRY_RUN,
-    ENV_OBS_LOG_ENDPOINT, ENV_OBS_LOG_EXCLUDE_PATTERNS, ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL,
-    ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_MATCH_MODE, ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES,
+    DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, DEFAULT_OBS_LOG_ZSTD_WORKERS, ENV_OBS_ENDPOINT, ENV_OBS_ENDPOINT_HEADERS,
+    ENV_OBS_ENDPOINT_LOGS_HEADERS, ENV_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_METRICS_HEADERS,
+    ENV_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_TRACES_HEADERS,
+    ENV_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_CLEANUP_INTERVAL_SECONDS,
+    ENV_OBS_LOG_COMPRESS_OLD_FILES, ENV_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS, ENV_OBS_LOG_COMPRESSION_ALGORITHM,
+    ENV_OBS_LOG_DELETE_EMPTY_FILES, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_DRY_RUN, ENV_OBS_LOG_ENDPOINT,
+    ENV_OBS_LOG_EXCLUDE_PATTERNS, ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL, ENV_OBS_LOG_KEEP_FILES,
+    ENV_OBS_LOG_MATCH_MODE, ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES,
     ENV_OBS_LOG_MIN_FILE_AGE_SECONDS, ENV_OBS_LOG_PARALLEL_COMPRESS, ENV_OBS_LOG_PARALLEL_WORKERS, ENV_OBS_LOG_ROTATION_TIME,
     ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOG_ZSTD_COMPRESSION_LEVEL, ENV_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, ENV_OBS_LOG_ZSTD_WORKERS,
     ENV_OBS_LOGGER_LEVEL, ENV_OBS_LOGS_EXPORT_ENABLED, ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT,
@@ -45,9 +48,16 @@ use rustfs_config::{
     DEFAULT_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
     SERVICE_VERSION, USE_STDOUT,
 };
-use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_str, get_env_u64, get_env_usize};
+use rustfs_utils::{
+    get_env_bool, get_env_bool_with_aliases, get_env_f64, get_env_opt_str, get_env_opt_u64, get_env_str, get_env_u64,
+    get_env_usize,
+};
 use serde::{Deserialize, Serialize};
 use std::env;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+const LEGACY_ENV_OBS_PROFILING_ENABLED: &str = "RUSTFS_OBS_PROFILING_ENABLED";
 
 /// Full observability configuration used by all telemetry backends.
 ///
@@ -101,6 +111,28 @@ pub struct OtelConfig {
     pub metric_endpoint: Option<String>,
     /// Dedicated log endpoint; overrides `endpoint` + `/v1/logs` fallback.
     pub log_endpoint: Option<String>,
+    /// Headers applied to all OTLP signals when using HTTP exporter.
+    /// Format: comma-separated `key=value` pairs with URL-encoded values, for
+    /// example: `Authorization=Bearer%20abc%20123,X-Scope-OrgID=my-tenant`.
+    /// URL-encode reserved characters in values such as spaces, commas, and `=`.
+    pub endpoint_headers: Option<String>,
+    /// Additional headers for traces; merged on top of `endpoint_headers`.
+    /// Uses the same comma-separated `key=value` format with URL-encoded values.
+    pub trace_headers: Option<String>,
+    /// Additional headers for metrics; merged on top of `endpoint_headers`.
+    /// Uses the same comma-separated `key=value` format with URL-encoded values.
+    pub metric_headers: Option<String>,
+    /// Additional headers for logs; merged on top of `endpoint_headers`.
+    /// Uses the same comma-separated `key=value` format with URL-encoded values.
+    pub log_headers: Option<String>,
+    /// Timeout (milliseconds) for all OTLP HTTP exports.
+    pub endpoint_timeout_millis: Option<u64>,
+    /// Timeout (milliseconds) for trace OTLP HTTP export.
+    pub trace_timeout_millis: Option<u64>,
+    /// Timeout (milliseconds) for metrics OTLP HTTP export.
+    pub metric_timeout_millis: Option<u64>,
+    /// Timeout (milliseconds) for log OTLP HTTP export.
+    pub log_timeout_millis: Option<u64>,
     /// Dedicated profiling endpoint.
     pub profiling_endpoint: Option<String>,
     /// Whether to export distributed traces (default: `true`).
@@ -109,7 +141,7 @@ pub struct OtelConfig {
     pub metrics_export_enabled: Option<bool>,
     /// Whether to export logs via OTLP (default: `true`).
     pub logs_export_enabled: Option<bool>,
-    /// Whether to export profiles via pyroscope (default: `true`).
+    /// Whether to export profiles via pyroscope (default: `false`).
     pub profiling_export_enabled: Option<bool>,
     /// **[OTLP-only]** Mirror all signals to stdout in addition to OTLP export.
     /// Only applies when an OTLP endpoint is configured.
@@ -245,11 +277,23 @@ impl OtelConfig {
             trace_endpoint: get_env_opt_str(ENV_OBS_TRACE_ENDPOINT),
             metric_endpoint: get_env_opt_str(ENV_OBS_METRIC_ENDPOINT),
             log_endpoint: get_env_opt_str(ENV_OBS_LOG_ENDPOINT),
+            endpoint_headers: get_env_opt_str(ENV_OBS_ENDPOINT_HEADERS),
+            trace_headers: get_env_opt_str(ENV_OBS_ENDPOINT_TRACES_HEADERS),
+            metric_headers: get_env_opt_str(ENV_OBS_ENDPOINT_METRICS_HEADERS),
+            log_headers: get_env_opt_str(ENV_OBS_ENDPOINT_LOGS_HEADERS),
+            endpoint_timeout_millis: get_env_opt_u64(ENV_OBS_ENDPOINT_TIMEOUT_MILLIS),
+            trace_timeout_millis: get_env_opt_u64(ENV_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS),
+            metric_timeout_millis: get_env_opt_u64(ENV_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS),
+            log_timeout_millis: get_env_opt_u64(ENV_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS),
             profiling_endpoint: get_env_opt_str(ENV_OBS_PROFILING_ENDPOINT),
             traces_export_enabled: Some(get_env_bool(ENV_OBS_TRACES_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED)),
             metrics_export_enabled: Some(get_env_bool(ENV_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED)),
             logs_export_enabled: Some(get_env_bool(ENV_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED)),
-            profiling_export_enabled: Some(get_env_bool(ENV_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED)),
+            profiling_export_enabled: Some(get_env_bool_with_aliases(
+                ENV_OBS_PROFILING_EXPORT_ENABLED,
+                &[LEGACY_ENV_OBS_PROFILING_ENABLED],
+                DEFAULT_OBS_PROFILING_EXPORT_ENABLED,
+            )),
             use_stdout: Some(use_stdout),
             sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
             meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
@@ -381,4 +425,56 @@ impl Default for AppConfig {
 /// case-insensitively against the string `"production"`.
 pub fn is_production_environment() -> bool {
     get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT).eq_ignore_ascii_case(DEFAULT_OBS_ENVIRONMENT_PRODUCTION)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static PROFILING_ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_profiling_env_lock<F>(f: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = PROFILING_ENV_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        f();
+    }
+
+    fn extract_profiling_export_enabled() -> Option<bool> {
+        OtelConfig::extract_otel_config_from_env(None).profiling_export_enabled
+    }
+
+    #[test]
+    fn profiling_export_defaults_to_disabled_when_unset() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
+                temp_env::with_var_unset(LEGACY_ENV_OBS_PROFILING_ENABLED, || {
+                    assert_eq!(extract_profiling_export_enabled(), Some(DEFAULT_OBS_PROFILING_EXPORT_ENABLED));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn profiling_export_accepts_legacy_env_alias() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
+                temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
+                    assert_eq!(extract_profiling_export_enabled(), Some(true));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn canonical_profiling_toggle_has_priority_over_legacy_alias() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
+                temp_env::with_var(ENV_OBS_PROFILING_EXPORT_ENABLED, Some("false"), || {
+                    assert_eq!(extract_profiling_export_enabled(), Some(false));
+                });
+            });
+        });
+    }
 }

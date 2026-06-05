@@ -29,8 +29,7 @@ categories = ["web-programming", "development-tools", "asynchronous", "api-bindi
 rustfs-targets = { workspace = true }
 rustfs-config = { workspace = true, features = ["audit", "constants"] }
 rustfs-ecstore = { workspace = true }
-rustfs-s3-common = { workspace = true }
-async-trait = { workspace = true }
+rustfs-s3-types = { workspace = true }
 chrono = { workspace = true }
 const-str = { workspace = true }
 futures = { workspace = true }
@@ -41,13 +40,14 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
-url = { workspace = true }
-rumqttc = { workspace = true }
 
+[dev-dependencies]
+async-trait = { workspace = true }
+temp-env = { workspace = true }
+url = { workspace = true }
 
 [lints]
 workspace = true
 
 [lib]
-test = false
 doctest = false

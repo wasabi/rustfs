@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time::timeout;
-use tracing::Instrument;
 
 use crate::fast_lock::{
     metrics::ShardMetrics,
@@ -42,6 +41,42 @@ pub struct LockShard {
     active_guards: parking_lot::Mutex<HashSet<u64>>,
 }
 
+/// Cancellation-safe waiter counter ticket.
+///
+/// Ensures waiting counters are decremented even if the waiting future
+/// is cancelled/dropped before the normal post-await path runs.
+struct WaiterCounterGuard {
+    state: Arc<ObjectLockState>,
+    mode: LockMode,
+    incremented: bool,
+}
+
+impl WaiterCounterGuard {
+    fn new(state: Arc<ObjectLockState>, mode: LockMode) -> Self {
+        let incremented = match mode {
+            LockMode::Shared => state.atomic_state.inc_readers_waiting(),
+            LockMode::Exclusive => state.atomic_state.inc_writers_waiting(),
+        };
+        Self {
+            state,
+            mode,
+            incremented,
+        }
+    }
+}
+
+impl Drop for WaiterCounterGuard {
+    fn drop(&mut self) {
+        if !self.incremented {
+            return;
+        }
+        match self.mode {
+            LockMode::Shared => self.state.atomic_state.dec_readers_waiting(),
+            LockMode::Exclusive => self.state.atomic_state.dec_writers_waiting(),
+        }
+    }
+}
+
 impl LockShard {
     pub fn new(shard_id: usize) -> Self {
         Self {
@@ -57,28 +92,14 @@ impl LockShard {
     pub async fn acquire_lock(&self, request: &ObjectLockRequest) -> Result<(), LockResult> {
         let start_time = Instant::now();
 
-        // Try fast path first (sync; typically short — separates parking_lot work from async wait)
-        let fast_hit = tracing::span!(
-            target: "rustfs_lock_acquire_detail",
-            tracing::Level::DEBUG,
-            "lock_shard.fast_path_try",
-            resource = %request.key,
-        )
-        .in_scope(|| self.try_fast_path(request));
-
-        if let Some(_state) = fast_hit {
+        // Try fast path first
+        if let Some(_state) = self.try_fast_path(request) {
             self.metrics.record_fast_path_success();
             return Ok(());
         }
 
-        // Slow path with waiting (async notify / backoff — expected parent: lock_manager.shard_acquire)
-        self.acquire_lock_slow_path(request, start_time)
-            .instrument(tracing::debug_span!(
-                target: "rustfs_lock_acquire_detail",
-                "lock_shard.slow_path_wait",
-                resource = %request.key,
-            ))
-            .await
+        // Slow path with waiting
+        self.acquire_lock_slow_path(request, start_time).await
     }
 
     /// Try fast path only (without fallback to slow path)
@@ -103,12 +124,7 @@ impl LockShard {
 
                 // Try atomic acquisition
                 let success = match request.mode {
-                    LockMode::Shared => state.try_acquire_shared_fast(
-                        &request.owner,
-                        request.lock_timeout,
-                        request.trace_id.clone(),
-                        request.operation_id.clone(),
-                    ),
+                    LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
                     LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
                 };
 
@@ -155,14 +171,8 @@ impl LockShard {
         const MAX_RETRIES: u32 = 10;
 
         loop {
-            // Get or create object state (parking_lot write lock — contends with other shard users)
-            let state = tracing::span!(
-                target: "rustfs_lock_acquire_detail",
-                tracing::Level::DEBUG,
-                "lock_shard.slow_path_objects_write",
-                resource = %request.key,
-            )
-            .in_scope(|| {
+            // Get or create object state
+            let state = {
                 let mut objects = self.objects.write();
                 match objects.get(&request.key) {
                     Some(state) => state.clone(),
@@ -173,27 +183,17 @@ impl LockShard {
                         state
                     }
                 }
-            });
+            };
 
             // Try acquisition again
             let success = match request.mode {
-                LockMode::Shared => state.try_acquire_shared_fast(
-                    &request.owner,
-                    request.lock_timeout,
-                    request.trace_id.clone(),
-                    request.operation_id.clone(),
-                ),
+                LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
                 LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
             };
 
             if success {
                 self.metrics.record_slow_path_success();
                 return Ok(());
-            }
-
-            if retry_count == 0 && tracing::enabled!(target: "rustfs_lock_holder", tracing::Level::DEBUG) {
-                let snap = state.waiter_contention_snapshot();
-                crate::fast_lock::holder_trace::emit_wait_blocked(request, &snap, retry_count);
             }
 
             // Check timeout
@@ -211,43 +211,21 @@ impl LockShard {
                 let backoff_duration = Duration::from_millis(backoff_ms);
 
                 if backoff_duration < remaining {
-                    tokio::time::sleep(backoff_duration)
-                        .instrument(tracing::debug_span!(
-                            target: "rustfs_lock_acquire_detail",
-                            "lock_shard.slow_path_backoff",
-                            resource = %request.key,
-                            backoff_ms,
-                        ))
-                        .await;
+                    tokio::time::sleep(backoff_duration).await;
                     retry_count += 1;
                     continue;
                 }
             }
 
             // If we've exhausted quick retries or have little time left, use notification wait
-            if tracing::enabled!(target: "rustfs_lock_holder", tracing::Level::DEBUG) {
-                let snap_notify = state.waiter_contention_snapshot();
-                crate::fast_lock::holder_trace::emit_notify_enter(request, &snap_notify, retry_count);
-            }
-
-            let notify_span = tracing::debug_span!(
-                target: "rustfs_lock_acquire_detail",
-                "lock_shard.slow_path_notify_wait",
-                resource = %request.key,
-                mode = ?request.mode,
-            );
             let wait_result = match request.mode {
                 LockMode::Shared => {
-                    state.atomic_state.inc_readers_waiting();
-                    let result = timeout(remaining, state.optimized_notify.wait_for_read().instrument(notify_span.clone())).await;
-                    state.atomic_state.dec_readers_waiting();
-                    result
+                    let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Shared);
+                    timeout(remaining, state.optimized_notify.wait_for_read()).await
                 }
                 LockMode::Exclusive => {
-                    state.atomic_state.inc_writers_waiting();
-                    let result = timeout(remaining, state.optimized_notify.wait_for_write().instrument(notify_span)).await;
-                    state.atomic_state.dec_writers_waiting();
-                    result
+                    let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Exclusive);
+                    timeout(remaining, state.optimized_notify.wait_for_write()).await
                 }
             };
 
@@ -268,30 +246,12 @@ impl LockShard {
         {
             let objects = self.objects.read();
             if let Some(state) = objects.get(key) {
-                let holder_trace_enabled = tracing::enabled!(target: "rustfs_lock_holder", tracing::Level::DEBUG);
-                let release_info = if holder_trace_enabled && matches!(mode, LockMode::Exclusive) {
-                    state.exclusive_release_info_if_releasing(owner)
-                } else {
-                    None
-                };
-                let release_info_shared = if holder_trace_enabled && matches!(mode, LockMode::Shared) {
-                    state.shared_release_info_if_releasing(owner)
-                } else {
-                    None
-                };
-
                 result = match mode {
                     LockMode::Shared => state.release_shared(owner),
                     LockMode::Exclusive => state.release_exclusive(owner),
                 };
 
                 if result {
-                    if let Some((prev_owner, held)) = release_info {
-                        crate::fast_lock::holder_trace::emit_exclusive_released(key, prev_owner.as_ref(), held);
-                    }
-                    if let Some((prev_owner, held)) = release_info_shared {
-                        crate::fast_lock::holder_trace::emit_shared_released(key, prev_owner.as_ref(), held);
-                    }
                     self.metrics.record_release();
 
                     // Check if cleanup is needed
@@ -360,30 +320,12 @@ impl LockShard {
         {
             let objects = self.objects.read();
             if let Some(state) = objects.get(key) {
-                let holder_trace_enabled = tracing::enabled!(target: "rustfs_lock_holder", tracing::Level::DEBUG);
-                let release_info = if holder_trace_enabled && matches!(mode, LockMode::Exclusive) {
-                    state.exclusive_release_info_if_releasing(owner)
-                } else {
-                    None
-                };
-                let release_info_shared = if holder_trace_enabled && matches!(mode, LockMode::Shared) {
-                    state.shared_release_info_if_releasing(owner)
-                } else {
-                    None
-                };
-
                 result = match mode {
                     LockMode::Shared => state.release_shared(owner),
                     LockMode::Exclusive => state.release_exclusive(owner),
                 };
 
                 if result {
-                    if let Some((prev_owner, held)) = release_info {
-                        crate::fast_lock::holder_trace::emit_exclusive_released(key, prev_owner.as_ref(), held);
-                    }
-                    if let Some((prev_owner, held)) = release_info_shared {
-                        crate::fast_lock::holder_trace::emit_shared_released(key, prev_owner.as_ref(), held);
-                    }
                     self.metrics.record_release();
                     should_cleanup = !state.is_locked() && !state.atomic_state.has_waiters();
                 } else {
@@ -893,5 +835,160 @@ mod tests {
         let obj1_key = ObjectKey::new("bucket", "obj1");
         let lock_info = shard.get_lock_info(&obj1_key);
         assert!(lock_info.is_some(), "obj1 should still be locked by blocking_owner");
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_waiter_abort_does_not_block_following_shared_lock() {
+        let shard = Arc::new(LockShard::new(0));
+        let key = ObjectKey::new("bucket", "abort-waiter-key");
+
+        let owner1: Arc<str> = Arc::from("writer-owner-1");
+        let owner2: Arc<str> = Arc::from("writer-owner-2");
+        let reader_owner: Arc<str> = Arc::from("reader-owner");
+
+        let hold_writer = ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Exclusive,
+            owner: owner1.clone(),
+            acquire_timeout: Duration::from_secs(1),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+            trace_id: None,
+            operation_id: None,
+            lock_source: None,
+            lock_source_detail: None,
+        };
+
+        assert!(shard.acquire_lock(&hold_writer).await.is_ok());
+
+        let contended_writer = ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Exclusive,
+            owner: owner2.clone(),
+            acquire_timeout: Duration::from_secs(5),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+            trace_id: None,
+            operation_id: None,
+            lock_source: None,
+            lock_source_detail: None,
+        };
+
+        let shard_for_waiter = shard.clone();
+        let waiter_handle = tokio::spawn(async move { shard_for_waiter.acquire_lock(&contended_writer).await });
+
+        // Ensure we actually enter slow-path wait registration before aborting.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(state) = shard.objects.read().get(&key).cloned()
+                    && state.atomic_state.writers_waiting_count() > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for contended writer to register as waiting");
+        waiter_handle.abort();
+        let _ = waiter_handle.await;
+
+        assert!(shard.release_lock(&key, &owner1, LockMode::Exclusive));
+
+        let followup_reader = ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Shared,
+            owner: reader_owner.clone(),
+            acquire_timeout: Duration::from_millis(200),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+            trace_id: None,
+            operation_id: None,
+            lock_source: None,
+            lock_source_detail: None,
+        };
+
+        assert!(
+            shard.acquire_lock(&followup_reader).await.is_ok(),
+            "shared lock should succeed after writer waiter task is aborted"
+        );
+        assert!(shard.release_lock(&key, &reader_owner, LockMode::Shared));
+    }
+
+    #[tokio::test]
+    async fn test_shared_waiter_abort_does_not_block_following_exclusive_lock() {
+        let shard = Arc::new(LockShard::new(0));
+        let key = ObjectKey::new("bucket", "abort-reader-waiter-key");
+
+        let writer_owner: Arc<str> = Arc::from("writer-owner");
+        let reader_owner: Arc<str> = Arc::from("reader-owner");
+        let followup_owner: Arc<str> = Arc::from("followup-writer-owner");
+
+        let hold_writer = ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Exclusive,
+            owner: writer_owner.clone(),
+            acquire_timeout: Duration::from_secs(1),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+            trace_id: None,
+            operation_id: None,
+            lock_source: None,
+            lock_source_detail: None,
+        };
+
+        assert!(shard.acquire_lock(&hold_writer).await.is_ok());
+
+        let contended_reader = ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Shared,
+            owner: reader_owner.clone(),
+            acquire_timeout: Duration::from_secs(5),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+            trace_id: None,
+            operation_id: None,
+            lock_source: None,
+            lock_source_detail: None,
+        };
+
+        let shard_for_waiter = shard.clone();
+        let waiter_handle = tokio::spawn(async move { shard_for_waiter.acquire_lock(&contended_reader).await });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(state) = shard.objects.read().get(&key).cloned()
+                    && state.atomic_state.readers_waiting_count() > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for contended reader to register as waiting");
+        waiter_handle.abort();
+        let _ = waiter_handle.await;
+
+        assert!(shard.release_lock(&key, &writer_owner, LockMode::Exclusive));
+
+        let followup_writer = ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Exclusive,
+            owner: followup_owner.clone(),
+            acquire_timeout: Duration::from_millis(200),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+            trace_id: None,
+            operation_id: None,
+            lock_source: None,
+            lock_source_detail: None,
+        };
+
+        assert!(
+            shard.acquire_lock(&followup_writer).await.is_ok(),
+            "exclusive lock should succeed after reader waiter task is aborted"
+        );
+        assert!(shard.release_lock(&key, &followup_owner, LockMode::Exclusive));
     }
 }

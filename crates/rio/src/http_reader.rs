@@ -18,7 +18,10 @@ use futures::{Stream, TryStreamExt as _};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
-use rustfs_common::internode_metrics::global_internode_metrics;
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
+    global_internode_metrics,
+};
 use rustfs_utils::get_env_opt_str;
 use std::io::IoSlice;
 use std::io::{self, Error};
@@ -27,11 +30,17 @@ use std::ops::Not as _;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+use tokio::time::{self, Sleep};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
 use tracing::error;
+
+const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
+const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
+const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 
 /// Get the TLS path from the RUSTFS_TLS_PATH environment variable.
 /// If the variable is not set, return None.
@@ -143,6 +152,9 @@ pin_project! {
         method: Method,
         headers: HeaderMap,
         track_internode_metrics: bool,
+        internode_operation: Option<&'static str>,
+        stall_timeout: Option<Duration>,
+        stall_timer: Option<Pin<Box<Sleep>>>,
         #[pin]
         inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
     }
@@ -151,8 +163,19 @@ pin_project! {
 impl HttpReader {
     pub async fn new(url: String, method: Method, headers: HeaderMap, body: Option<Vec<u8>>) -> io::Result<Self> {
         // http_log!("[HttpReader::new] url: {url}, method: {method:?}, headers: {headers:?}");
-        Self::with_capacity(url, method, headers, body, 0).await
+        Self::with_capacity_and_stall_timeout(url, method, headers, body, 0, None).await
     }
+
+    pub async fn new_with_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        Self::with_capacity_and_stall_timeout(url, method, headers, body, 0, stall_timeout).await
+    }
+
     /// Create a new HttpReader from a URL. The request is performed immediately.
     pub async fn with_capacity(
         url: String,
@@ -161,7 +184,19 @@ impl HttpReader {
         body: Option<Vec<u8>>,
         _read_buf_size: usize,
     ) -> io::Result<Self> {
+        Self::with_capacity_and_stall_timeout(url, method, headers, body, _read_buf_size, None).await
+    }
+
+    async fn with_capacity_and_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        _read_buf_size: usize,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
         let track_internode_metrics = is_internode_rpc_url(&url);
+        let internode_operation = internode_rpc_operation(&url);
         let client = get_http_client(&url);
         let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
         if let Some(body) = body {
@@ -169,30 +204,22 @@ impl HttpReader {
         }
 
         let resp = request.send().await.map_err(|e| {
-            if track_internode_metrics {
-                global_internode_metrics().record_error();
-            }
+            record_internode_error(track_internode_metrics, internode_operation);
             Error::other(format!("HttpReader HTTP request error: {e}"))
         })?;
 
         if resp.status().is_success().not() {
-            if track_internode_metrics {
-                global_internode_metrics().record_error();
-            }
+            record_internode_error(track_internode_metrics, internode_operation);
             return Err(Error::other(format!(
                 "HttpReader HTTP request failed with non-200 status {}",
                 resp.status()
             )));
         }
 
-        if track_internode_metrics {
-            global_internode_metrics().record_outgoing_request();
-        }
+        record_internode_outgoing_request(track_internode_metrics, internode_operation);
 
         let stream = resp.bytes_stream().map_err(move |e| {
-            if track_internode_metrics {
-                global_internode_metrics().record_error();
-            }
+            record_internode_error(track_internode_metrics, internode_operation);
             Error::other(format!("HttpReader stream error: {e}"))
         });
 
@@ -202,6 +229,9 @@ impl HttpReader {
             method,
             headers,
             track_internode_metrics,
+            internode_operation,
+            stall_timer: stall_timeout.map(|timeout| Box::pin(time::sleep(timeout))),
+            stall_timeout,
         })
     }
     pub fn url(&self) -> &str {
@@ -216,15 +246,37 @@ impl HttpReader {
 }
 
 impl AsyncRead for HttpReader {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let mut this = self.project();
+
         let filled_before = buf.filled().len();
-        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+        match this.inner.as_mut().poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
                 let bytes_read = buf.filled().len().saturating_sub(filled_before);
-                if self.track_internode_metrics && bytes_read > 0 {
-                    global_internode_metrics().record_recv_bytes(bytes_read);
+                if bytes_read > 0 {
+                    record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, bytes_read);
+                }
+                if bytes_read > 0 {
+                    if let Some(stall_timeout) = *this.stall_timeout {
+                        *this.stall_timer = Some(Box::pin(time::sleep(stall_timeout)));
+                    }
+                } else {
+                    *this.stall_timer = None;
                 }
                 Poll::Ready(Ok(()))
+            }
+            Poll::Pending => {
+                if let Some(timer) = this.stall_timer.as_mut()
+                    && timer.as_mut().poll(cx).is_ready()
+                {
+                    record_internode_error(*this.track_internode_metrics, *this.internode_operation);
+                    Poll::Ready(Err(Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HttpReader stall timeout: no data received before deadline",
+                    )))
+                } else {
+                    Poll::Pending
+                }
             }
             other => other,
         }
@@ -253,6 +305,7 @@ impl HashReaderDetector for HttpReader {
 struct ReceiverStream {
     receiver: mpsc::Receiver<Option<Bytes>>,
     track_internode_metrics: bool,
+    internode_operation: Option<&'static str>,
 }
 
 impl Stream for ReceiverStream {
@@ -275,9 +328,7 @@ impl Stream for ReceiverStream {
         // }
         match poll {
             Poll::Ready(Some(Some(bytes))) => {
-                if self.track_internode_metrics {
-                    global_internode_metrics().record_sent_bytes(bytes.len());
-                }
+                record_internode_sent_bytes(self.track_internode_metrics, self.internode_operation, bytes.len());
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(None)) => Poll::Ready(None), // Sender shutdown
@@ -312,6 +363,7 @@ impl HttpWriter {
         let method_clone = method.clone();
         let headers_clone = headers.clone();
         let track_internode_metrics = is_internode_rpc_url(&url);
+        let internode_operation = internode_rpc_operation(&url);
 
         let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(HTTP_WRITER_CHANNEL_CAPACITY);
         let (err_tx, err_rx) = tokio::sync::oneshot::channel::<io::Error>();
@@ -320,6 +372,7 @@ impl HttpWriter {
             let stream = ReceiverStream {
                 receiver,
                 track_internode_metrics,
+                internode_operation,
             };
             let body = reqwest::Body::wrap_stream(stream);
             // http_log!(
@@ -339,9 +392,7 @@ impl HttpWriter {
                 Ok(resp) => {
                     // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
-                        if track_internode_metrics {
-                            global_internode_metrics().record_error();
-                        }
+                        record_internode_error(track_internode_metrics, internode_operation);
                         let _ = err_tx.send(Error::other(format!(
                             "HttpWriter HTTP request failed with non-200 status {}",
                             resp.status()
@@ -350,9 +401,7 @@ impl HttpWriter {
                     }
                 }
                 Err(e) => {
-                    if track_internode_metrics {
-                        global_internode_metrics().record_error();
-                    }
+                    record_internode_error(track_internode_metrics, internode_operation);
                     // http_log!("[HttpWriter::spawn] HTTP request error: {e}");
                     let _ = err_tx.send(Error::other(format!("HTTP request failed: {e}")));
                     return Err(Error::other(format!("HTTP request failed: {e}")));
@@ -364,9 +413,7 @@ impl HttpWriter {
         });
 
         // http_log!("[HttpWriter::new] connection established successfully");
-        if track_internode_metrics {
-            global_internode_metrics().record_outgoing_request();
-        }
+        record_internode_outgoing_request(track_internode_metrics, internode_operation);
         Ok(Self {
             url,
             method,
@@ -394,6 +441,60 @@ impl HttpWriter {
 
 fn is_internode_rpc_url(url: &str) -> bool {
     url.contains("/rustfs/rpc/")
+}
+
+fn internode_rpc_operation(url: &str) -> Option<&'static str> {
+    let url = reqwest::Url::parse(url).ok()?;
+    match url.path() {
+        READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        PUT_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
+        _ => None,
+    }
+}
+
+fn record_internode_outgoing_request(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    match operation {
+        Some(operation) => global_internode_metrics().record_outgoing_request_for_operation(operation),
+        None => global_internode_metrics().record_outgoing_request(),
+    }
+}
+
+fn record_internode_sent_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
+    if !track {
+        return;
+    }
+
+    match operation {
+        Some(operation) => global_internode_metrics().record_sent_bytes_for_operation(operation, bytes),
+        None => global_internode_metrics().record_sent_bytes(bytes),
+    }
+}
+
+fn record_internode_recv_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
+    if !track {
+        return;
+    }
+
+    match operation {
+        Some(operation) => global_internode_metrics().record_recv_bytes_for_operation(operation, bytes),
+        None => global_internode_metrics().record_recv_bytes(bytes),
+    }
+}
+
+fn record_internode_error(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    match operation {
+        Some(operation) => global_internode_metrics().record_error_for_operation(operation),
+        None => global_internode_metrics().record_error(),
+    }
 }
 
 fn poll_send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -> io::Error {
@@ -570,8 +671,9 @@ impl AsyncWrite for HttpWriter {
 mod tests {
     use super::*;
     use axum::{Router, body::Body, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+    use futures::stream::{self, StreamExt as _};
     use http_body_util::BodyExt as _;
-    use std::io::IoSlice;
+    use std::io::{self, IoSlice};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -595,6 +697,12 @@ mod tests {
         (StatusCode::OK, Body::from("hello"))
     }
 
+    async fn get_stalling_stream(State(state): State<TestState>) -> impl IntoResponse {
+        state.get_count.fetch_add(1, Ordering::SeqCst);
+        let body_stream = stream::once(async { Ok::<Bytes, io::Error>(Bytes::from_static(b"hello")) }).chain(stream::pending());
+        (StatusCode::OK, Body::from_stream(body_stream))
+    }
+
     async fn reject_head(State(state): State<TestState>) -> impl IntoResponse {
         state.head_count.fetch_add(1, Ordering::SeqCst);
         StatusCode::METHOD_NOT_ALLOWED
@@ -612,6 +720,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .route("/stall", get(get_stalling_stream))
             .with_state(state);
 
         let handle = tokio::spawn(async move {
@@ -619,6 +728,27 @@ mod tests {
         });
 
         (format!("http://{addr}/stream"), handle)
+    }
+
+    #[test]
+    fn internode_rpc_operation_maps_known_routes() {
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{READ_FILE_STREAM_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM)
+        );
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{PUT_FILE_STREAM_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM)
+        );
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{WALK_DIR_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_WALK_DIR)
+        );
+        assert_eq!(internode_rpc_operation("http://node:9000/rustfs/rpc/unknown"), None);
+        assert_eq!(
+            internode_rpc_operation("http://node:9000/rustfs/rpc/unknown?next=/rustfs/rpc/read_file_stream"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -633,6 +763,31 @@ mod tests {
         assert_eq!(buf, b"hello");
         assert_eq!(state.head_count.load(Ordering::SeqCst), 0);
         assert_eq!(state.get_count.load(Ordering::SeqCst), 1);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_reader_stall_timeout_triggers_after_progress_stops() {
+        let state = TestState::default();
+        let (base_url, handle) = start_test_server(state.clone()).await;
+        let url = base_url.replace("/stream", "/stall");
+
+        let mut reader =
+            HttpReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, Some(Duration::from_millis(20)))
+                .await
+                .unwrap();
+
+        let mut first = [0u8; 5];
+        reader.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"hello");
+
+        let mut next = [0u8; 1];
+        let err = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut next))
+            .await
+            .expect("stall timeout should wake reader")
+            .expect_err("reader should return a timeout error");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 
         handle.abort();
     }

@@ -48,6 +48,7 @@ jsonwebtoken = { workspace = true }
 tracing.workspace = true
 rustfs-madmin.workspace = true
 rustfs-utils = { workspace = true, features = ["path"] }
+rustfs-io-metrics.workspace = true
 tokio-util.workspace = true
 pollster.workspace = true
 reqwest = { workspace = true }
@@ -58,6 +59,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 pollster.workspace = true
+serial_test = { workspace = true }
+temp-env = { workspace = true }
 
 [lib]
 doctest = false

@@ -137,7 +137,7 @@ impl LockClient for LocalClient {
 
         match lock_manager.acquire_lock(lock_request).instrument(global_span).await {
             Ok(guard) => {
-                let lock_id = LockId::new_unique(&request.resource);
+                let lock_id = request.lock_id.clone();
 
                 let insert_span = tracing::debug_span!(
                     target: "rustfs_lock_acquire_detail",

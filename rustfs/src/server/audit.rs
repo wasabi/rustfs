@@ -12,13 +12,38 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use super::{module_switch::resolve_audit_module_state, refresh_persisted_module_switches_from_store};
 use crate::app::context::resolve_server_config;
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
-use rustfs_config::DEFAULT_DELIMITER;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
+
+static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_AUDIT_ENABLE);
 
 fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
     resolve_server_config()
+}
+
+pub fn refresh_audit_module_enabled() -> bool {
+    let enabled = resolve_audit_module_state().enabled;
+    AUDIT_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+pub fn is_audit_module_enabled() -> bool {
+    AUDIT_MODULE_ENABLED.load(Ordering::Relaxed)
+}
+
+fn has_any_audit_targets(config: &rustfs_ecstore::config::Config) -> bool {
+    for &subsystem in rustfs_config::audit::AUDIT_SUB_SYSTEMS {
+        let Some(targets) = config.0.get(subsystem) else {
+            continue;
+        };
+        if targets.keys().any(|key| key != rustfs_config::DEFAULT_DELIMITER) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Start the audit system.
@@ -26,7 +51,20 @@ fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
 /// If configured, it initializes and starts the audit system.
 /// If not configured, it skips the initialization.
 /// It also handles cases where the audit system is already running or if the global configuration is not loaded.
-pub(crate) async fn start_audit_system() -> AuditResult<()> {
+pub async fn start_audit_system() -> AuditResult<()> {
+    if let Err(err) = refresh_persisted_module_switches_from_store().await {
+        warn!("Failed to refresh persisted audit module switch from store: {}", err);
+    }
+
+    let enabled = refresh_audit_module_enabled();
+    if !enabled {
+        info!(
+            target: "rustfs::main::start_audit_system",
+            "Audit module is disabled, audit system initialization is skipped. Enable the audit module first."
+        );
+        return Ok(());
+    }
+
     info!(
         target: "rustfs::main::start_audit_system",
         "Initializing the audit system..."
@@ -34,13 +72,7 @@ pub(crate) async fn start_audit_system() -> AuditResult<()> {
 
     // 1. Get the global configuration loaded by ecstore
     let server_config = match server_config_from_context() {
-        Some(config) => {
-            info!(
-                target: "rustfs::main::start_audit_system",
-                "Global server configuration loads successfully: {:?}", config
-            );
-            config
-        }
+        Some(config) => config,
         None => {
             warn!(
                 target: "rustfs::main::start_audit_system",
@@ -54,53 +86,62 @@ pub(crate) async fn start_audit_system() -> AuditResult<()> {
         target: "rustfs::main::start_audit_system",
         "The global server configuration is loaded"
     );
-    // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
-    let mqtt_config = server_config.get_value(rustfs_config::audit::AUDIT_MQTT_SUB_SYS, DEFAULT_DELIMITER);
-    let webhook_config = server_config.get_value(rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER);
-
-    if mqtt_config.is_none() && webhook_config.is_none() {
+    // 2. Check if the audit subsystem exists in the configuration, and skip initialization if it doesn't
+    if !has_any_audit_targets(&server_config) {
         info!(
             target: "rustfs::main::start_audit_system",
-            "Audit subsystem (MQTT/Webhook) is not configured, and audit system initialization is skipped."
+            "Audit subsystem targets are not configured, and audit system initialization is skipped."
         );
         return Ok(());
     }
 
     info!(
         target: "rustfs::main::start_audit_system",
-        "Audit subsystem configuration detected (MQTT: {}, Webhook: {}) and started initializing the audit system.",
-        mqtt_config.is_some(),
-        webhook_config.is_some()
+        "Audit subsystem configuration detected and started initializing the audit system."
     );
-    // 3. Initialize and start the audit system
-    let system = init_audit_system();
-    // Check if the audit system is already running
-    let state = system.get_state().await;
-    if state == AuditSystemState::Running {
-        warn!(
-            target: "rustfs::main::start_audit_system",
-            "The audit system is running, skip repeated initialization."
-        );
-        return Err(AuditError::AlreadyInitialized);
-    }
-    // Preparation before starting
-    match system.start(server_config).await {
-        Ok(_) => {
-            info!(
-                target: "rustfs::main::start_audit_system",
-                "Audit system started successfully with time: {}.",
-                jiff::Zoned::now()
-            );
-            Ok(())
+
+    let system = audit_system().unwrap_or_else(init_audit_system);
+    match system.get_state().await {
+        AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {
+            // Match notify behavior: prefer reloading the existing singleton
+            // instead of constructing a second lifecycle path on re-enable.
+            match system.reload_config(server_config).await {
+                Ok(()) => {
+                    info!(
+                        target: "rustfs::main::start_audit_system",
+                        "Audit system reloaded successfully with time: {}.",
+                        jiff::Zoned::now()
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(
+                        target: "rustfs::main::start_audit_system",
+                        "Audit system reload failed: {:?}",
+                        e
+                    );
+                    Err(e)
+                }
+            }
         }
-        Err(e) => {
-            warn!(
-                target: "rustfs::main::start_audit_system",
-                "Audit system startup failed: {:?}",
-                e
-            );
-            Err(e)
-        }
+        AuditSystemState::Stopped | AuditSystemState::Stopping => match system.start(server_config).await {
+            Ok(()) => {
+                info!(
+                    target: "rustfs::main::start_audit_system",
+                    "Audit system started successfully with time: {}.",
+                    jiff::Zoned::now()
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    target: "rustfs::main::start_audit_system",
+                    "Audit system startup failed: {:?}",
+                    e
+                );
+                Err(e)
+            }
+        },
     }
 }
 
@@ -108,7 +149,7 @@ pub(crate) async fn start_audit_system() -> AuditResult<()> {
 /// This function checks if the audit system is initialized and running.
 /// If it is running, it prepares to stop the system, stops it, and records the stop time.
 /// If the system is already stopped or not initialized, it logs a warning and returns.
-pub(crate) async fn stop_audit_system() -> AuditResult<()> {
+pub async fn stop_audit_system() -> AuditResult<()> {
     if let Some(system) = audit_system() {
         let state = system.get_state().await;
         if state == AuditSystemState::Stopped {

@@ -685,6 +685,18 @@ pub fn is_err_read_quorum(err: &Error) -> bool {
     matches!(err, &StorageError::ErasureReadQuorum)
 }
 
+pub fn classify_system_path_failure_reason(err: &Error) -> &'static str {
+    match err {
+        StorageError::ConfigNotFound => "config_not_found",
+        StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => "read_quorum",
+        StorageError::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::TimedOut => "timeout",
+            _ => "io",
+        },
+        _ => "other",
+    }
+}
+
 pub fn is_err_invalid_upload_id(err: &Error) -> bool {
     matches!(err, &StorageError::InvalidUploadID(_, _, _))
 }
@@ -1040,6 +1052,28 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_system_path_failure_reason() {
+        assert_eq!(classify_system_path_failure_reason(&StorageError::ConfigNotFound), "config_not_found");
+        assert_eq!(classify_system_path_failure_reason(&StorageError::ErasureReadQuorum), "read_quorum");
+        assert_eq!(
+            classify_system_path_failure_reason(&StorageError::InsufficientReadQuorum(
+                "bucket".to_string(),
+                "object".to_string()
+            )),
+            "read_quorum"
+        );
+        assert_eq!(
+            classify_system_path_failure_reason(&StorageError::Io(IoError::new(ErrorKind::TimedOut, "probe"))),
+            "timeout"
+        );
+        assert_eq!(
+            classify_system_path_failure_reason(&StorageError::Io(IoError::new(ErrorKind::PermissionDenied, "probe"))),
+            "io"
+        );
+        assert_eq!(classify_system_path_failure_reason(&StorageError::DiskFull), "other");
+    }
+
+    #[test]
     fn test_storage_error_from_disk_error() {
         // Test conversion from DiskError
         let disk_io = DiskError::Io(IoError::other("disk io error"));
@@ -1188,7 +1222,7 @@ mod tests {
     fn test_io_error_with_disk_error_inside() {
         // Test io::Error containing DiskError -> StorageError conversion
         let original_disk_error = DiskError::FileNotFound;
-        let io_with_disk_error = std::io::Error::other(original_disk_error.clone());
+        let io_with_disk_error = std::io::Error::other(original_disk_error);
 
         // Convert io::Error to StorageError
         let storage_error: StorageError = io_with_disk_error.into();

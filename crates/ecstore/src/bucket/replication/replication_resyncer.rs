@@ -34,8 +34,8 @@ use crate::global::get_global_bucket_monitor;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::store_api::{DeletedObject, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
 use aws_smithy_types::body::SdkBody;
@@ -53,10 +53,10 @@ use regex::Regex;
 use rustfs_filemeta::{
     MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
     ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
-    ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
+    ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, S3VersionId, VersionPurgeStatusType,
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
     SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
@@ -85,7 +85,8 @@ use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
 
 pub(crate) const REPLICATION_DIR: &str = ".replication";
 pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";
@@ -112,6 +113,84 @@ fn normalize_wire_time(value: Option<OffsetDateTime>) -> Option<OffsetDateTime> 
 
 fn resync_state_accepts_update(state: &TargetReplicationResyncStatus, opts: &ResyncOpts) -> bool {
     state.resync_id.is_empty() || opts.resync_id.is_empty() || state.resync_id == opts.resync_id
+}
+
+fn should_count_head_proxy_failure(is_not_found: bool, code: Option<&str>, raw_status: Option<u16>) -> bool {
+    if is_not_found || matches!(code, Some("MethodNotAllowed" | "405")) {
+        return false;
+    }
+    if matches!(raw_status, Some(404 | 405)) {
+        return false;
+    }
+    !is_version_id_mismatch(code, raw_status)
+}
+
+fn has_raw_status(err: &SdkError<HeadObjectError>, status: u16) -> bool {
+    err.raw_response().is_some_and(|r| r.status().as_u16() == status)
+}
+
+fn is_head_proxy_failure(err: &SdkError<HeadObjectError>) -> bool {
+    let (is_not_found, code) = err
+        .as_service_error()
+        .map(|service_err| (service_err.is_not_found(), service_err.code()))
+        .unwrap_or((false, None));
+    let raw_status = err.raw_response().map(|resp| resp.status().as_u16());
+    should_count_head_proxy_failure(is_not_found, code, raw_status)
+}
+
+async fn record_proxy_request(bucket: &str, api: &str, is_err: bool) {
+    if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+        stats.inc_proxy(bucket, api, is_err).await;
+    }
+}
+
+async fn head_object_with_proxy_stats(
+    source_bucket: &str,
+    target_client: &TargetClient,
+    target_bucket: &str,
+    object: &str,
+    version_id: Option<String>,
+) -> std::result::Result<HeadObjectOutput, SdkError<HeadObjectError>> {
+    let result = target_client.head_object(target_bucket, object, version_id).await;
+    let is_err = result.as_ref().err().is_some_and(is_head_proxy_failure);
+    record_proxy_request(source_bucket, "HeadObject", is_err).await;
+    result
+}
+
+// AWS returns 400 for root callers and 403 for IAM users when a UUID version ID
+// is rejected. The 403 case is safe: a real auth failure also returns 403 on the
+// versionId-less fallback, propagating as a hard error instead of silently skipping.
+fn is_version_id_mismatch(code: Option<&str>, raw_status: Option<u16>) -> bool {
+    match code {
+        Some(c) if !c.is_empty() => c == "InvalidArgument",
+        _ => matches!(raw_status, Some(400) | Some(403)),
+    }
+}
+
+fn is_version_id_format_mismatch(err: &SdkError<HeadObjectError>) -> bool {
+    let code = err.as_service_error().and_then(|se| se.code());
+    let raw_status = err.raw_response().map(|r| r.status().as_u16());
+    is_version_id_mismatch(code, raw_status)
+}
+
+async fn head_object_fallback(
+    source_bucket: &str,
+    tgt_client: &TargetClient,
+    object: &str,
+) -> std::result::Result<Option<HeadObjectOutput>, SdkError<HeadObjectError>> {
+    match head_object_with_proxy_stats(source_bucket, tgt_client, &tgt_client.bucket, object, None).await {
+        Ok(oi) => Ok(Some(oi)),
+        Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+// Version IDs differ by design on this path (RustFS UUID vs AWS alphanumeric), so
+// compare only ETags. Equal ETags mean identical content; version ID is irrelevant.
+fn content_matches(src: &ObjectInfo, tgt: &HeadObjectOutput) -> bool {
+    let src_etag = src.etag.as_deref().map(rustfs_utils::path::trim_etag);
+    let tgt_etag = tgt.e_tag.as_deref().map(rustfs_utils::path::trim_etag);
+    src_etag.is_some() && src_etag == tgt_etag
 }
 
 #[derive(Debug, Clone, Default)]
@@ -747,10 +826,15 @@ impl ReplicationResyncer {
 
                     let reset_id = target_client.reset_id.clone();
 
-                    let (size, err) = if let Err(err) = target_client
-                        .head_object(&target_client.bucket, &roi.name, roi.version_id.map(|v| v.to_string()))
-                        .await
-                    {
+                    let head_result = head_object_with_proxy_stats(
+                        &bucket_name,
+                        target_client.as_ref(),
+                        &target_client.bucket,
+                        &roi.name,
+                        roi.version_id.map(|v| v.to_string()),
+                    )
+                    .await;
+                    let (size, err) = if let Err(err) = head_result {
                         if roi.delete_marker {
                             st.replicated_count += 1;
                         } else {
@@ -1271,15 +1355,7 @@ pub async fn check_replicate_delete(
         return ReplicateDecision::default();
     }
 
-    let opts = ObjectOpts {
-        name: dobj.object_name.clone(),
-        ssec: is_ssec_encrypted(&oi.user_defined),
-        user_tags: oi.user_tags.clone(),
-        delete_marker: oi.delete_marker,
-        version_id: dobj.version_id,
-        op_type: ReplicationType::Delete,
-        ..Default::default()
-    };
+    let opts = delete_replication_object_opts(dobj, oi);
 
     let tgt_arns = rcfg.filter_target_arns(&opts);
     let mut dsc = ReplicateDecision::new();
@@ -1329,6 +1405,19 @@ pub async fn check_replicate_delete(
     }
 
     dsc
+}
+
+fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> ObjectOpts {
+    ObjectOpts {
+        name: dobj.object_name.clone(),
+        ssec: is_ssec_encrypted(&oi.user_defined),
+        user_tags: oi.user_tags.clone(),
+        delete_marker: oi.delete_marker,
+        version_id: dobj.version_id,
+        op_type: ReplicationType::Delete,
+        replica: oi.replication_status == ReplicationStatusType::Replica,
+        ..Default::default()
+    }
 }
 
 /// Check if the user-defined metadata contains SSEC encryption headers
@@ -1497,6 +1586,54 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         }
     };
 
+    if dobj.delete_object.delete_marker
+        && let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id
+    {
+        let source_marker_state = storage
+            .get_object_info(
+                &bucket,
+                &dobj.delete_object.object_name,
+                &ObjectOptions {
+                    version_id: Some(delete_marker_version_id.to_string()),
+                    versioned: BucketVersioningSys::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                    version_suspended: BucketVersioningSys::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        match source_marker_state {
+            Ok(info) if info.delete_marker && info.version_id == Some(delete_marker_version_id) => {}
+            Ok(_) => {
+                warn!(
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = %delete_marker_version_id,
+                    "skipping stale delete-marker replication because source version is no longer a delete marker"
+                );
+                return;
+            }
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
+                warn!(
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = %delete_marker_version_id,
+                    "skipping stale delete-marker replication because source version no longer exists"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = %delete_marker_version_id,
+                    error = %err,
+                    "failed to verify source delete-marker state before replication"
+                );
+            }
+        }
+    }
+
     let dsc = match parse_replicate_decision(
         &bucket,
         &dobj
@@ -1529,7 +1666,6 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
             return;
         }
     };
-
     let ns_lock = match storage
         .new_ns_lock(&bucket, format!("/[replicate]/{}", dobj.delete_object.object_name).as_str())
         .await
@@ -1653,7 +1789,36 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         }
     }
 
-    let (replication_status, prev_status) = if dobj.delete_object.version_id.is_none() {
+    let is_version_purge = is_version_delete_replication(&dobj.delete_object);
+
+    if should_retry_delete_marker_purge(&dobj.delete_object) {
+        let bucket_clone = bucket.clone();
+        let dobj_clone = dobj.clone();
+        let dsc_clone = dsc.clone();
+        let storage_clone = storage.clone();
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                if let Some(delete_marker_version_id) = dobj_clone.delete_object.delete_marker_version_id
+                    && source_delete_marker_missing(
+                        &*storage_clone,
+                        &bucket_clone,
+                        &dobj_clone.delete_object.object_name,
+                        match delete_marker_version_id {
+                            S3VersionId::Uuid(u) => u,
+                            S3VersionId::WasabiAscii(_) => Uuid::nil(),
+                        },
+                    )
+                    .await
+                {
+                    replicate_delete_marker_purge_to_targets(&bucket_clone, &dobj_clone, &dsc_clone).await;
+                    break;
+                }
+                tokio::time::sleep(TokioDuration::from_secs(1)).await;
+            }
+        });
+    }
+
+    let (replication_status, prev_status) = if !is_version_purge {
         (
             rinfos.replication_status(),
             dobj.delete_object
@@ -1738,6 +1903,65 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
                 ..Default::default()
             });
         }
+    }
+}
+
+async fn source_delete_marker_missing<S: StorageAPI>(
+    storage: &S,
+    bucket: &str,
+    object_name: &str,
+    delete_marker_version_id: Uuid,
+) -> bool {
+    match storage
+        .get_object_info(
+            bucket,
+            object_name,
+            &ObjectOptions {
+                version_id: Some(delete_marker_version_id.to_string()),
+                versioned: BucketVersioningSys::prefix_enabled(bucket, object_name).await,
+                version_suspended: BucketVersioningSys::prefix_suspended(bucket, object_name).await,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(info) => !info.delete_marker || info.version_id != Some(S3VersionId::Uuid(delete_marker_version_id)),
+        Err(err) => is_err_object_not_found(&err) || is_err_version_not_found(&err),
+    }
+}
+
+async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedObjectReplicationInfo, dsc: &ReplicateDecision) {
+    let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id else {
+        return;
+    };
+
+    for tgt_entry in dsc.targets_map.values() {
+        if !tgt_entry.replicate {
+            continue;
+        }
+        if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
+            continue;
+        }
+        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(bucket, &tgt_entry.arn).await else {
+            continue;
+        };
+
+        let _ = tgt_client
+            .remove_object(
+                &tgt_client.bucket,
+                &dobj.delete_object.object_name,
+                Some(delete_marker_version_id.to_string()),
+                RemoveObjectOptions {
+                    force_delete: false,
+                    governance_bypass: false,
+                    replication_delete_marker: false,
+                    replication_mtime: dobj.delete_object.delete_marker_mtime,
+                    replication_status: ReplicationStatusType::Replica,
+                    replication_request: true,
+                    replication_validity_check: false,
+                },
+            )
+            .await;
     }
 }
 
@@ -1924,6 +2148,18 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
     }
 }
 
+fn is_version_delete_replication(dobj: &DeletedObject) -> bool {
+    dobj.version_id.is_some() || (dobj.delete_marker_version_id.is_some() && !dobj.delete_marker)
+}
+
+fn should_retry_delete_marker_purge(dobj: &DeletedObject) -> bool {
+    dobj.delete_marker_version_id.is_some()
+}
+
+fn is_retryable_delete_replication_head_error(is_not_found: bool, code: Option<&str>) -> bool {
+    !is_not_found && !matches!(code, Some("MethodNotAllowed" | "405"))
+}
+
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         version_id.to_owned()
@@ -1941,7 +2177,8 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     rinfo.endpoint = tgt_client.endpoint.clone();
     rinfo.secure = tgt_client.secure;
 
-    if dobj.delete_object.version_id.is_none()
+    let is_version_purge = is_version_delete_replication(&dobj.delete_object);
+    if !is_version_purge
         && rinfo.prev_replication_status == ReplicationStatusType::Completed
         && dobj.op_type != ReplicationType::ExistingObject
     {
@@ -1949,12 +2186,12 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if dobj.delete_object.version_id.is_some() && rinfo.version_purge_status == VersionPurgeStatusType::Complete {
+    if is_version_purge && rinfo.version_purge_status == VersionPurgeStatusType::Complete {
         return rinfo;
     }
 
     if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
-        if dobj.delete_object.version_id.is_none() {
+        if !is_version_purge {
             rinfo.replication_status = ReplicationStatusType::Failed;
         } else {
             rinfo.version_purge_status = VersionPurgeStatusType::Failed;
@@ -1968,18 +2205,34 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         Some(version_id.to_string())
     };
 
-    if dobj.delete_object.delete_marker_version_id.is_some()
-        && let Err(e) = tgt_client
-            .head_object(&tgt_client.bucket, &dobj.delete_object.object_name, version_id.clone())
-            .await
-        && let SdkError::ServiceError(service_err) = &e
-        && !service_err.err().is_not_found()
-    {
-        rinfo.replication_status = ReplicationStatusType::Failed;
-        rinfo.error = Some(e.to_string());
-
-        return rinfo;
-    };
+    if dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
+        match head_object_with_proxy_stats(
+            &dobj.bucket,
+            tgt_client.as_ref(),
+            &tgt_client.bucket,
+            &dobj.delete_object.object_name,
+            version_id.clone(),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let non_retryable = matches!(
+                    &e,
+                    SdkError::ServiceError(service_err)
+                        if is_retryable_delete_replication_head_error(
+                            service_err.err().is_not_found(),
+                            service_err.err().code(),
+                        )
+                );
+                if non_retryable {
+                    rinfo.replication_status = ReplicationStatusType::Failed;
+                    rinfo.error = Some(e.to_string());
+                    return rinfo;
+                }
+            }
+        }
+    }
 
     match tgt_client
         .remove_object(
@@ -1989,7 +2242,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             RemoveObjectOptions {
                 force_delete: false,
                 governance_bypass: false,
-                replication_delete_marker: dobj.delete_object.delete_marker_version_id.is_some(),
+                replication_delete_marker: dobj.delete_object.delete_marker,
                 replication_mtime: dobj.delete_object.delete_marker_mtime,
                 replication_status: ReplicationStatusType::Replica,
                 replication_request: true,
@@ -1999,15 +2252,32 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         .await
     {
         Ok(_) => {
-            if dobj.delete_object.version_id.is_none() {
+            debug!(
+                bucket = tgt_client.bucket,
+                object = dobj.delete_object.object_name,
+                version_id = ?version_id,
+                delete_marker = dobj.delete_object.delete_marker,
+                is_version_purge,
+                "replicate_delete_to_target succeeded"
+            );
+            if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Completed;
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Complete;
             }
         }
         Err(e) => {
+            warn!(
+                bucket = tgt_client.bucket,
+                object = dobj.delete_object.object_name,
+                version_id = ?version_id,
+                delete_marker = dobj.delete_object.delete_marker,
+                is_version_purge,
+                error = %e,
+                "replicate_delete_to_target failed"
+            );
             rinfo.error = Some(e.to_string());
-            if dobj.delete_object.version_id.is_none() {
+            if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Failed;
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Failed;
@@ -2293,9 +2563,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         }
 
         let mut replication_action = replication_action;
-        match tgt_client
-            .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
-            .await
+        match head_object_with_proxy_stats(
+            &bucket,
+            tgt_client.as_ref(),
+            &tgt_client.bucket,
+            &object,
+            self.version_id.map(|v| v.to_string()),
+        )
+        .await
         {
             Ok(oi) => {
                 replication_action = get_replication_action(&object_info, &oi, self.op_type);
@@ -2308,16 +2583,28 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             }
             Err(e) => {
-                if let Some(se) = e.as_service_error() {
-                    if !se.is_not_found() {
-                        rinfo.error = Some(e.to_string());
-                        warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
-                        return rinfo;
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) {
+                    // Object not on target yet → fall through to PUT.
+                } else if is_version_id_format_mismatch(&e) {
+                    // Version-ID format mismatch: retry without versionId and compare ETags.
+                    match head_object_fallback(&bucket, &tgt_client, &object).await {
+                        Ok(Some(oi)) if content_matches(&object_info, &oi) => {
+                            rinfo.replication_status = ReplicationStatusType::Completed;
+                            rinfo.replication_resynced = true;
+                            rinfo.replication_action = ReplicationAction::None;
+                            rinfo.size = size;
+                            return rinfo;
+                        }
+                        Ok(_) => {}
+                        Err(e2) => {
+                            rinfo.error = Some(e2.to_string());
+                            warn!(
+                                "replication head_object fallback failed bucket:{} arn:{} error:{}",
+                                bucket, tgt_client.arn, e2
+                            );
+                            return rinfo;
+                        }
                     }
-                } else if e.raw_response().is_some_and(|resp| resp.status().as_u16() == 404) {
-                    // Some HEAD Object 404 responses are surfaced by the AWS SDK as `response error`
-                    // instead of `service error (NotFound)`. Treat raw HTTP 404 as object-not-found
-                    // so replication can proceed with PUT.
                 } else {
                     rinfo.error = Some(e.to_string());
                     warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
@@ -2350,9 +2637,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
+        let has_tagging_replication = !put_opts.user_tags.is_empty();
         if let Some(err) = if is_multipart {
             drop(gr);
-            replicate_object_with_multipart(MultipartReplicationContext {
+            let result = replicate_object_with_multipart(MultipartReplicationContext {
                 storage: storage.clone(),
                 cli: tgt_client.clone(),
                 src_bucket: &bucket,
@@ -2363,16 +2651,24 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 arn: &rinfo.arn,
                 put_opts,
             })
-            .await
-            .err()
+            .await;
+            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
+            result.err()
         } else {
             gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
             let byte_stream = async_read_to_bytestream(gr.stream);
-            tgt_client
+            let result = tgt_client
                 .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                 .await
-                .map_err(|e| std::io::Error::other(e.to_string()))
-                .err()
+                .map_err(|e| std::io::Error::other(e.to_string()));
+            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
+            result.err()
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(err.to_string());
@@ -2513,9 +2809,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             warn!("failed to set replication tagging directive header: {err}");
         }
 
-        match tgt_client
-            .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
-            .await
+        match head_object_with_proxy_stats(
+            &bucket,
+            tgt_client.as_ref(),
+            &tgt_client.bucket,
+            &object,
+            self.version_id.map(|v| v.to_string()),
+        )
+        .await
         {
             Ok(oi) => {
                 replication_action = get_replication_action(&object_info, &oi, self.op_type);
@@ -2566,25 +2867,39 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             }
             Err(e) => {
-                if let Some(se) = e.as_service_error() {
-                    if se.is_not_found() {
-                        replication_action = ReplicationAction::All;
-                    } else {
-                        rinfo.error = Some(e.to_string());
-                        warn!("failed to head object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
-
-                        send_event(EventArgs {
-                            event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                            bucket_name: bucket.clone(),
-                            object: object_info,
-                            host: GLOBAL_LocalNodeName.to_string(),
-                            user_agent: "Internal: [Replication]".to_string(),
-                            ..Default::default()
-                        });
-
-                        rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
-                        return rinfo;
+                if is_version_id_format_mismatch(&e) {
+                    // Version-ID format mismatch: retry without versionId and compare ETags.
+                    match head_object_fallback(&bucket, &tgt_client, &object).await {
+                        Ok(Some(oi)) => {
+                            replication_action = if content_matches(&object_info, &oi) {
+                                ReplicationAction::None
+                            } else {
+                                ReplicationAction::All
+                            };
+                        }
+                        Ok(None) => {
+                            replication_action = ReplicationAction::All;
+                        }
+                        Err(e2) => {
+                            rinfo.error = Some(e2.to_string());
+                            warn!(
+                                "replication head_object fallback failed bucket:{} arn:{} error:{}",
+                                bucket, tgt_client.arn, e2
+                            );
+                            send_event(EventArgs {
+                                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                                bucket_name: bucket.clone(),
+                                object: object_info,
+                                host: GLOBAL_LocalNodeName.to_string(),
+                                user_agent: "Internal: [Replication]".to_string(),
+                                ..Default::default()
+                            });
+                            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                            return rinfo;
+                        }
                     }
+                } else if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    replication_action = ReplicationAction::All;
                 } else {
                     rinfo.error = Some(e.to_string());
                     warn!("failed to head object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
@@ -2633,9 +2948,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             };
 
+            let has_tagging_replication = !put_opts.user_tags.is_empty();
             if let Some(err) = if is_multipart {
                 drop(gr);
-                replicate_object_with_multipart(MultipartReplicationContext {
+                let result = replicate_object_with_multipart(MultipartReplicationContext {
                     storage: storage.clone(),
                     cli: tgt_client.clone(),
                     src_bucket: &bucket,
@@ -2646,16 +2962,24 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     arn: &rinfo.arn,
                     put_opts,
                 })
-                .await
-                .err()
+                .await;
+                record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+                if has_tagging_replication {
+                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+                }
+                result.err()
             } else {
                 gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
                 let byte_stream = async_read_to_bytestream(gr.stream);
-                tgt_client
+                let result = tgt_client
                     .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                     .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-                    .err()
+                    .map_err(|e| std::io::Error::other(e.to_string()));
+                record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+                if has_tagging_replication {
+                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+                }
+                result.err()
             } {
                 rinfo.replication_status = ReplicationStatusType::Failed;
                 rinfo.error = Some(err.to_string());
@@ -3449,6 +3773,264 @@ mod tests {
         assert!(
             heal_should_use_check_replicate_delete(&oi),
             "Delete marker always uses check_replicate_delete path"
+        );
+    }
+
+    #[test]
+    fn test_delete_replication_object_opts_marks_replica_deletes() {
+        let dobj = ObjectToDelete {
+            object_name: "obj".to_string(),
+            version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
+            ..Default::default()
+        };
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+
+        let opts = delete_replication_object_opts(&dobj, &oi);
+
+        assert!(
+            opts.replica,
+            "replica deletes must preserve replica status for downstream ReplicaModifications rules"
+        );
+        assert_eq!(opts.version_id, dobj.version_id);
+        assert_eq!(opts.name, dobj.object_name);
+        assert_eq!(opts.op_type, ReplicationType::Delete);
+    }
+
+    #[test]
+    fn test_delete_replication_object_opts_keeps_non_replica_deletes_local() {
+        let dobj = ObjectToDelete {
+            object_name: "obj".to_string(),
+            ..Default::default()
+        };
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+
+        let opts = delete_replication_object_opts(&dobj, &oi);
+
+        assert!(!opts.replica, "source-originated deletes should not be treated as replica modifications");
+    }
+
+    #[test]
+    fn test_is_version_delete_replication_for_delete_marker_version_purge() {
+        let dobj = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
+            ..Default::default()
+        };
+
+        assert!(
+            is_version_delete_replication(&dobj),
+            "delete-marker version purges must be tracked as version purge replication, not delete-marker creation replication"
+        );
+    }
+
+    #[test]
+    fn test_is_version_delete_replication_for_delete_marker_creation() {
+        let dobj = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
+            ..Default::default()
+        };
+
+        assert!(
+            !is_version_delete_replication(&dobj),
+            "delete-marker creation should remain on the delete-marker replication path"
+        );
+    }
+
+    #[test]
+    fn test_should_retry_delete_marker_purge_for_version_purge() {
+        let dobj = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
+            ..Default::default()
+        };
+
+        assert!(
+            should_retry_delete_marker_purge(&dobj),
+            "delete-marker version purge should schedule delayed target cleanup in case the target marker arrives late"
+        );
+    }
+
+    #[test]
+    fn test_should_retry_delete_marker_purge_for_delete_marker_creation() {
+        let dobj = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
+            ..Default::default()
+        };
+
+        assert!(
+            should_retry_delete_marker_purge(&dobj),
+            "delete-marker creation should keep the late-arrival cleanup path so downstream purges can catch up"
+        );
+    }
+
+    #[test]
+    fn test_is_retryable_delete_replication_head_error_allows_delete_marker_head_responses() {
+        assert!(
+            !is_retryable_delete_replication_head_error(false, Some("405")),
+            "numeric 405 responses should not block delete-marker purge replication"
+        );
+        assert!(
+            !is_retryable_delete_replication_head_error(false, Some("MethodNotAllowed")),
+            "MethodNotAllowed responses should not block delete-marker purge replication"
+        );
+        assert!(
+            !is_retryable_delete_replication_head_error(true, Some("NoSuchKey")),
+            "not-found responses should not block delete-marker purge replication"
+        );
+        assert!(
+            is_retryable_delete_replication_head_error(false, Some("AccessDenied")),
+            "unexpected head errors should still fail fast"
+        );
+    }
+
+    #[test]
+    fn test_should_count_head_proxy_failure_ignores_not_found_and_405() {
+        assert!(
+            !should_count_head_proxy_failure(true, Some("NoSuchKey"), Some(404)),
+            "not-found heads are expected when the object has not reached the target yet"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, Some("MethodNotAllowed"), Some(405)),
+            "405 delete-marker probing responses should not be counted as proxy failures"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, Some("405"), Some(405)),
+            "numeric 405 codes must align with MethodNotAllowed semantics"
+        );
+    }
+
+    #[test]
+    fn test_should_count_head_proxy_failure_ignores_version_id_format_rejections() {
+        assert!(
+            !should_count_head_proxy_failure(false, Some("InvalidArgument"), Some(400)),
+            "InvalidArgument/400 is a version-ID format rejection and must not be counted as a proxy failure"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, None, Some(400)),
+            "raw HTTP 400 without error code must not be counted as a proxy failure"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, None, Some(403)),
+            "raw HTTP 403 without error code must not be counted as a proxy failure (IAM user + invalid versionId)"
+        );
+    }
+
+    #[test]
+    fn test_is_version_id_mismatch_detects_invalid_argument() {
+        assert!(
+            is_version_id_mismatch(Some("InvalidArgument"), Some(400)),
+            "AWS S3 returns InvalidArgument/400 when a UUID versionId is passed to HeadObject"
+        );
+        assert!(
+            !is_version_id_mismatch(Some("AccessDenied"), Some(403)),
+            "AccessDenied must not trigger the version-ID fallback path"
+        );
+        assert!(
+            !is_version_id_mismatch(Some("NoSuchKey"), Some(404)),
+            "NoSuchKey is an object-not-found response, not a version-ID mismatch"
+        );
+    }
+
+    #[test]
+    fn test_is_version_id_mismatch_raw_status_without_service_code() {
+        assert!(
+            is_version_id_mismatch(None, Some(400)),
+            "no error code + HTTP 400 is treated as version-ID mismatch (HEAD response)"
+        );
+        assert!(
+            is_version_id_mismatch(Some(""), Some(400)),
+            "empty error code + HTTP 400 is treated as version-ID mismatch"
+        );
+        assert!(
+            is_version_id_mismatch(None, Some(403)),
+            "no error code + HTTP 403 is treated as version-ID mismatch (IAM user + invalid versionId)"
+        );
+        assert!(
+            is_version_id_mismatch(Some(""), Some(403)),
+            "empty error code + HTTP 403 is treated as version-ID mismatch"
+        );
+        assert!(
+            !is_version_id_mismatch(None, Some(500)),
+            "raw 5xx must not trigger the version-ID fallback path"
+        );
+        assert!(
+            !is_version_id_mismatch(None, Some(404)),
+            "raw 404 must not trigger the version-ID fallback path"
+        );
+    }
+
+    #[test]
+    fn test_is_version_id_mismatch_400_with_other_service_code() {
+        assert!(
+            !is_version_id_mismatch(Some("MalformedXML"), Some(400)),
+            "MalformedXML/400 is a real request error and must not trigger version-ID fallback"
+        );
+        assert!(
+            !is_version_id_mismatch(Some("EntityTooLarge"), Some(400)),
+            "EntityTooLarge/400 is a real request error and must not trigger version-ID fallback"
+        );
+    }
+
+    #[test]
+    fn test_content_matches_compares_etag_only() {
+        let src = ObjectInfo {
+            etag: Some("\"abc123\"".to_string()),
+            ..Default::default()
+        };
+
+        let tgt_match = HeadObjectOutput::builder().e_tag("\"abc123\"").build();
+        assert!(content_matches(&src, &tgt_match), "identical ETags must match");
+
+        let tgt_unquoted_match = HeadObjectOutput::builder().e_tag("abc123").build();
+        assert!(
+            content_matches(&src, &tgt_unquoted_match),
+            "quoted and unquoted ETags with identical values must match"
+        );
+
+        // version_id on the target is intentionally ignored
+        let tgt_different_version = HeadObjectOutput::builder()
+            .e_tag("\"abc123\"")
+            .version_id("aws-alphanumeric-id")
+            .build();
+        assert!(
+            content_matches(&src, &tgt_different_version),
+            "matching ETags with different version IDs must still match"
+        );
+
+        let tgt_different_content = HeadObjectOutput::builder().e_tag("\"def456\"").build();
+        assert!(!content_matches(&src, &tgt_different_content), "different ETags must not match");
+
+        let src_no_etag = ObjectInfo {
+            etag: None,
+            ..Default::default()
+        };
+        assert!(!content_matches(&src_no_etag, &tgt_match), "missing source ETag must not match");
+
+        let tgt_no_etag = HeadObjectOutput::builder().build();
+        assert!(!content_matches(&src, &tgt_no_etag), "missing target ETag must not match");
+    }
+
+    #[test]
+    fn test_should_count_head_proxy_failure_counts_unexpected_errors() {
+        assert!(
+            should_count_head_proxy_failure(false, Some("AccessDenied"), Some(403)),
+            "non-NotFound and non-405 service errors should be counted as failures"
+        );
+        assert!(
+            should_count_head_proxy_failure(false, None, Some(500)),
+            "raw 5xx head responses should be counted as proxy failures"
         );
     }
 

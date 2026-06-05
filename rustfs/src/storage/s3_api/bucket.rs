@@ -23,6 +23,12 @@ use s3s::{S3Error, S3ErrorCode};
 use tracing::debug;
 use urlencoding::encode;
 
+const S3_MAX_KEYS: i32 = 1000;
+
+fn normalize_max_keys(max_keys: i32) -> i32 {
+    max_keys.min(S3_MAX_KEYS)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ListObjectVersionsParams {
     pub prefix: String,
@@ -68,7 +74,7 @@ pub(crate) fn build_list_buckets_output(bucket_infos: &[BucketInfo]) -> ListBuck
     let buckets: Vec<Bucket> = bucket_infos
         .iter()
         .map(|bucket_info| Bucket {
-            creation_date: bucket_info.created.map(Timestamp::from),
+            creation_date: Some(Timestamp::from(bucket_info.created.unwrap_or(time::OffsetDateTime::UNIX_EPOCH))),
             name: Some(bucket_info.name.clone()),
             ..Default::default()
         })
@@ -92,10 +98,11 @@ pub(crate) fn parse_list_object_versions_params(
     let delimiter = delimiter.filter(|v| !v.is_empty());
     let key_marker = key_marker.filter(|v| !v.is_empty());
     let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
-    let max_keys = max_keys.unwrap_or(1000);
+    let max_keys = max_keys.unwrap_or(S3_MAX_KEYS);
     if max_keys < 0 {
         return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
     }
+    let max_keys = normalize_max_keys(max_keys);
 
     Ok(ListObjectVersionsParams {
         prefix,
@@ -120,10 +127,11 @@ pub(crate) fn parse_list_objects_v2_params(
         debug!("LIST objects with special characters in prefix: {:?}", prefix);
     }
 
-    let max_keys = max_keys.unwrap_or(1000);
+    let max_keys = max_keys.unwrap_or(S3_MAX_KEYS);
     if max_keys < 0 {
         return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
     }
+    let max_keys = normalize_max_keys(max_keys);
 
     let delimiter = delimiter.filter(|v| !v.is_empty());
 
@@ -381,7 +389,7 @@ mod tests {
         assert_eq!(buckets[0].name.as_deref(), Some("bucket-a"));
         assert_eq!(buckets[0].creation_date, Some(s3s::dto::Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
         assert_eq!(buckets[1].name.as_deref(), Some("bucket-b"));
-        assert_eq!(buckets[1].creation_date, None);
+        assert_eq!(buckets[1].creation_date, Some(s3s::dto::Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
 
         let expected_owner = rustfs_owner();
         assert_eq!(owner.display_name, expected_owner.display_name);
@@ -552,6 +560,20 @@ mod tests {
         assert_eq!(parsed.start_after_for_query, None);
         assert_eq!(parsed.response_continuation_token, Some(String::new()));
         assert_eq!(parsed.decoded_continuation_token, None);
+    }
+
+    #[test]
+    fn test_parse_list_objects_v2_params_caps_large_max_keys() {
+        let parsed = parse_list_objects_v2_params(None, None, Some(1001), None, None).expect("parse should succeed");
+
+        assert_eq!(parsed.max_keys, 1000);
+    }
+
+    #[test]
+    fn test_parse_list_object_versions_params_caps_large_max_keys() {
+        let parsed = parse_list_object_versions_params(None, None, None, None, Some(1001)).expect("parse should succeed");
+
+        assert_eq!(parsed.max_keys, 1000);
     }
 
     #[test]

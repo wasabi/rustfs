@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM alpine:3.23 AS build
+FROM alpine:3.23.4 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -29,8 +29,20 @@ RUN set -eux; \
     if [ "$RELEASE" = "latest" ]; then \
       TAG="$(curl -fsSL https://api.github.com/repos/rustfs/rustfs/releases \
               | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4 | head -n 1)"; \
+      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG")"; \
     else \
       TAG="$RELEASE"; \
+      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" 2>/dev/null || true)"; \
+      if [ -z "$RELEASE_JSON" ]; then \
+        if [ "${TAG#v}" = "$TAG" ]; then \
+          ALT_TAG="v$TAG"; \
+        else \
+          ALT_TAG="${TAG#v}"; \
+        fi; \
+        echo "Primary tag lookup failed, retrying with alternate tag: $ALT_TAG"; \
+        RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$ALT_TAG")"; \
+        TAG="$ALT_TAG"; \
+      fi; \
     fi; \
     echo "Using tag: $TAG (arch pattern: $ARCH_SUBSTR)"; \
     # Find download URL in assets list for this tag that contains arch substring and ends with .zip
@@ -54,7 +66,7 @@ RUN set -eux; \
     rm -rf rustfs.zip /build/.tmp || true
 
 
-FROM alpine:3.23
+FROM alpine:3.23.4
 
 ARG RELEASE=latest
 ARG BUILD_DATE
@@ -73,7 +85,7 @@ LABEL name="RustFS" \
       license="Apache-2.0"
 
 RUN apk update && \
-    apk add --no-cache ca-certificates coreutils curl "zlib>=1.3.2-r0"
+    apk add --no-cache ca-certificates coreutils curl
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
@@ -87,8 +99,7 @@ RUN addgroup -g 10001 -S rustfs && \
     chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 
-ENV RUSTFS_CORS_ALLOWED_ORIGINS="*" \
-    RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
+ENV RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_VOLUMES="/data" \
     RUSTFS_OBS_LOGGER_LEVEL=warn \
     RUSTFS_OBS_LOG_DIRECTORY=/logs \
