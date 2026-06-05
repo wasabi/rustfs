@@ -35,16 +35,33 @@ log "Starting load generator (duration=${DURATION} test_id=${TEST_ID})..."
 log "Config: ${LOADGEN_CFG}  Endpoint: ${LOADGEN_ENDPOINT:-<from cfg>}"
 
 # ---------------------------------------------------------------------------
+# Workload parameters — override via env vars; defaults give the standard
+# PUT-only baseline identical to all prior A/B runs.
+#
+#   LG_PUT_PCT      PUT percentage  (default: 100)
+#   LG_GET_PCT      GET percentage  (default: 0)
+#   LG_DEL_PCT      DELETE percentage (default: 0)
+#   LG_LIST_PCT     LIST percentage (default: 0)
+#   LG_HEAD_PCT     HEAD percentage (default: 0)
+#   LG_OBJ_SIZE     object size range passed to -z (default: 0-1500K)
+#   LG_THREADS      worker thread count passed to -t (default: 100)
+#   LG_PUTS_PRELOAD integer: pre-populate N objects before the timed phase;
+#                   passed to -puts only when > 0; useful for GET/DELETE runs
+#                   where the pool must exist before the op starts
+# ---------------------------------------------------------------------------
+
+LG_PUT_PCT="${LG_PUT_PCT:-100}"
+LG_GET_PCT="${LG_GET_PCT:-0}"
+LG_DEL_PCT="${LG_DEL_PCT:-0}"
+LG_LIST_PCT="${LG_LIST_PCT:-0}"
+LG_HEAD_PCT="${LG_HEAD_PCT:-0}"
+LG_OBJ_SIZE="${LG_OBJ_SIZE:-0-1500K}"
+LG_THREADS="${LG_THREADS:-100}"
+LG_PUTS_PRELOAD="${LG_PUTS_PRELOAD:-0}"
+
+# ---------------------------------------------------------------------------
 # Build the loadgen command
 # ---------------------------------------------------------------------------
-# Standard two-node EC:1 workload (matches the lab baseline parameters):
-#   - Mixed object sizes 0–1500 KB
-#   - 20 buckets, 100 concurrent threads
-#   - 100% PUT, all other op types forced to 0
-#   - AWS-chunked encoding disabled (0%)
-#   - PUT disconnect test disabled (0s)
-#   - No request timeout cap (0 = none)
-#   - deleteOnlyOurBuckets: limits end-of-run S3 DELETE to this run's buckets
 
 # Line-buffer through the pipe to tee. stdout to a pipe is often fully buffered;
 # without stdbuf, summary lines can hit loadgen.txt before prior interval rows,
@@ -66,14 +83,14 @@ LOADGEN_CMD=(
     "${STDBUF[@]}"
     "$LOADGEN_BIN"
     -c       "$LOADGEN_CFG"
-    -z       "0-1500K"
+    -z       "$LG_OBJ_SIZE"
     -b       20
-    -t       100
-    -put     100
-    -get     0
-    -del     0
-    -list    0
-    -head    0
+    -t       "$LG_THREADS"
+    -put     "$LG_PUT_PCT"
+    -get     "$LG_GET_PCT"
+    -del     "$LG_DEL_PCT"
+    -list    "$LG_LIST_PCT"
+    -head    "$LG_HEAD_PCT"
     -post    0
     -awschunked  0
     -disconnect  0
@@ -84,6 +101,10 @@ LOADGEN_CMD=(
     -v4
     -deleteOnlyOurBuckets
 )
+
+if (( LG_PUTS_PRELOAD > 0 )); then
+    LOADGEN_CMD+=( -puts "$LG_PUTS_PRELOAD" )
+fi
 
 # Server endpoint comes from the Server field in LOADGEN_CFG (local.cfg).
 # The binary does not accept a command-line server override flag.
