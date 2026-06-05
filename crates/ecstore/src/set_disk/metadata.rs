@@ -15,6 +15,28 @@
 use super::*;
 
 impl SetDisks {
+    pub(super) fn all_not_found_metadata(errs: &[Option<DiskError>]) -> bool {
+        !errs.is_empty()
+            && errs.iter().all(|err| match err {
+                Some(err) => {
+                    matches!(
+                        err,
+                        DiskError::FileNotFound
+                            | DiskError::FileVersionNotFound
+                            | DiskError::VolumeNotFound
+                            | DiskError::DiskNotFound
+                    ) || OBJECT_OP_IGNORED_ERRS.contains(err)
+                }
+                None => false,
+            })
+            && errs.iter().any(|err| {
+                matches!(
+                    err,
+                    Some(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
+                )
+            })
+    }
+
     pub(super) fn reduce_common_data_dir(data_dirs: &Vec<Option<Uuid>>, write_quorum: usize) -> Option<Uuid> {
         let mut data_dirs_count = HashMap::new();
 
@@ -38,14 +60,17 @@ impl SetDisks {
         let upload_uuid = base64_simd::URL_SAFE_NO_PAD
             .decode_to_vec(upload_id.as_bytes())
             .and_then(|v| {
-                String::from_utf8(v).map_or(Ok(upload_id.to_owned()), |v| {
-                    let parts: Vec<_> = v.splitn(2, '.').collect();
-                    if parts.len() == 2 {
-                        Ok(parts[1].to_string())
-                    } else {
-                        Ok(upload_id.to_string())
-                    }
-                })
+                String::from_utf8(v).map_or_else(
+                    |_| Ok(upload_id.to_owned()),
+                    |v| {
+                        let parts: Vec<_> = v.splitn(2, '.').collect();
+                        if parts.len() == 2 {
+                            Ok(parts[1].to_string())
+                        } else {
+                            Ok(upload_id.to_string())
+                        }
+                    },
+                )
             })
             .unwrap_or_default();
 
@@ -234,6 +259,10 @@ impl SetDisks {
         errs: &[Option<DiskError>],
         default_parity_count: usize,
     ) -> disk::error::Result<(i32, i32)> {
+        if Self::all_not_found_metadata(errs) {
+            return Err(DiskError::FileNotFound);
+        }
+
         let expected_rquorum = if default_parity_count == 0 {
             parts_metadata.len()
         } else {

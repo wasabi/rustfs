@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
@@ -19,8 +20,10 @@ use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::{WASABI_SET_VERSION_ID_HEADER, ensure_wasabi_set_version_id_header_allowed, wasabi_version_ids_enabled};
 use rustfs_filemeta::S3VersionId;
-use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
-use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
+use rustfs_utils::http::{
+    AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+    AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+};
 use rustfs_utils::http::{
     SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_DELETEMARKER,
     SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header, insert_header_map,
@@ -37,7 +40,7 @@ use rustfs_policy::service_type::ServiceType;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
 use rustfs_utils::path::is_dir_object;
-use s3s::{S3Result, s3_error};
+use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::error;
@@ -183,29 +186,39 @@ pub async fn get_opts(
 }
 
 fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) -> std::io::Result<()> {
-    if headers.contains_key("If-None-Match") || headers.contains_key("If-Match") {
-        let mut preconditions = HTTPPreconditions::default();
-        if let Some(if_none_match) = headers.get("If-None-Match") {
-            preconditions.if_none_match = Some(
-                if_none_match
-                    .to_str()
-                    .map_err(|_| std::io::Error::other("Invalid If-None-Match header"))?
-                    .to_string(),
-            );
-        }
-        if let Some(if_match) = headers.get("If-Match") {
-            preconditions.if_match = Some(
-                if_match
-                    .to_str()
-                    .map_err(|_| std::io::Error::other("Invalid If-Match header"))?
-                    .to_string(),
-            );
-        }
+    let if_none_match = conditional_etag_header(headers, IF_NONE_MATCH, "If-None-Match")?;
+    let if_match = conditional_etag_header(headers, IF_MATCH, "If-Match")?;
 
-        opts.http_preconditions = Some(preconditions);
+    if if_none_match.is_some() || if_match.is_some() {
+        opts.http_preconditions = Some(HTTPPreconditions {
+            if_match,
+            if_none_match,
+            ..Default::default()
+        });
     }
 
     Ok(())
+}
+
+fn conditional_etag_header(
+    headers: &HeaderMap<HeaderValue>,
+    name: http::header::HeaderName,
+    display_name: &str,
+) -> std::io::Result<Option<String>> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+
+    let value = value
+        .to_str()
+        .map_err(|_| std::io::Error::other(format!("Invalid {display_name} header")))?
+        .trim();
+
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_owned()))
+    }
 }
 
 /// Creates options for putting an object in a bucket.
@@ -464,6 +477,77 @@ pub(crate) fn normalize_content_encoding_for_storage(value: &str) -> Option<Stri
     if normalized.is_empty() { None } else { Some(normalized) }
 }
 
+const ENV_REJECT_ARCHIVE_CONTENT_ENCODING: &str = "RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING";
+
+const ARCHIVE_CONTENT_ENCODING_BLOCKED_SUFFIXES: &[&str] = &[
+    ".zip",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz",
+    ".tbz2",
+    ".tar.xz",
+    ".txz",
+    ".tar.zst",
+    ".tar.zstd",
+    ".tzst",
+];
+
+const ARCHIVE_CONTENT_ENCODING_BLOCKED_CONTENT_TYPES: &[&str] =
+    &["application/zip", "application/x-zip-compressed", "application/x-tar"];
+
+fn is_archive_object_name_for_content_encoding(object_name: &str) -> bool {
+    let object_name = object_name.to_ascii_lowercase();
+    ARCHIVE_CONTENT_ENCODING_BLOCKED_SUFFIXES
+        .iter()
+        .any(|suffix| object_name.ends_with(suffix))
+}
+
+fn is_archive_content_type_for_content_encoding(content_type: &str) -> bool {
+    let main_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+
+    ARCHIVE_CONTENT_ENCODING_BLOCKED_CONTENT_TYPES
+        .iter()
+        .any(|candidate| main_type == *candidate)
+}
+
+pub(crate) fn validate_archive_content_encoding(
+    object_name: &str,
+    content_type: Option<&str>,
+    content_encoding: Option<&str>,
+) -> S3Result<()> {
+    if !archive_content_encoding_strict_mode() {
+        return Ok(());
+    }
+
+    let Some(content_encoding) = content_encoding.and_then(normalize_content_encoding_for_storage) else {
+        return Ok(());
+    };
+
+    let is_archive_like = is_archive_object_name_for_content_encoding(object_name)
+        || content_type.is_some_and(is_archive_content_type_for_content_encoding);
+    if !is_archive_like {
+        return Ok(());
+    }
+
+    Err(S3Error::with_message(
+        S3ErrorCode::InvalidArgument,
+        format!(
+            "Content-Encoding '{content_encoding}' is not allowed for archive objects when {ENV_REJECT_ARCHIVE_CONTENT_ENCODING}=true; unset {ENV_REJECT_ARCHIVE_CONTENT_ENCODING} or set it to false to restore compatibility-first behavior"
+        ),
+    ))
+}
+
+fn archive_content_encoding_strict_mode() -> bool {
+    rustfs_utils::get_env_bool(ENV_REJECT_ARCHIVE_CONTENT_ENCODING, false)
+}
+
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
 pub fn extract_metadata_from_mime_with_object_name(
     headers: &HeaderMap<HeaderValue>,
@@ -619,9 +703,9 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "expires",
         "x-amz-replication-status",
         // Object Lock headers - required for S3 Object Lock functionality
-        "x-amz-object-lock-mode",
-        "x-amz-object-lock-retain-until-date",
-        "x-amz-object-lock-legal-hold",
+        AMZ_OBJECT_LOCK_MODE_LOWER,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
     ]
 });
 
@@ -807,6 +891,8 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
 
 #[cfg(test)]
 mod tests {
+    use temp_env;
+
     use super::*;
     use http::{HeaderMap, HeaderValue};
     use std::collections::HashMap;
@@ -973,6 +1059,32 @@ mod tests {
         let result = get_opts("test-bucket", "test-object", Some("   \t".to_string()), None, &headers).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().version_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_opts_ignores_empty_conditional_headers() {
+        let mut headers = create_test_headers();
+        headers.insert(http::header::IF_MATCH, HeaderValue::from_static(""));
+        headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static(" "));
+
+        let result = get_opts("test-bucket", "test-object", None, None, &headers).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().http_preconditions.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_opts_keeps_non_empty_conditional_headers() {
+        let mut headers = create_test_headers();
+        headers.insert(http::header::IF_MATCH, HeaderValue::from_static(" \"etag-a\" "));
+        headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"etag-b\""));
+
+        let result = get_opts("test-bucket", "test-object", None, None, &headers).await;
+
+        assert!(result.is_ok());
+        let preconditions = result.unwrap().http_preconditions.expect("conditional headers");
+        assert_eq!(preconditions.if_match.as_deref(), Some("\"etag-a\""));
+        assert_eq!(preconditions.if_none_match.as_deref(), Some("\"etag-b\""));
     }
 
     #[tokio::test]
@@ -1398,9 +1510,9 @@ mod tests {
             "x-amz-tagging",
             "expires",
             "x-amz-replication-status",
-            "x-amz-object-lock-mode",
-            "x-amz-object-lock-retain-until-date",
-            "x-amz-object-lock-legal-hold",
+            AMZ_OBJECT_LOCK_MODE_LOWER,
+            AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+            AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
         ];
 
         assert_eq!(*SUPPORTED_HEADERS, expected_headers);
@@ -1539,6 +1651,70 @@ mod tests {
 
         // Test files without extension
         assert_eq!(detect_content_type_from_object_name("noextension"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_archive_suffix_by_default() {
+        validate_archive_content_encoding("bundle.tar.gz", Some("application/gzip"), Some("gzip")).expect("default allow");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_archive_mime_by_default() {
+        validate_archive_content_encoding("bundle", Some("application/zip"), Some("gzip")).expect("default allow");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_non_archive_precompressed_object() {
+        validate_archive_content_encoding("logs/app.log.zst", Some("text/plain"), Some("zstd")).expect("non-archive");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_archive_sigv4_streaming_encoding_by_default() {
+        validate_archive_content_encoding("bundle.tar.gz", Some("application/gzip"), Some("aws-chunked"))
+            .expect("aws-chunked is request-side only");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_archive_sigv4_streaming_encoding_case_insensitive() {
+        validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("AWS-CHUNKED"))
+            .expect("aws-chunked stripping should be case-insensitive");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_effective_archive_encoding_after_aws_chunked_stripped_by_default() {
+        validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("aws-chunked, gzip"))
+            .expect("default allow after stripping aws-chunked");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_rejects_archive_suffix_in_strict_mode() {
+        temp_env::with_var(ENV_REJECT_ARCHIVE_CONTENT_ENCODING, Some("true"), || {
+            let err = validate_archive_content_encoding("bundle.tar.gz", Some("application/gzip"), Some("gzip")).unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        });
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_rejects_archive_mime_in_strict_mode() {
+        temp_env::with_var(ENV_REJECT_ARCHIVE_CONTENT_ENCODING, Some("true"), || {
+            let err = validate_archive_content_encoding("bundle", Some("application/zip"), Some("gzip")).unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        });
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_rejects_effective_archive_encoding_after_aws_chunked_stripped_in_strict_mode() {
+        temp_env::with_var(ENV_REJECT_ARCHIVE_CONTENT_ENCODING, Some("true"), || {
+            let err =
+                validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("aws-chunked, gzip")).unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                Some(
+                    "Content-Encoding 'gzip' is not allowed for archive objects when RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING=true; unset RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING or set it to false to restore compatibility-first behavior"
+                )
+            );
+        });
     }
 
     #[test]

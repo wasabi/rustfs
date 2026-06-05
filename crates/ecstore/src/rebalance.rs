@@ -31,7 +31,6 @@ use http::HeaderMap;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 use std::fmt;
 use std::future::Future;
 use std::io::Cursor;
@@ -781,6 +780,7 @@ impl ECStore {
 
         let cancel_tx = CancellationToken::new();
         let rx = cancel_tx.clone();
+        let mut meta_to_save = None;
 
         {
             let mut rebalance_meta = self.rebalance_meta.write().await;
@@ -793,9 +793,17 @@ impl ECStore {
                 info!("start_rebalance: already in progress, skip duplicate start");
                 return Ok(());
             }
+            if complete_rebalance_pools_at_goal(meta, OffsetDateTime::now_utc()) {
+                meta_to_save = Some(meta.clone());
+            }
             meta.cancel = Some(cancel_tx);
 
             drop(rebalance_meta);
+        }
+
+        if let Some(meta) = meta_to_save {
+            let pool = clone_first_arc(self.pools.as_slice(), "start_rebalance: no pools available")?;
+            resolve_rebalance_meta_save_result(meta.save(pool).await, "start_rebalance complete pools at goal")?;
         }
 
         let participants = if let Some(ref meta) = *self.rebalance_meta.read().await {
@@ -1127,6 +1135,30 @@ fn should_pool_participate(init_free_space: u64, init_capacity: u64, percent_fre
     init_capacity > 0 && percent_free_ratio(init_free_space, init_capacity) < percent_free_goal
 }
 
+fn complete_rebalance_pools_at_goal(meta: &mut RebalanceMeta, now: OffsetDateTime) -> bool {
+    let mut changed = false;
+
+    for pool_stat in meta.pool_stats.iter_mut() {
+        if !is_rebalance_pool_started(pool_stat) {
+            continue;
+        }
+
+        if rebalance_goal_reached(
+            pool_stat.init_free_space,
+            pool_stat.init_capacity,
+            pool_stat.bytes,
+            meta.percent_free_goal,
+        ) {
+            pool_stat.info.status = RebalStatus::Completed;
+            pool_stat.info.end_time = Some(now);
+            pool_stat.info.last_error = None;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 fn resolve_rebalance_worker_result(
     set_idx: usize,
     worker_result: std::result::Result<Result<()>, tokio::task::JoinError>,
@@ -1135,6 +1167,37 @@ fn resolve_rebalance_worker_result(
         Ok(result) => result,
         Err(err) => Err(Error::other(format!("rebalance worker {set_idx} task join error: {err}"))),
     }
+}
+
+type RebalanceEntryTask = tokio::task::JoinHandle<Result<()>>;
+
+async fn wait_rebalance_entry_tasks(set_idx: usize, tasks: Arc<tokio::sync::Mutex<Vec<RebalanceEntryTask>>>) -> Result<()> {
+    let tasks = {
+        let mut tasks = tasks.lock().await;
+        std::mem::take(&mut *tasks)
+    };
+
+    let mut first_error = None;
+    for task in tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                error!("rebalance entry task failed for set {}: {}", set_idx, err);
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+            Err(err) => {
+                let err = Error::other(format!("rebalance entry task join error for set {set_idx}: {err}"));
+                error!("{}", err);
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_error { Err(err) } else { Ok(()) }
 }
 
 fn resolve_rebalance_save_task_result(
@@ -1531,7 +1594,8 @@ impl ECStore {
         let mut fivs =
             resolve_rebalance_file_info_versions_result(entry.file_info_versions(&bucket), bucket.as_str(), entry.name.as_str())?;
 
-        fivs.versions.sort_by_key(|b| Reverse(b.mod_time));
+        fivs.versions
+            .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
 
         let mut rebalanced: usize = 0;
         let mut expired: usize = 0;
@@ -1658,26 +1722,28 @@ impl ECStore {
 
         let mut jobs = Vec::new();
         let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
+        let entry_workers = Arc::new(tokio::sync::Semaphore::new(pool.disk_set.len().max(1)));
 
-        // let wk = Workers::new(pool.disk_set.len() * 2).map_err(Error::other)?;
-        // wk.clone().take().await;
         for (set_idx, set) in pool.disk_set.iter().enumerate() {
+            let entry_tasks = Arc::new(tokio::sync::Mutex::new(Vec::<RebalanceEntryTask>::new()));
             let rebalance_entry: ListCallback = Arc::new({
                 let this = Arc::clone(self);
                 let bucket = bucket.clone();
                 let entry_error = entry_error.clone();
                 let callback_rx = rx.clone();
-                // let wk = wk.clone();
                 let set = set.clone();
                 let bucket_configs = bucket_configs.clone();
+                let entry_tasks = entry_tasks.clone();
+                let entry_workers = entry_workers.clone();
                 move |entry: MetaCacheEntry| {
                     let this = this.clone();
                     let bucket = bucket.clone();
                     let entry_error = entry_error.clone();
                     let callback_rx = callback_rx.clone();
-                    // let wk = wk.clone();
                     let set = set.clone();
                     let bucket_configs = bucket_configs.clone();
+                    let entry_tasks = entry_tasks.clone();
+                    let entry_workers = entry_workers.clone();
                     Box::pin(async move {
                         if callback_rx.is_cancelled() {
                             return;
@@ -1686,20 +1752,38 @@ impl ECStore {
                             return;
                         }
 
-                        info!("rebalance_entry: rebalance_entry spawn start");
-                        // wk.take().await;
-                        // tokio::spawn(async move {
-                        info!("rebalance_entry: rebalance_entry spawn start2");
-                        if let Err(err) = this.rebalance_entry(bucket, pool_index, entry, set, bucket_configs).await {
-                            error!("rebalance_entry: rebalance entry failed: {err}");
-                            let mut first_err = entry_error.lock().await;
-                            if first_err.is_none() {
-                                *first_err = Some(err);
-                                callback_rx.cancel();
-                            }
+                        let permit = tokio::select! {
+                            _ = callback_rx.cancelled() => return,
+                            permit = entry_workers.clone().acquire_owned() => match permit {
+                                Ok(permit) => permit,
+                                Err(err) => {
+                                    error!("rebalance_entry: worker semaphore closed: {err}");
+                                    return;
+                                }
+                            },
+                        };
+
+                        if entry_error.lock().await.is_some() {
+                            return;
                         }
-                        info!("rebalance_entry: rebalance_entry spawn done");
-                        // });
+
+                        let task = tokio::spawn(async move {
+                            let _permit = permit;
+                            info!("rebalance_entry: rebalance entry task start");
+                            let result = this.rebalance_entry(bucket, pool_index, entry, set, bucket_configs).await;
+                            if let Err(err) = &result {
+                                error!("rebalance_entry: rebalance entry failed: {err}");
+                                let mut first_err = entry_error.lock().await;
+                                if first_err.is_none() {
+                                    *first_err = Some(err.clone());
+                                    callback_rx.cancel();
+                                }
+                            }
+                            info!("rebalance_entry: rebalance entry task done");
+                            result
+                        });
+
+                        entry_tasks.lock().await.push(task);
                     })
                 }
             });
@@ -1707,23 +1791,23 @@ impl ECStore {
             let set = set.clone();
             let rx = rx.clone();
             let bucket = bucket.clone();
-            // let wk = wk.clone();
+            let entry_tasks = entry_tasks.clone();
 
             let job = tokio::spawn(async move {
-                let result = set.list_objects_to_rebalance(rx, bucket, rebalance_entry).await;
+                let list_result = set.list_objects_to_rebalance(rx, bucket, rebalance_entry).await;
+                let entry_result = wait_rebalance_entry_tasks(set_idx, entry_tasks).await;
+                let result = list_result.and(entry_result);
                 if let Err(err) = &result {
                     error!("Rebalance worker {} error: {}", set_idx, err);
                 } else {
                     info!("Rebalance worker {} done", set_idx);
                 }
-                // wk.clone().give().await;
                 result
             });
 
             jobs.push((set_idx, job));
         }
 
-        // wk.wait().await;
         let mut worker_error: Option<Error> = None;
         for (set_idx, job) in jobs {
             if let Err(err) = resolve_rebalance_worker_result(set_idx, job.await)
@@ -1838,12 +1922,12 @@ mod rebalance_unit_tests {
         GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions, RebalSaveOpt,
         RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option,
         apply_rebalance_terminal_event, apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
-        clone_rebalance_pool_stats, ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning,
-        ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event, load_rebalance_bucket_configs,
-        mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat, rebalance_delete_marker_opts,
-        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
-        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
-        resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        clone_rebalance_pool_stats, complete_rebalance_pools_at_goal, ensure_rebalance_listing_disks_available,
+        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
+        load_rebalance_bucket_configs, mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
+        rebalance_delete_marker_opts, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
+        rebalance_meta_load_unknown_version_error, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
+        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
         resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
@@ -2647,6 +2731,29 @@ mod rebalance_unit_tests {
         assert!(err.to_string().contains("rebalance worker 7 task join error"));
     }
 
+    #[tokio::test]
+    async fn test_wait_rebalance_entry_tasks_returns_ok_for_successful_tasks() {
+        let tasks = Arc::new(tokio::sync::Mutex::new(vec![tokio::spawn(async { Ok(()) })]));
+
+        super::wait_rebalance_entry_tasks(1, tasks)
+            .await
+            .expect("successful entry tasks should pass");
+    }
+
+    #[tokio::test]
+    async fn test_wait_rebalance_entry_tasks_returns_first_task_error() {
+        let tasks = Arc::new(tokio::sync::Mutex::new(vec![
+            tokio::spawn(async { Ok(()) }),
+            tokio::spawn(async { Err(Error::other("entry failed")) }),
+        ]));
+
+        let err = super::wait_rebalance_entry_tasks(1, tasks)
+            .await
+            .expect_err("entry task failure should be returned");
+
+        assert!(err.to_string().contains("entry failed"));
+    }
+
     #[test]
     fn test_resolve_rebalance_save_task_result_passthrough() {
         assert!(resolve_rebalance_save_task_result(0, Ok(Ok(()))).is_ok());
@@ -3246,6 +3353,44 @@ mod rebalance_unit_tests {
     #[test]
     fn test_should_pool_participate_false_when_ratio_meets_goal() {
         assert!(!should_pool_participate(300, 1_000, 0.3));
+    }
+
+    #[test]
+    fn test_complete_rebalance_pools_at_goal_marks_started_participants_completed() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let mut meta = RebalanceMeta {
+            percent_free_goal: 0.5,
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    init_free_space: 400,
+                    init_capacity: 1_000,
+                    bytes: 50,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    participating: true,
+                    init_free_space: 100,
+                    init_capacity: 1_000,
+                    bytes: 0,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(complete_rebalance_pools_at_goal(&mut meta, now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Completed);
+        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+        assert_eq!(meta.pool_stats[1].info.status, RebalStatus::Started);
     }
 
     #[test]

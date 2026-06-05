@@ -13,18 +13,25 @@
 // limitations under the License.
 
 pub mod account_info;
+pub mod audit;
+mod audit_runtime_config;
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
 pub mod heal;
 pub mod health;
+mod iam_error;
 pub mod is_admin;
 pub mod kms;
 pub mod kms_dynamic;
 pub mod kms_keys;
 pub mod kms_management;
 pub mod metrics;
+pub mod module_switch;
+mod notify_runtime_access;
 pub mod oidc;
+pub mod plugins_catalog;
+pub mod plugins_instances;
 pub mod policies;
 pub mod pools;
 pub mod profile;
@@ -36,6 +43,7 @@ pub mod service_account;
 pub mod site_replication;
 pub mod sts;
 pub mod system;
+mod target_descriptor;
 pub mod tier;
 pub mod trace;
 pub mod user;
@@ -51,6 +59,14 @@ mod tests {
     fn test_handler_struct_creation() {
         // Test that handler structs can be created
         let _account_handler = account_info::AccountInfoHandler {};
+        let _list_audit_targets = audit::ListAuditTargets {};
+        let _get_module_switches = module_switch::GetModuleSwitchesHandler {};
+        let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
+        let _list_plugin_instances = plugins_instances::ListPluginInstancesHandler {};
+        let _get_plugin_instance = plugins_instances::GetPluginInstanceHandler {};
+        let _put_plugin_instance = plugins_instances::PutPluginInstanceHandler {};
+        let _delete_plugin_instance = plugins_instances::DeletePluginInstanceHandler {};
+        let _update_module_switches = module_switch::UpdateModuleSwitchesHandler {};
         let _service_handler = system::ServiceHandle {};
         let _server_info_handler = system::ServerInfoHandler {};
         let _inspect_data_handler = system::InspectDataHandler {};

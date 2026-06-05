@@ -9,24 +9,50 @@ homepage.workspace = true
 description = "Notification target abstraction and implementations for RustFS"
 keywords = ["file-system", "notification", "target", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "filesystem"]
-documentation = "https://docs.rs/rustfs-target/latest/rustfs_target/"
+documentation = "https://docs.rs/rustfs-targets/latest/rustfs_targets/"
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["notify", "constants", "audit"] }
-rustfs-utils = { workspace = true, features = ["sys", "notify"] }
-rustfs-s3-common = { workspace = true }
+rustfs-ecstore = { workspace = true }
+rustfs-utils = { workspace = true, features = ["notify", "tls"] }
+rustfs-s3-types = { workspace = true }
 async-trait = { workspace = true }
+async-nats = { workspace = true }
+deadpool-postgres = { workspace = true }
+hyper-rustls = { workspace = true }
+lapin = { workspace = true }
+pulsar = { workspace = true }
 reqwest = { workspace = true }
 rumqttc = { workspace = true }
+redis = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pki-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
+tokio-postgres = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
+sysinfo = { workspace = true, features = ["multithread"] }
+rustfs-kafka-async = { workspace = true }
+mysql_async = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+hashbrown = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "queue_store_benchmark"
+harness = false
 
 [lints]
 workspace = true

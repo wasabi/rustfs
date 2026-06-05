@@ -267,7 +267,7 @@ impl KmsClient for LocalKmsClient {
             key_id: uuid::Uuid::new_v4().to_string(),
             master_key_id: request.master_key_id.clone(),
             key_spec: request.key_spec.clone(),
-            encrypted_key: encrypted_key.clone(),
+            encrypted_key,
             nonce,
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
@@ -566,7 +566,9 @@ impl LocalKmsBackend {
     pub async fn new(config: KmsConfig) -> Result<Self> {
         let local_config = match &config.backend_config {
             crate::config::BackendConfig::Local(local_config) => local_config.clone(),
-            _ => return Err(KmsError::configuration_error("Expected Local backend configuration")),
+            crate::config::BackendConfig::VaultKv2(_) | crate::config::BackendConfig::VaultTransit(_) => {
+                return Err(KmsError::configuration_error("Expected Local backend configuration"));
+            }
         };
 
         let client = LocalKmsClient::new(local_config).await?;

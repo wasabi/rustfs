@@ -56,6 +56,9 @@ mod special_chars_test;
 #[cfg(test)]
 mod content_encoding_test;
 
+#[cfg(test)]
+mod archive_download_integrity_test;
+
 // ListObjectsV2 pagination test (Issue #1596)
 #[cfg(test)]
 mod list_objects_v2_pagination_test;
@@ -70,6 +73,10 @@ mod compression_test;
 // Regression test for Issue #1878: DeleteMarkers not visible immediately after delete_objects
 #[cfg(test)]
 mod delete_objects_versioning_test;
+
+// Regression test for signed DELETE Object?versionId requests without Content-Length.
+#[cfg(test)]
+mod delete_object_no_content_length_test;
 
 // Regression test for Issue #2252: ListObjectVersions misses newest version after put -> delete -> put
 #[cfg(test)]
@@ -101,6 +108,15 @@ mod checksum_upload_test;
 #[cfg(test)]
 mod group_delete_test;
 
+#[cfg(test)]
+mod head_object_range_test;
+
+#[cfg(test)]
+mod head_object_consistency_test;
+
+#[cfg(test)]
+mod copy_object_metadata_test;
+
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;
@@ -108,6 +124,9 @@ mod bucket_logging_test;
 // Multipart control API auth regression tests
 #[cfg(test)]
 mod multipart_auth_test;
+
+#[cfg(test)]
+mod stale_multipart_cleanup_cluster_test;
 
 // Object lambda end-to-end regression tests
 #[cfg(test)]
@@ -119,3 +138,5 @@ mod replication_extension_test;
 
 #[cfg(test)]
 mod snowball_auto_extract_test;
+
+pub mod tls_gen;

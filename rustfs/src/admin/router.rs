@@ -65,7 +65,7 @@ use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
@@ -343,7 +343,8 @@ fn parse_misc_extension_request(method: &Method, uri: &Uri) -> Option<MiscExtRou
         if uri.path() == "/" {
             return Some(MiscExtRoute::ListenNotification { bucket: None });
         }
-        if let Some(bucket) = extract_bucket_for_bucket_level_path(uri.path()) {
+        let path = uri.path().strip_suffix('/').unwrap_or(uri.path());
+        if let Some(bucket) = extract_bucket_for_bucket_level_path(path) {
             return Some(MiscExtRoute::ListenNotification { bucket: Some(bucket) });
         }
     }
@@ -509,7 +510,7 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         })
         .transpose()?;
     let version_id = query_value_exact(&filtered_uri, "versionId").filter(|value| !value.is_empty());
-    let range = parse_optional_header(&req.headers, http::header::RANGE)?
+    let range = parse_optional_header(&req.headers, header::RANGE)?
         .map(|value| Range::parse(&value).map_err(|_| s3_error!(InvalidArgument, "Range header is invalid")))
         .transpose()?;
 
@@ -519,13 +520,10 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         .part_number(part_number)
         .version_id(version_id)
         .range(range)
-        .if_match(parse_optional_etag_condition_header::<IfMatch>(&req.headers, http::header::IF_MATCH)?)
-        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(
-            &req.headers,
-            http::header::IF_NONE_MATCH,
-        )?)
-        .if_modified_since(parse_optional_timestamp_header(&req.headers, http::header::IF_MODIFIED_SINCE)?)
-        .if_unmodified_since(parse_optional_timestamp_header(&req.headers, http::header::IF_UNMODIFIED_SINCE)?);
+        .if_match(parse_optional_etag_condition_header::<IfMatch>(&req.headers, header::IF_MATCH)?)
+        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(&req.headers, header::IF_NONE_MATCH)?)
+        .if_modified_since(parse_optional_timestamp_header(&req.headers, header::IF_MODIFIED_SINCE)?)
+        .if_unmodified_since(parse_optional_timestamp_header(&req.headers, header::IF_UNMODIFIED_SINCE)?);
 
     builder = builder.sse_customer_algorithm(parse_optional_header(
         &req.headers,
@@ -643,13 +641,17 @@ async fn resolve_object_lambda_webhook_config(uri: &Uri) -> S3Result<ObjectLambd
 }
 
 fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
+    let mut builder = reqwest::Client::builder().user_agent(rustfs_targets::get_user_agent(rustfs_targets::ServiceType::Basis));
 
     if let Some(timeout) = config.response_header_timeout {
         builder = builder.timeout(timeout);
     }
 
     if config.skip_tls_verify {
+        warn!(
+            "Object Lambda webhook target '{}' is configured to skip TLS certificate verification. This permits MITM attacks and should not be used in production.",
+            config.endpoint
+        );
         builder = builder.danger_accept_invalid_certs(true);
     } else if !config.client_ca.is_empty() {
         let ca_pem = std::fs::read(&config.client_ca)
@@ -1442,6 +1444,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         object: None,
         version_id: None,
         region: get_global_region(),
+        ..Default::default()
     });
 
     license_check().map_err(|er| match er.kind() {
@@ -2163,6 +2166,7 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
         object,
         version_id: None,
         region: get_global_region(),
+        ..Default::default()
     });
 
     license_check().map_err(|er| match er.kind() {
@@ -2184,7 +2188,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
         MiscExtRoute::ObjectLambda { bucket, object } => {
             let get_req = build_object_lambda_get_request(req, bucket, object)?;
             let usecase = DefaultObjectUsecase::from_global();
-            let get_resp = usecase.execute_get_object(get_req).await?;
+            let get_resp = Box::pin(usecase.execute_get_object(get_req)).await?;
             invoke_object_lambda_target(req, bucket, object, get_resp).await
         }
         MiscExtRoute::ListenNotification { bucket } => {
@@ -2328,11 +2332,6 @@ where
         // Allow unauthenticated access to health check
         let path = req.uri.path();
 
-        // Profiling endpoints
-        if req.method == Method::GET && (path == PROFILE_CPU_PATH || path == PROFILE_MEMORY_PATH) {
-            return Ok(());
-        }
-
         // Health check
         if (req.method == Method::HEAD || req.method == Method::GET) && is_public_health_path(path) {
             return Ok(());
@@ -2384,7 +2383,7 @@ where
             return handle_replication_extension_request(&mut req, &ext_req).await;
         }
         if let Some(ext_req) = parse_misc_extension_request(&req.method, &req.uri) {
-            return handle_misc_extension_request(&mut req, &ext_req).await;
+            return Box::pin(handle_misc_extension_request(&mut req, &ext_req)).await;
         }
 
         // Console requests should be handled by console router first (including OPTIONS)
@@ -2490,12 +2489,14 @@ mod tests {
         let object_level: Uri = "/demo-bucket/path/file?replication-metrics"
             .parse()
             .expect("uri should parse");
+        let bucket_trailing_slash: Uri = "/demo-bucket/?replication-metrics".parse().expect("uri should parse");
         let invalid_value: Uri = "/demo-bucket?replication-metrics=1".parse().expect("uri should parse");
         let wrong_method: Uri = "/demo-bucket?replication-check".parse().expect("uri should parse");
         let wrong_method_reset: Uri = "/demo-bucket?replication-reset".parse().expect("uri should parse");
         let wrong_method_status: Uri = "/demo-bucket?replication-reset-status".parse().expect("uri should parse");
 
         assert!(parse_replication_extension_request(&Method::GET, &object_level).is_none());
+        assert!(parse_replication_extension_request(&Method::GET, &bucket_trailing_slash).is_none());
         assert!(parse_replication_extension_request(&Method::GET, &invalid_value).is_none());
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method).is_none());
         assert!(parse_replication_extension_request(&Method::GET, &wrong_method_reset).is_none());
@@ -3097,6 +3098,7 @@ mod tests {
             .parse()
             .expect("uri should parse");
         let listen_bucket: Uri = "/demo-bucket?events=s3:ObjectCreated:*".parse().expect("uri should parse");
+        let listen_bucket_trailing_slash: Uri = "/demo-bucket/?events=s3:ObjectCreated:*".parse().expect("uri should parse");
         let listen_root: Uri = "/?events=s3:ObjectRemoved:*".parse().expect("uri should parse");
 
         let object_route = parse_misc_extension_request(&Method::GET, &object_lambda).expect("object lambda route should parse");
@@ -3112,6 +3114,15 @@ mod tests {
             parse_misc_extension_request(&Method::GET, &listen_bucket).expect("bucket listen route should parse");
         assert_eq!(
             listen_bucket_route,
+            MiscExtRoute::ListenNotification {
+                bucket: Some("demo-bucket".to_string())
+            }
+        );
+
+        let listen_bucket_trailing_slash_route = parse_misc_extension_request(&Method::GET, &listen_bucket_trailing_slash)
+            .expect("bucket listen route with trailing slash should parse");
+        assert_eq!(
+            listen_bucket_trailing_slash_route,
             MiscExtRoute::ListenNotification {
                 bucket: Some("demo-bucket".to_string())
             }
@@ -3732,6 +3743,28 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
+    #[tokio::test]
+    async fn check_access_rejects_anonymous_profile_request() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: PROFILE_CPU_PATH.parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("anonymous profile request must be denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
     #[test]
     fn listen_notification_keepalive_plan_defaults_to_space_keepalive() {
         let uri: Uri = "/demo-bucket?events=s3:ObjectCreated:Put".parse().expect("uri should parse");
@@ -3770,7 +3803,7 @@ mod tests {
     fn event_matches_listen_notification_respects_bucket_event_and_object_filters() {
         let filter = ListenNotificationFilter {
             bucket: Some("demo-bucket".to_string()),
-            event_mask: EventName::ObjectCreatedPut.mask() | EventName::ObjectCreatedPost.mask(),
+            event_mask: rustfs_s3_ops::put_object_created_event_mask(),
             prefix: Some("logs/".to_string()),
             suffix: Some(".json".to_string()),
         };

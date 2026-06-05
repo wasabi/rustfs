@@ -16,6 +16,7 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_confi
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
+use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
@@ -29,7 +30,7 @@ use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, insert_str,
+    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, insert_str, remove_str,
 };
 use s3s::dto::{
     Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
@@ -49,21 +50,41 @@ use tracing::{debug, warn};
 pub const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
+fn format_object_lock_timestamp(timestamp: OffsetDateTime) -> String {
+    timestamp.format(&Rfc3339).unwrap_or_default()
+}
+
+fn has_object_lock_retention_metadata(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER) || metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+}
+
+pub(crate) fn remove_object_lock_retention_metadata(metadata: &mut HashMap<String, String>) -> bool {
+    let removed_mode = metadata.remove(AMZ_OBJECT_LOCK_MODE_LOWER).is_some();
+    let removed_retain_until_date = metadata.remove(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).is_some();
+    let removed_timestamp = contains_key_str(metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP);
+    remove_str(metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP);
+
+    removed_mode || removed_retain_until_date || removed_timestamp
+}
+
+fn remove_object_lock_legal_hold_metadata(metadata: &mut HashMap<String, String>) -> bool {
+    let removed_legal_hold = metadata.remove(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).is_some();
+    let removed_timestamp = contains_key_str(metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP);
+    remove_str(metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP);
+
+    removed_legal_hold || removed_timestamp
+}
+
+pub(crate) fn remove_object_lock_metadata_for_copy(metadata: &mut HashMap<String, String>) -> bool {
+    let removed_retention = remove_object_lock_retention_metadata(metadata);
+    let removed_legal_hold = remove_object_lock_legal_hold_metadata(metadata);
+
+    removed_retention || removed_legal_hold
+}
+
 /// Apply bucket default Object Lock retention to object metadata if no explicit retention is set.
-///
-/// This function implements S3-compatible behavior where objects uploaded to a bucket with
-/// default retention configuration automatically inherit the bucket's default retention policy.
-/// The retention is only applied if:
-/// 1. The bucket has Object Lock enabled
-/// 2. The bucket has a default retention rule configured
-/// 3. The object metadata does not already contain explicit retention headers
-///
-/// # Arguments
-/// * `object_lock_config` - Optional bucket Object Lock configuration. If None, no retention is applied.
-/// * `metadata` - Mutable reference to object metadata HashMap. Retention headers are inserted here.
-#[allow(dead_code)]
 pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
-    if metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER) || metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER) {
+    if has_object_lock_retention_metadata(metadata) {
         return;
     }
 
@@ -86,7 +107,58 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
     if let Ok(date_str) = retain_until.format(&Rfc3339) {
         metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode.as_str().to_string());
         metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), date_str);
+        insert_str(metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, format_object_lock_timestamp(now));
     }
+}
+
+pub(crate) fn apply_default_lock_retention_metadata(
+    object_lock_configuration: Option<ObjectLockConfiguration>,
+    metadata: &mut HashMap<String, String>,
+) -> bool {
+    if has_object_lock_retention_metadata(metadata) {
+        return false;
+    }
+
+    let mut default_retention_metadata = HashMap::new();
+    apply_lock_retention(object_lock_configuration, &mut default_retention_metadata);
+    if default_retention_metadata.is_empty() {
+        return false;
+    }
+
+    metadata.extend(default_retention_metadata);
+    true
+}
+
+pub(crate) async fn apply_bucket_default_lock_retention(
+    bucket: &str,
+    metadata: &mut HashMap<String, String>,
+    has_explicit_retention: bool,
+) -> S3Result<()> {
+    if has_explicit_retention {
+        return Ok(());
+    }
+
+    if has_object_lock_retention_metadata(metadata) {
+        return Ok(());
+    }
+
+    let object_lock_configuration = match metadata_sys::get_object_lock_config(bucket).await {
+        Ok((cfg, _created)) => Some(cfg),
+        Err(err) => {
+            if err == StorageError::ConfigNotFound {
+                None
+            } else {
+                warn!("get_object_lock_config err {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Failed to load Object Lock configuration".to_string(),
+                ));
+            }
+        }
+    };
+
+    apply_default_lock_retention_metadata(object_lock_configuration, metadata);
+    Ok(())
 }
 
 /// Calculate adaptive buffer size with workload profile support.
@@ -189,12 +261,12 @@ pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     // Optional performance metrics collection for monitoring and optimization
     {
         use metrics::histogram;
-        histogram!("rustfs.buffer.size.bytes").record(buffer_size as f64);
-        counter!("rustfs.buffer.size.selections").increment(1);
+        histogram!("rustfs_buffer_size_bytes").record(buffer_size as f64);
+        counter!("rustfs_buffer_size_selections_total").increment(1);
 
-        if file_size >= 0 {
+        if file_size > 0 {
             let ratio = buffer_size as f64 / file_size as f64;
-            histogram!("rustfs.buffer.to.file.ratio").record(ratio);
+            histogram!("rustfs_buffer_to_file_ratio").record(ratio);
         }
     }
 
@@ -300,7 +372,7 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
         insert_str(
             &mut eval_metadata,
             SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
-            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+            format_object_lock_timestamp(now),
         );
     }
     Ok(eval_metadata)
@@ -327,7 +399,7 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
         insert_str(
             &mut eval_metadata,
             SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
-            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+            format_object_lock_timestamp(now),
         );
     }
     Ok(eval_metadata)
@@ -384,13 +456,17 @@ pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Resul
 pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3Result<()> {
     let mod_time = info.mod_time;
     let etag = info.etag.as_deref();
+    let if_match = non_empty_header_value(headers, IF_MATCH);
+    let if_none_match = non_empty_header_value(headers, IF_NONE_MATCH);
+    let if_modified_since = non_empty_header_value(headers, IF_MODIFIED_SINCE);
+    let if_unmodified_since = non_empty_header_value(headers, IF_UNMODIFIED_SINCE);
 
     if mod_time.is_none() && etag.is_none() {
         return Ok(());
     }
 
     // If-Match: requires ETag to exist
-    if let Some(if_match_val) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
+    if let Some(if_match_val) = if_match {
         match etag {
             Some(e) if is_etag_equal(e, if_match_val) => {}
             _ => return Err(S3Error::new(S3ErrorCode::PreconditionFailed)),
@@ -398,9 +474,9 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     }
 
     // If-Unmodified-Since (only when If-Match is absent)
-    if headers.get("if-match").is_none()
+    if if_match.is_none()
         && let Some(t) = mod_time
-        && let Some(if_unmodified_since) = headers.get("if-unmodified-since").and_then(|v| v.to_str().ok())
+        && let Some(if_unmodified_since) = if_unmodified_since
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_unmodified_since, &RFC1123).map(|dt| dt.assume_utc())
         && t > given_time.add(time::Duration::seconds(1))
     {
@@ -408,7 +484,7 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     }
 
     // If-None-Match
-    if let Some(if_none_match) = headers.get("if-none-match").and_then(|v| v.to_str().ok())
+    if let Some(if_none_match) = if_none_match
         && let Some(e) = etag
         && is_etag_equal(e, if_none_match)
     {
@@ -431,9 +507,9 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     }
 
     // If-Modified-Since (only when If-None-Match is absent — semantics per RFC 7232; dates use RFC 1123 format)
-    if headers.get("if-none-match").is_none()
+    if if_none_match.is_none()
         && let Some(t) = mod_time
-        && let Some(if_modified_since) = headers.get("if-modified-since").and_then(|v| v.to_str().ok())
+        && let Some(if_modified_since) = if_modified_since
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_modified_since, &RFC1123).map(|dt| dt.assume_utc())
         && t < given_time.add(time::Duration::seconds(1))
     {
@@ -458,6 +534,14 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     }
 
     Ok(())
+}
+
+fn non_empty_header_value(headers: &HeaderMap, name: http::header::HeaderName) -> Option<&str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 /// Compares an object ETag with an ETag value from an HTTP header.
@@ -540,10 +624,10 @@ pub(crate) fn extract_prefix_suffix(filter: Option<&NotificationConfigurationFil
         if let Some(rules) = &filter_rules.filter_rules {
             for rule in rules {
                 if let (Some(name), Some(value)) = (rule.name.as_ref(), rule.value.as_ref()) {
-                    match name.as_str() {
-                        "prefix" => prefix = value.clone(),
-                        "suffix" => suffix = value.clone(),
-                        _ => {}
+                    if name.as_str().eq_ignore_ascii_case("prefix") {
+                        prefix = value.clone();
+                    } else if name.as_str().eq_ignore_ascii_case("suffix") {
+                        suffix = value.clone();
                     }
                 }
             }

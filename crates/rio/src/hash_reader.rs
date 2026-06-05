@@ -285,7 +285,7 @@ impl HashReader {
             Ok(Self {
                 inner,
                 size,
-                checksum: md5hex.clone(),
+                checksum: md5hex,
                 actual_size,
                 diskable_md5,
                 bytes_read: 0,
@@ -367,7 +367,7 @@ impl HashReader {
 
         if let Some(checksum) = cs {
             if checksum.checksum_type.trailing() {
-                self.trailer_s3s = trailing_headers.clone();
+                self.trailer_s3s = trailing_headers;
             }
 
             self.content_hash = Some(checksum.clone());
@@ -405,6 +405,24 @@ impl HashReader {
 
             tracing::debug!("add_non_trailing_checksum checksum={checksum:?}");
         }
+        Ok(())
+    }
+
+    pub fn add_calculated_checksum(&mut self, checksum_type: ChecksumType) -> Result<(), std::io::Error> {
+        if !checksum_type.is_set() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum type"));
+        }
+
+        let Some(hasher) = checksum_type.hasher() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum type"));
+        };
+
+        self.content_hash = Some(Checksum {
+            checksum_type,
+            ..Default::default()
+        });
+        self.content_hasher = Some(hasher);
+
         Ok(())
     }
 
@@ -569,7 +587,13 @@ impl AsyncRead for HashReader {
 
                         let content_hash = hasher.finalize();
 
-                        if content_hash != expected_content_hash.raw {
+                        if expected_content_hash.raw.is_empty()
+                            && expected_content_hash.encoded.is_empty()
+                            && !expected_content_hash.checksum_type.trailing()
+                        {
+                            expected_content_hash.raw = content_hash;
+                            expected_content_hash.encoded = general_purpose::STANDARD.encode(&expected_content_hash.raw);
+                        } else if content_hash != expected_content_hash.raw {
                             let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
                             let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);
                             error!(
@@ -658,7 +682,7 @@ mod tests {
             HashReader::from_stream(BufReader::new(Cursor::new(&data[..])), size, actual_size, etag.clone(), None, false)
                 .unwrap();
         let etag_reader = EtagReader::new(reader3, etag.clone());
-        let hash_reader3 = HashReader::from_reader(etag_reader, size, actual_size, etag.clone(), None, false).unwrap();
+        let hash_reader3 = HashReader::from_reader(etag_reader, size, actual_size, etag, None, false).unwrap();
         assert_eq!(hash_reader3.size(), size);
         assert_eq!(hash_reader3.actual_size(), actual_size);
     }
@@ -740,6 +764,25 @@ mod tests {
         let etag = hash_reader.try_resolve_etag();
         assert!(etag.is_none());
         assert_eq!(buf, data);
+    }
+
+    #[tokio::test]
+    async fn test_add_calculated_checksum_records_checksum() {
+        let data = b"server-side copy checksum";
+        let reader = BufReader::new(Cursor::new(&data[..]));
+        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
+
+        hash_reader.add_calculated_checksum(ChecksumType::CRC64_NVME).unwrap();
+
+        let mut buf = Vec::new();
+        hash_reader.read_to_end(&mut buf).await.unwrap();
+
+        let expected = Checksum::new_from_data(ChecksumType::CRC64_NVME, data).unwrap();
+        let checksums = hash_reader.content_crc();
+
+        assert_eq!(buf, data);
+        assert_eq!(hash_reader.content_crc_type(), Some(ChecksumType::CRC64_NVME));
+        assert_eq!(checksums.get("CRC64NVME"), Some(&expected.encoded));
     }
 
     #[tokio::test]

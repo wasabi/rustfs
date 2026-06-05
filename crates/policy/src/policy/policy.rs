@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::{
-    Effect, Error as IamError, Functions, ID, Statement, action::Action, statement::BPStatement,
-    statement::variable_resolver_for_policy_args,
+    ClaimLookup, Effect, Error as IamError, Functions, ID, Statement, action::Action, get_claim_case_insensitive,
+    statement::BPStatement, statement::variable_resolver_for_policy_args,
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -241,29 +241,35 @@ impl Validator for BucketPolicy {
 
 fn get_values_from_claims(claims: &HashMap<String, Value>, claim_name: &str) -> (HashSet<String>, bool) {
     let mut s = HashSet::new();
-    if let Some(pname) = claims.get(claim_name) {
-        if let Some(pnames) = pname.as_array() {
-            for pname in pnames {
-                if let Some(pname_str) = pname.as_str() {
-                    for pname in pname_str.split(',') {
-                        let pname = pname.trim();
-                        if !pname.is_empty() {
-                            s.insert(pname.to_string());
+    match get_claim_case_insensitive(claims, claim_name) {
+        ClaimLookup::Found(pname) => {
+            if let Some(pnames) = pname.as_array() {
+                for pname in pnames {
+                    if let Some(pname_str) = pname.as_str() {
+                        for pname in pname_str.split(',') {
+                            let pname = pname.trim();
+                            if !pname.is_empty() {
+                                s.insert(pname.to_string());
+                            }
                         }
                     }
                 }
+                return (s, true);
             }
-            return (s, true);
-        } else if let Some(pname_str) = pname.as_str() {
-            for pname in pname_str.split(',') {
-                let pname = pname.trim();
-                if !pname.is_empty() {
-                    s.insert(pname.to_string());
+
+            if let Some(pname_str) = pname.as_str() {
+                for pname in pname_str.split(',') {
+                    let pname = pname.trim();
+                    if !pname.is_empty() {
+                        s.insert(pname.to_string());
+                    }
                 }
+                return (s, true);
             }
-            return (s, true);
         }
+        ClaimLookup::Missing | ClaimLookup::Ambiguous => {}
     }
+
     (s, false)
 }
 
@@ -351,37 +357,52 @@ pub mod default {
 
     use crate::policy::{
         ActionSet, DEFAULT_VERSION, Effect, Functions, ResourceSet, Statement,
-        action::{Action, AdminAction, KmsAction, S3Action},
+        action::{Action, AdminAction, KmsAction, S3Action, StsAction},
         resource::Resource,
     };
 
     use super::Policy;
 
     #[allow(clippy::incompatible_msrv)]
-    pub static DEFAULT_POLICIES: LazyLock<[(&'static str, Policy); 6]> = LazyLock::new(|| {
+    pub static DEFAULT_POLICIES: LazyLock<[(&'static str, Policy); 5]> = LazyLock::new(|| {
         [
             (
                 "readwrite",
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::AllActions));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::S3Action(S3Action::AllActions));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Resource::S3("*".into()));
+                                hash_set
+                            }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -389,25 +410,40 @@ pub mod default {
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
-                            hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
-                            hash_set.insert(Action::S3Action(S3Action::GetBucketQuotaAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
+                                hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
+                                hash_set.insert(Action::S3Action(S3Action::GetBucketQuotaAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Resource::S3("*".into()));
+                                hash_set
+                            }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -415,47 +451,38 @@ pub mod default {
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
-                },
-            ),
-            (
-                "writeonly",
-                Policy {
-                    id: "".into(),
-                    version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Resource::S3("*".into()));
+                                hash_set
+                            }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -463,30 +490,45 @@ pub mod default {
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::AdminAction(AdminAction::ProfilingAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::TraceAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::ConsoleLogAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::ServerInfoAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::TopLocksAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::HealthInfoAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::PrometheusAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::BandwidthMonitorAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::AdminAction(AdminAction::ProfilingAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::TraceAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::ConsoleLogAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::ServerInfoAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::TopLocksAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::HealthInfoAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::PrometheusAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::BandwidthMonitorAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Resource::S3("*".into()));
+                                hash_set
+                            }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -535,6 +577,19 @@ pub mod default {
                                 hash_set.insert(Resource::S3("*".into()));
                                 hash_set
                             }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(HashSet::new()),
                             conditions: Functions::default(),
                             ..Default::default()
                         },
@@ -679,6 +734,44 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_default_policies_allow_sts_assume_role() {
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::StsAction(crate::policy::action::StsAction::AssumeRoleAction),
+            bucket: "",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        for (name, policy) in default::DEFAULT_POLICIES.iter() {
+            assert!(policy.is_allowed(&args).await, "default policy {name} should allow sts:AssumeRole");
+        }
+    }
+
+    #[test]
+    fn test_default_policy_names_are_unique() {
+        let mut names = HashSet::new();
+        for (name, _) in default::DEFAULT_POLICIES.iter() {
+            assert!(names.insert(*name), "duplicate default policy name: {name}");
+        }
+    }
+
+    #[test]
+    fn test_default_policies_validate() {
+        for (name, policy) in default::DEFAULT_POLICIES.iter() {
+            policy
+                .validate()
+                .unwrap_or_else(|err| panic!("default policy {name} should validate: {err}"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_deny_only_checks_only_deny_statements() -> Result<()> {
         let data = r#"
 {
@@ -787,6 +880,176 @@ mod test {
         assert!(
             policy.is_allowed(&args_owner_deny_only).await,
             "deny_only should allow when no Deny statement matches, including owner requests"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket_prefix_condition_uses_bucket_resource() -> Result<()> {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "polaris_test/snowflake_catalog/db1/schema/iceberg_table/*"
+          ]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert(
+            "prefix".to_string(),
+            vec!["polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/".to_string()],
+        );
+        let claims = HashMap::new();
+        let args = Args {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(
+            policy.is_allowed(&args).await,
+            "ListBucket should match the bucket resource and apply the prefix through the condition, not by converting the prefix into an object resource"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket_versions_prefix_condition_uses_bucket_resource() -> Result<()> {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucketVersions"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "polaris_test/snowflake_catalog/db1/schema/iceberg_table/*"
+          ]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert(
+            "prefix".to_string(),
+            vec!["polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/".to_string()],
+        );
+        let claims = HashMap::new();
+        let args = Args {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketVersionsAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(
+            policy.is_allowed(&args).await,
+            "ListBucketVersions should match the bucket resource and apply the prefix through the condition"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket_gateway_prefix_uses_object_resource_when_condition_missing() -> Result<()> {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket/home/alice/*"]
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert("prefix".to_string(), vec!["home/alice/projects/".to_string()]);
+        let claims = HashMap::new();
+        let args = Args {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "home/alice/projects/",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(
+            policy.is_allowed(&args).await,
+            "Gateway ListBucket auth without an s3:prefix condition should continue matching prefix-scoped resources via args.object"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_gateway_prefix_uses_object_resource_when_condition_missing() -> Result<()> {
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket/home/alice/*"]
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert("prefix".to_string(), vec!["home/alice/projects/".to_string()]);
+        let args = BucketPolicyArgs {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "home/alice/projects/",
+        };
+
+        assert!(
+            bucket_policy.is_allowed(&args).await,
+            "Bucket policy ListBucket without an s3:prefix condition should continue matching prefix-scoped resources via args.object"
         );
 
         Ok(())
@@ -1244,6 +1507,166 @@ mod test {
     }
 
     #[test]
+    fn test_admin_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:ServerInfo"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "Admin-only Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_sts_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["sts:AssumeRole"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "STS-only Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_kms_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "KMS-only Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_mixed_action_families_are_invalid_even_with_resource() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*", "sts:AssumeRole"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families should be rejected");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_mixed_action_families_are_invalid_even_without_resource() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*", "s3:GetObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families should be rejected even when Resource is missing");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_mixed_action_families_with_wildcard_variants_are_invalid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:*", "admin:*", "sts:AssumeRole"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families with wildcard variants should be rejected");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_notaction_without_resource_remains_invalid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "NotAction": ["s3:DeleteObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "NotAction statement without Resource should remain invalid");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonResource)),
+            "Error should be NonResource, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
     fn test_bucket_policy_serialize_omits_empty_fields() {
         use crate::policy::action::{Action, ActionSet, S3Action};
         use crate::policy::resource::{Resource, ResourceSet};
@@ -1400,6 +1823,52 @@ mod test {
         let arr = action.as_array().expect("Should be array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].as_str().unwrap(), "s3:ListBucket");
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_list_bucket_prefix_condition_uses_bucket_resource() -> Result<()> {
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "polaris_test/snowflake_catalog/db1/schema/iceberg_table/*"
+          ]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert(
+            "prefix".to_string(),
+            vec!["polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/".to_string()],
+        );
+        let args = BucketPolicyArgs {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/",
+        };
+
+        assert!(
+            bucket_policy.is_allowed(&args).await,
+            "Bucket policy ListBucket should match the bucket resource and apply the prefix through the condition"
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -1692,5 +2161,91 @@ mod test {
             bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_alice_private).await,
             "principal and resource match should keep ExistingObjectTag fetch hint"
         );
+    }
+
+    #[test]
+    fn test_get_values_from_claims_case_insensitive() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), Value::Array(vec![Value::String("consoleAdmin".to_string())]));
+
+        let (policies, found) = get_values_from_claims(&claims, "policyMinio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+
+        let (policies, found) = get_values_from_claims(&claims, "POLICYMINIO");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+
+        let (policies, found) = get_values_from_claims(&claims, "policyminio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+    }
+
+    #[test]
+    fn test_get_values_from_claims_exact_match_preferred() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::Array(vec![Value::String("exact_match".to_string())]));
+        claims.insert("policy".to_string(), Value::Array(vec![Value::String("lowercase".to_string())]));
+
+        let (policies, _) = get_values_from_claims(&claims, "Policy");
+        assert!(policies.contains("exact_match"));
+        assert!(!policies.contains("lowercase"));
+    }
+
+    #[test]
+    fn test_get_policies_from_claims_case_insensitive_string() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), Value::String("consoleAdmin,readwrite".to_string()));
+
+        let (policies, found) = get_policies_from_claims(&claims, "policyMinio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+        assert!(policies.contains("readwrite"));
+    }
+
+    #[test]
+    fn test_get_values_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::Array(vec![Value::String("exact_match".to_string())]));
+        claims.insert("policy".to_string(), Value::Array(vec![Value::String("lowercase".to_string())]));
+
+        let (policies, found) = get_values_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
+    }
+
+    #[test]
+    fn test_get_policies_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::String("consoleAdmin".to_string()));
+        claims.insert("policy".to_string(), Value::String("readwrite".to_string()));
+
+        let (policies, found) = get_policies_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
+    }
+
+    #[test]
+    fn test_policy_round_trips_through_json_value() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    }
+  ]
+}"#,
+        )
+        .expect("policy should parse");
+
+        let value = serde_json::to_value(&policy).expect("policy should serialize");
+        let round_trip: Policy = serde_json::from_value(value).expect("policy should deserialize from serde_json::Value");
+
+        assert_eq!(round_trip.version, policy.version);
+        assert_eq!(round_trip.statements.len(), policy.statements.len());
+        assert_eq!(round_trip.statements[0].effect, policy.statements[0].effect);
     }
 }

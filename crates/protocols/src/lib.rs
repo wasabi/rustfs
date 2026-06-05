@@ -17,6 +17,9 @@
 pub mod common;
 pub mod constants;
 
+#[cfg(any(feature = "ftps", feature = "webdav"))]
+mod tls_hot_reload;
+
 #[cfg(feature = "ftps")]
 pub mod ftps;
 
@@ -25,6 +28,9 @@ pub mod swift;
 
 #[cfg(feature = "webdav")]
 pub mod webdav;
+
+#[cfg(feature = "sftp")]
+pub mod sftp;
 
 pub use common::session::Protocol;
 pub use common::{AuthorizationError, ProtocolPrincipal, S3Action, SessionContext, authorize_operation};
@@ -37,3 +43,6 @@ pub use swift::handler::SwiftService;
 
 #[cfg(feature = "webdav")]
 pub use webdav::{config::WebDavConfig, server::WebDavServer};
+
+#[cfg(feature = "sftp")]
+pub use sftp::{SftpConfig, SftpInitError, SftpServer};

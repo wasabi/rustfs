@@ -108,6 +108,7 @@ fi
 
 : "${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY must be set (source conf/paths.env)}"
 : "${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY must be set (source conf/paths.env)}"
+: "${RUSTFS_RPC_SECRET:?RUSTFS_RPC_SECRET must be set}"
 
 # ---------------------------------------------------------------------------
 # 2. SHIP BINARY TO PEERS
@@ -140,6 +141,7 @@ expand_template() {
         -e "s|@@RUST_LOG@@|${RUST_LOG}|g" \
         -e "s|@@RUSTFS_ACCESS_KEY@@|${RUSTFS_ACCESS_KEY}|g" \
         -e "s|@@RUSTFS_SECRET_KEY@@|${RUSTFS_SECRET_KEY}|g" \
+        -e "s|@@RUSTFS_RPC_SECRET@@|${RUSTFS_RPC_SECRET}|g" \
         "$CONF_TEMPLATE"
 }
 

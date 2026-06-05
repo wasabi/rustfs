@@ -42,6 +42,8 @@ jobs:
     name: Performance Profiling
     runs-on: ubicloud-standard-2
     timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -63,14 +65,7 @@ jobs:
           tool: samply
 
       - name: Configure kernel for profiling
-        run: |
-          current_value="$(cat /proc/sys/kernel/perf_event_paranoid)"
-          if [[ "$current_value" == "2" ]]; then
-            echo "kernel.perf_event_paranoid is 2; attempting to set it to 1"
-            echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
-          else
-            echo "kernel.perf_event_paranoid is ${current_value}; skipping change"
-          fi
+        run: echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
 
       - name: Prepare test environment
         run: |
@@ -91,9 +86,7 @@ jobs:
 
       - name: Build with profiling optimizations
         run: |
-          # Must include --cfg tokio_unstable: dial9-tokio-telemetry uses Tokio unstable
-          # runtime APIs. Setting RUSTFLAGS without it shadows .cargo/config and breaks the build.
-          RUSTFLAGS="--cfg tokio_unstable -C force-frame-pointers=yes -C debug-assertions=off" \
+          RUSTFLAGS="-C force-frame-pointers=yes -C debug-assertions=off --cfg tokio_unstable" \
           cargo +nightly build --profile profiling -p rustfs --bins
 
       - name: Run performance profiling
@@ -122,14 +115,12 @@ jobs:
           path: samply-profile.json
           retention-days: 30
 
-      - name: Failure diagnostics
-        if: failure()
-        uses: ./.github/actions/diagnostics-on-failure
-
   benchmark:
     name: Benchmark Tests
     runs-on: ubicloud-standard-2
     timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -153,7 +144,3 @@ jobs:
           name: benchmark-results-${{ github.run_number }}
           path: benchmark-results.json
           retention-days: 7
-
-      - name: Failure diagnostics
-        if: failure()
-        uses: ./.github/actions/diagnostics-on-failure

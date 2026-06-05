@@ -45,19 +45,34 @@ fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
 
-# export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"√
+# export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"
 
-export RUSTFS_VOLUMES="./target/volume/test{1...4}"
+# This script provisions multiple local export directories on the same disk.
+# Default the bypass only for this local layout, while still allowing callers
+# to override it explicitly through the environment.
+if [ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ] && [ -z "${MINIO_CI+x}" ]; then
+    export RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
+fi
+
+if [ -z "${RUSTFS_ALLOCATOR_RECLAIM_ENABLED+x}" ]; then
+    export RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true
+fi
+
+export RUSTFS_VOLUMES="${RUSTFS_VOLUMES:-./target/volume/test{1...4}}"
 # export RUSTFS_VOLUMES="./target/volume/test"
-export RUSTFS_ADDRESS=":9000"
-export RUSTFS_CONSOLE_ENABLE=true
-export RUSTFS_CONSOLE_ADDRESS=":9001"
+export RUSTFS_ADDRESS="${RUSTFS_ADDRESS:-:9000}"
+export RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfs-admin}"
+export RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfs-secret}"
+export RUSTFS_RPC_SECRET="${RUSTFS_RPC_SECRET:-rustfs-rpc-secret}"
+export RUSTFS_REGION="${RUSTFS_REGION:-us-east-1}"
+export RUSTFS_CONSOLE_ENABLE="${RUSTFS_CONSOLE_ENABLE:-true}"
+export RUSTFS_CONSOLE_ADDRESS="${RUSTFS_CONSOLE_ADDRESS:-:9001}"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS certificate directory
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # Observability related configuration
-#export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
+export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
 # RustFS OR OTEL exporter configuration
 #export RUSTFS_OBS_TRACE_ENDPOINT=http://localhost:4318/v1/traces # OpenTelemetry Collector trace address http://localhost:4318/v1/traces
 #export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:14318/v1/traces
@@ -66,14 +81,15 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_LOG_ENDPOINT=http://loki:3100/otlp/v1/logs # OpenTelemetry Collector logs address http://loki:3100/otlp/v1/logs
 #export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://loki:3100/otlp/v1/logs
 export RUSTFS_OBS_PROFILING_ENDPOINT=http://localhost:4040 # OpenTelemetry Collector profiling address
-export RUSTFS_OBS_USE_STDOUT=true # Whether to use standard output
-export RUSTFS_OBS_SAMPLE_RATIO=2.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
+export RUSTFS_OBS_PROFILING_EXPORT_ENABLED="${RUSTFS_OBS_PROFILING_EXPORT_ENABLED:-true}" # Whether to enable profiling export
+export RUSTFS_OBS_USE_STDOUT=false # Whether to use standard output
+export RUSTFS_OBS_SAMPLE_RATIO=1.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
 export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
 export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
 export RUSTFS_OBS_ENVIRONMENT=production # Environment name development, staging, production
 export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
-#export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
+export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="minutely" # Log rotation time unit, can be "minutely", "hourly", "daily"
 export RUSTFS_OBS_LOG_KEEP_FILES=10 # Number of log files to keep
@@ -242,9 +258,6 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 export RUSTFS_SCANNER_ENABLED=true
 
 export RUSTFS_HEAL_ENABLED=true
-
-# Object cache configuration
-export RUSTFS_OBJECT_CACHE_ENABLE=true
 
 # Profiling configuration
 export RUSTFS_ENABLE_PROFILING=false
@@ -525,4 +538,7 @@ fi
 #cargo run --profile release --bin rustfs
 
 # To run in debug mode, use the following line
-cargo run --bin rustfs
+#cargo run --bin rustfs
+
+# Default local run mode: release
+cargo run --profile release --bin rustfs

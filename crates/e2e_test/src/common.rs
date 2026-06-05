@@ -41,7 +41,9 @@ use walkdir::WalkDir;
 // Common constants for all E2E tests
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
+pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
+const RUSTFS_FULL_FEATURE: &str = "full";
 
 fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, provider_name: &'static str) -> Config {
     let credentials = Credentials::new(access_key, secret_key, None, None, provider_name);
@@ -83,6 +85,7 @@ pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> Pat
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
         return PathBuf::from(path);
     }
+    let requested_features = requested_features.and_then(normalize_rustfs_build_features);
 
     let mut binary_path = workspace_root();
     binary_path.push("target");
@@ -90,7 +93,7 @@ pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> Pat
     binary_path.push(profile_dir);
     binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
 
-    let features_match = binary_features_match(&binary_path, requested_features);
+    let features_match = binary_features_match(&binary_path, requested_features.as_deref());
     let source_is_newer = workspace_sources_newer_than_binary(&binary_path);
     let can_reuse_inside_e2e = running_inside_e2e_test_binary() && requested_features.is_none() && features_match;
     if binary_path.is_file() && features_match && (!source_is_newer || can_reuse_inside_e2e) {
@@ -105,7 +108,7 @@ pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> Pat
     }
 
     info!("Building RustFS binary to ensure it's up to date...");
-    build_rustfs_binary(requested_features);
+    build_rustfs_binary(requested_features.as_deref());
 
     info!("Using RustFS binary at {:?}", binary_path);
     binary_path
@@ -134,11 +137,31 @@ fn running_inside_e2e_test_binary() -> bool {
     std::env::var("CARGO_PKG_NAME").is_ok_and(|value| value == "e2e_test")
 }
 
-fn requested_rustfs_build_features() -> Option<String> {
-    std::env::var("RUSTFS_BUILD_FEATURES")
+pub fn requested_rustfs_build_features() -> Option<String> {
+    std::env::var(ENV_RUSTFS_BUILD_FEATURES)
         .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .and_then(|value| normalize_rustfs_build_features(&value))
+}
+
+pub fn normalize_rustfs_build_features(features: &str) -> Option<String> {
+    let features = features
+        .split(',')
+        .map(str::trim)
+        .filter(|feature| !feature.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    if features.is_empty() { None } else { Some(features.join(",")) }
+}
+
+pub fn rustfs_build_feature_enabled(requested_features: Option<&str>, required_feature: &str) -> bool {
+    let Some(requested_features) = requested_features.and_then(normalize_rustfs_build_features) else {
+        return true;
+    };
+
+    requested_features
+        .split(',')
+        .any(|feature| feature.eq_ignore_ascii_case(RUSTFS_FULL_FEATURE) || feature.eq_ignore_ascii_case(required_feature))
 }
 
 fn rustfs_binary_features_stamp_path(binary_path: &Path) -> PathBuf {
@@ -147,11 +170,14 @@ fn rustfs_binary_features_stamp_path(binary_path: &Path) -> PathBuf {
 
 fn binary_features_match(binary_path: &Path, requested_features: Option<&str>) -> bool {
     let stamp_path = rustfs_binary_features_stamp_path(binary_path);
-    let recorded = stdfs::read_to_string(stamp_path).ok().map(|value| value.trim().to_string());
+    let recorded = stdfs::read_to_string(stamp_path)
+        .ok()
+        .and_then(|value| normalize_rustfs_build_features(&value));
+    let requested = requested_features.and_then(normalize_rustfs_build_features);
 
-    match requested_features {
+    match requested.as_deref() {
         Some(features) => recorded.as_deref() == Some(features),
-        None => recorded.as_deref().is_none_or(str::is_empty),
+        None => recorded.is_none(),
     }
 }
 
@@ -255,11 +281,7 @@ static INIT: Once = Once::new();
 /// Initialize tracing for all E2E tests
 pub fn init_logging() {
     INIT.call_once(|| {
-        // Use try_init so that if another test binary or thread has already installed
-        // a global subscriber, we do not panic and poison the Once for all callers.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("rustfs=info,e2e_test=debug")
-            .try_init();
+        tracing_subscriber::fmt().with_env_filter("rustfs=info,e2e_test=debug").init();
     });
 }
 
@@ -340,22 +362,23 @@ impl RustFSTestEnvironment {
     fn build_start_args<'a>(&'a self, extra_args: Vec<&'a str>) -> Vec<&'a str> {
         let mut args = vec![
             "--address",
-            self.address.as_str(),
+            &self.address,
             "--access-key",
-            self.access_key.as_str(),
+            &self.access_key,
             "--secret-key",
-            self.secret_key.as_str(),
+            &self.secret_key,
         ];
+
         args.extend(extra_args);
-        args.push(self.temp_dir.as_str());
+        args.push(&self.temp_dir);
         args
     }
 
     async fn start_rustfs_server_inner(
         &mut self,
         extra_args: Vec<&str>,
-        cleanup_existing: bool,
         extra_env: &[(&str, &str)],
+        cleanup_existing: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if cleanup_existing {
             self.cleanup_existing_processes().await?;
@@ -363,37 +386,36 @@ impl RustFSTestEnvironment {
 
         let args = self.build_start_args(extra_args);
 
-        info!("Starting RustFS server with args: {:?} env_overrides: {:?}", args, extra_env);
+        info!("Starting RustFS server with args: {:?}", args);
 
         let binary_path = rustfs_binary_path();
-        let mut cmd = Command::new(&binary_path);
-        cmd.env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
-        for (k, v) in extra_env {
-            cmd.env(k, v);
+        let mut command = Command::new(&binary_path);
+        command.env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
+        for (key, value) in extra_env {
+            command.env(key, value);
         }
-        cmd.args(&args);
-        let process = cmd.spawn()?;
+        let process = command.args(&args).spawn()?;
 
         self.process = Some(process);
+
+        // Wait for server to be ready
         self.wait_for_server_ready().await?;
+
         Ok(())
     }
 
     /// Start RustFS server with basic configuration
     pub async fn start_rustfs_server(&mut self, extra_args: Vec<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.start_rustfs_server_inner(extra_args, true, &[]).await
+        self.start_rustfs_server_inner(extra_args, &[], true).await
     }
 
-    /// Start RustFS server with extra environment variables set on the child process only.
-    ///
-    /// Use this for tests that need a clean `LazyLock` read (e.g. `RUSTFS_WASABI_VERSION_IDS=false`)
-    /// without mutating the test harness process environment.
+    /// Start RustFS server with extra child-process environment variables.
     pub async fn start_rustfs_server_with_env(
         &mut self,
         extra_args: Vec<&str>,
         extra_env: &[(&str, &str)],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.start_rustfs_server_inner(extra_args, true, extra_env).await
+        self.start_rustfs_server_inner(extra_args, extra_env, true).await
     }
 
     /// Start RustFS server without cleaning up other running RustFS processes.
@@ -404,7 +426,7 @@ impl RustFSTestEnvironment {
         &mut self,
         extra_args: Vec<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.start_rustfs_server_inner(extra_args, false, &[]).await
+        self.start_rustfs_server_inner(extra_args, &[], false).await
     }
 
     /// Wait for RustFS server to be ready.
@@ -638,6 +660,7 @@ pub struct RustFSTestClusterEnvironment {
     pub temp_dir: String,
     pub access_key: String,
     pub secret_key: String,
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl RustFSTestClusterEnvironment {
@@ -686,7 +709,17 @@ impl RustFSTestClusterEnvironment {
             temp_dir,
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
+            extra_env: Vec::new(),
         })
+    }
+
+    /// Add an extra environment variable applied to every cluster node process.
+    pub fn set_env<K, V>(&mut self, key: K, value: V)
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.extra_env.push((key.into(), value.into()));
     }
 
     /// Build the volumes argument string for RustFS binary (internal helper method).
@@ -719,15 +752,20 @@ impl RustFSTestClusterEnvironment {
         for (i, node) in self.nodes.iter_mut().enumerate() {
             info!("Starting cluster node {} on {}", i, node.address);
 
-            let process = Command::new(&binary_path)
+            let mut command = Command::new(&binary_path);
+            command
                 .env("RUSTFS_VOLUMES", &volumes_arg)
                 .env("RUSTFS_ADDRESS", &node.address)
                 .env("RUSTFS_ACCESS_KEY", &self.access_key)
                 .env("RUSTFS_SECRET_KEY", &self.secret_key)
                 .env("RUSTFS_CONSOLE_ENABLE", "false")
-                .env("RUST_LOG", "rustfs=info,rustfs_notify=debug")
-                .current_dir(&node.data_dir)
-                .spawn()?;
+                .env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
+
+            for (key, value) in &self.extra_env {
+                command.env(key, value);
+            }
+
+            let process = command.current_dir(&node.data_dir).spawn()?;
 
             node.process = Some(process);
         }
@@ -886,5 +924,38 @@ impl Drop for RustFSTestClusterEnvironment {
         if let Err(e) = std::fs::remove_dir_all(&self.temp_dir) {
             warn!("Failed to clean up cluster temp directory {}: {}", self.temp_dir, e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_rustfs_build_features() {
+        assert_eq!(
+            normalize_rustfs_build_features(" SFTP, ftps ,, WebDAV "),
+            Some("sftp,ftps,webdav".to_string())
+        );
+        assert_eq!(normalize_rustfs_build_features(" , "), None);
+    }
+
+    #[test]
+    fn full_feature_enables_any_required_feature() {
+        assert!(rustfs_build_feature_enabled(Some("full"), "sftp"));
+        assert!(rustfs_build_feature_enabled(Some("ftps, full"), "webdav"));
+    }
+
+    #[test]
+    fn binary_feature_stamp_matching_uses_normalized_features() {
+        let binary_path = std::env::temp_dir().join(format!("rustfs-feature-stamp-test-{}", Uuid::new_v4()));
+        let stamp_path = rustfs_binary_features_stamp_path(&binary_path);
+
+        stdfs::write(&stamp_path, " SFTP, ftps ").expect("write feature stamp");
+        assert!(binary_features_match(&binary_path, Some("sftp,ftps")));
+        assert!(binary_features_match(&binary_path, Some(" SFTP, FTPS ")));
+        assert!(!binary_features_match(&binary_path, Some("sftp")));
+
+        stdfs::remove_file(stamp_path).ok();
     }
 }

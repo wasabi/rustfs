@@ -162,8 +162,9 @@ pub async fn get_local_server_property() -> ServerProperties {
 
     let mut props = ServerProperties {
         endpoint: addr,
-        uptime: SystemTime::now()
-            .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
+        uptime: GLOBAL_BOOT_TIME
+            .get()
+            .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
             .unwrap_or_default()
             .as_secs(),
         network,
@@ -182,11 +183,8 @@ pub async fn get_local_server_property() -> ServerProperties {
     };
 
     // let mut sensitive = HashSet::new();
-    // sensitive.insert(ENV_ACCESS_KEY.to_string());
-    // sensitive.insert(ENV_SECRET_KEY.to_string());
-    // sensitive.insert(ENV_ROOT_USER.to_string());
-    // sensitive.insert(ENV_ROOT_PASSWORD.to_string());
-
+    // sensitive.insert(rustfs_config::ENV_RUSTFS_ACCESS_KEY.to_string());
+    // sensitive.insert(rustfs_config::ENV_RUSTFS_SECRET_KEY.to_string());
     if let Some(store) = new_object_layer_fn() {
         let storage_info = store.local_storage_info().await;
         props.state = ITEM_ONLINE.to_string();

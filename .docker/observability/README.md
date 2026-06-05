@@ -13,6 +13,9 @@ The stack is composed of the following best-in-class open-source components:
 - **Jaeger** (v1.59.0): Distributed tracing system (configured as a secondary UI/storage).
 - **OpenTelemetry Collector** (v0.104.0): A vendor-agnostic implementation for receiving, processing, and exporting telemetry data.
 
+By default, this stack uses Tempo in single-binary mode and does not require Kafka/Redpanda.
+If you want the Kafka-backed HA Tempo path, use `docker-compose-example-for-rustfs.yml` together with `docker-compose-tempo-ha-override.yml`.
+
 ## Architecture
 
 1. **Telemetry Collection**: Applications send OTLP (OpenTelemetry Protocol) data (Metrics, Logs, Traces) to the **OpenTelemetry Collector**.
@@ -46,6 +49,15 @@ Run the following command to start the entire stack:
 docker compose up -d
 ```
 
+### High Availability Tempo
+
+The default `docker-compose.yml` is the single-node stack.
+If you need the Kafka-backed HA Tempo configuration, start it with:
+
+```bash
+docker compose -f docker-compose-example-for-rustfs.yml -f docker-compose-tempo-ha-override.yml up -d
+```
+
 ### Access Dashboards
 
 | Service        | URL                                              | Credentials       | Description                    |
@@ -77,6 +89,54 @@ docker compose down -v
 - **Prometheus**: Edit `prometheus.yml` to add scrape targets or alerting rules.
 - **Grafana**: Dashboards and datasources are provisioned from the `grafana/` directory.
 - **Collector**: Edit `otel-collector-config.yaml` to modify pipelines, processors, or exporters.
+
+### Verifying RustFS Traces
+
+When RustFS points `RUSTFS_OBS_ENDPOINT` at this stack, treat the value as the
+OTLP/HTTP base URL, for example:
+
+```bash
+export RUSTFS_OBS_ENDPOINT=http://host.docker.internal:4318
+```
+
+RustFS automatically expands that base URL to:
+
+- `/v1/traces`
+- `/v1/metrics`
+- `/v1/logs`
+
+Important behavior notes:
+
+- Logs and metrics usually appear during startup, so seeing those two signals
+  first is expected.
+- Visible trace data usually requires real HTTP/S3/gRPC request traffic after
+  startup, because request-path spans are created on demand.
+- `RUSTFS_OBS_LOGGER_LEVEL=info` keeps the top-level request span but filters
+  many nested `debug` spans. If Tempo or Jaeger looks sparse, retry with
+  `RUSTFS_OBS_LOGGER_LEVEL=debug` before suspecting collector or Tempo issues.
+
+Minimal validation flow:
+
+```bash
+# 1. Start this observability stack.
+docker compose up -d
+
+# 2. Start RustFS with OTLP/HTTP export and richer span visibility.
+export RUSTFS_OBS_ENDPOINT=http://host.docker.internal:4318
+export RUSTFS_OBS_LOGGER_LEVEL=debug
+
+# 3. Generate real request traffic.
+curl -I http://127.0.0.1:9000/health
+curl -I http://127.0.0.1:9000/health/ready
+
+# 4. Inspect Grafana or Jaeger.
+# Grafana: http://localhost:3000
+# Jaeger:  http://localhost:16686
+```
+
+If logs and metrics are present but traces are sparse, the most common cause is
+"no real request traffic yet" or "`info` level filtered nested spans", not an
+OTLP routing failure.
 
 ## Troubleshooting
 

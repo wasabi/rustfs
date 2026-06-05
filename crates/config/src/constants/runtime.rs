@@ -59,9 +59,50 @@ pub const DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT: usize = 10;
 pub const DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE: f64 = 1.0; // 100% sampling
 // Note: S3 bucket/prefix have no default; absence means upload is disabled (modeled as Option<String>)
 
-/// Threshold for small object seek support in megabytes.
+/// Maximum transition workers used as a local fallback when runtime env is unset.
+pub const DEFAULT_TRANSITION_WORKERS_CAP: i64 = 16;
+/// Absolute upper bound for transition workers accepted from runtime env.
+pub const DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX: i64 = 32;
+/// Default capacity for the transition queue.
+pub const DEFAULT_TRANSITION_QUEUE_CAPACITY: usize = 1000;
+/// Default send timeout for transition queue enqueue attempts, in milliseconds.
+pub const DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS: usize = 100;
+/// Test-only fault injection env var that forces the immediate transition enqueue timeout path.
+pub const ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT: &str = "RUSTFS_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT";
+/// Runtime env var controlling the transition worker count.
+pub const ENV_TRANSITION_WORKERS: &str = "RUSTFS_MAX_TRANSITION_WORKERS";
+/// Runtime env var controlling the absolute maximum transition workers.
+pub const ENV_TRANSITION_WORKERS_ABSOLUTE_MAX: &str = "RUSTFS_ABSOLUTE_MAX_WORKERS";
+/// Runtime env var controlling the transition queue capacity.
+pub const ENV_TRANSITION_QUEUE_CAPACITY: &str = "RUSTFS_TRANSITION_QUEUE_CAPACITY";
+/// Runtime env var controlling the transition queue send timeout in milliseconds.
+pub const ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS: &str = "RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS";
+
+// Allocator reclaim configuration
+pub const ENV_ALLOCATOR_RECLAIM_ENABLED: &str = "RUSTFS_ALLOCATOR_RECLAIM_ENABLED";
+pub const ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS: &str = "RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS";
+pub const ENV_ALLOCATOR_RECLAIM_FORCE: &str = "RUSTFS_ALLOCATOR_RECLAIM_FORCE";
+pub const ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS: &str = "RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS";
+pub const DEFAULT_ALLOCATOR_RECLAIM_ENABLED: bool = false;
+pub const DEFAULT_ALLOCATOR_RECLAIM_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_ALLOCATOR_RECLAIM_FORCE: bool = true;
+pub const DEFAULT_ALLOCATOR_RECLAIM_IDLE_INTERVALS: u64 = 3;
+
+// File page-cache reclaim configuration
+pub const ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE";
+pub const ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE";
+pub const ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD";
+pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: bool = false;
+pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: bool = false;
+pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: usize = 4 * 1024 * 1024;
+
+/// Threshold for small object seek support in bytes.
 ///
-/// When an object is smaller than this size, rustfs will provide seek support.
+/// When an object response is smaller than this size, rustfs may provide
+/// in-memory seek support. Runtime GET logic also enforces a hard safety cap
+/// (`64 MiB`) to prevent large-download memory spikes even if this threshold
+/// is configured higher.
 ///
-/// Default is set to 10MB.
+/// Default is set to 10 MiB.
+pub const ENV_OBJECT_SEEK_SUPPORT_THRESHOLD: &str = "RUSTFS_OBJECT_SEEK_SUPPORT_THRESHOLD";
 pub const DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD: usize = 10 * 1024 * 1024;

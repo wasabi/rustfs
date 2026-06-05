@@ -30,6 +30,7 @@
 //! - `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` - Max files before sampling (default: 200,000)
 //! - `RUSTFS_CAPACITY_STAT_TIMEOUT` - Stat operation timeout (default: 3s)
 //! - `RUSTFS_CAPACITY_SAMPLE_RATE` - Sampling rate for metrics (default: 200)
+//! - `RUSTFS_CAPACITY_METRICS_INTERVAL` - Metrics summary logging interval (default: 600s)
 //! - `RUSTFS_CAPACITY_FOLLOW_SYMLINKS` - Follow symlinks during traversal (default: false)
 //! - `RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH` - Max symlink depth (default: 3)
 //! - `RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT` - Enable dynamic timeout (default: true)
@@ -48,22 +49,11 @@
 //! Capacity metrics flow through the existing observability pipeline via the `metrics`
 //! crate and `rustfs-io-metrics`; this module does not expose a Prometheus HTTP endpoint.
 //!
-//! ## Testing
-//!
-//! For isolated tests, use `create_isolated_manager()` to create independent
-//! instances instead of the global singleton:
-//!
-//! ```ignore
-//! use crate::capacity::create_isolated_manager;
-//!
-//! let manager = create_isolated_manager(HybridStrategyConfig::default());
-//! // Test without affecting global state
-//! ```
-//!
 
 pub mod capacity_integration;
-pub mod capacity_manager;
-#[cfg(test)]
-mod capacity_manager_test;
-#[cfg(test)]
-mod write_trigger_test;
+pub mod service;
+
+pub use service::{
+    capacity_disk_ref, get_cached_capacity_with_metrics, init_capacity_management_for_local_disks, record_capacity_write,
+    refresh_or_join_admin_disks, resolve_admin_used_capacity, spawn_refresh_if_needed_admin_disks,
+};

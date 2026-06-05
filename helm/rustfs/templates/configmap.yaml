@@ -65,9 +65,10 @@ data:
     {{- end }}
     {{- if .profiling.enabled }}
   RUSTFS_OBS_PROFILING_ENDPOINT: {{ .profiling.endpoint | quote }}
+  RUSTFS_OBS_PROFILING_EXPORT_ENABLED: "true"
     {{- else }}
   RUSTFS_OBS_PROFILING_ENDPOINT: ""
-  RUSTFS_OBS_PROFILING_ENABLED: "false"
+  RUSTFS_OBS_PROFILING_EXPORT_ENABLED: "false"
     {{- end }}
   {{- end }}
   {{- end }}
@@ -81,10 +82,21 @@ data:
     {{- if .idle_mode }}
   RUSTFS_SCANNER_IDLE_MODE: {{ .idle_mode | quote }}
     {{- end }}
+    {{- if .cache_save_timeout_secs }}
+  RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: {{ .cache_save_timeout_secs | quote }}
+    {{- end }}
   {{- end }}
-  {{- if .Values.mode.distributed.enabled }}
-  {{- with .Values.config.rustfs.ec }}
-  RUSTFS_ERASURE_SET_DRIVE_COUNT: {{ 16 | quote }}
-  RUSTFS_STORAGE_CLASS_STANDARD: {{ .storage_class_standard | quote }}
-  {{- end }}
+  {{- if .Values.config.rustfs.kms.enabled }}
+    {{- if eq .Values.config.rustfs.kms.type "vault" }}
+      {{- with .Values.config.rustfs.kms.vault }}
+  RUSTFS_KMS_ENABLE: "true"
+  RUSTFS_KMS_BACKEND: {{ .vault_backend | quote }}
+  RUSTFS_KMS_VAULT_ADDRESS: {{ .vault_address | quote }}
+  RUSTFS_KMS_VAULT_TOKEN: {{ .vault_token | quote }}
+  RUSTFS_KMS_DEFAULT_KEY_ID: {{ .default_key | quote }}
+        {{- if eq .vault_backend "vault-transit" }}
+  RUSTFS_KMS_VAULT_MOUNT_PATH: {{ .vault_mount_path | quote }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
   {{- end }}

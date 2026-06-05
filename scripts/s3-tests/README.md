@@ -130,8 +130,8 @@ DEPLOY_MODE=existing S3_HOST=192.168.1.100 S3_PORT=9000 ./scripts/s3-tests/run.s
 
 ### Service Configuration
 
-- `S3_ACCESS_KEY`: Main user access key (default: `rustfsadmin`)
-- `S3_SECRET_KEY`: Main user secret key (default: `rustfsadmin`)
+- `S3_ACCESS_KEY`: Main user access key (default: `rustfs-ci-admin`)
+- `S3_SECRET_KEY`: Main user secret key (default: `rustfs-ci-secret`)
 - `S3_ALT_ACCESS_KEY`: Alt user access key (default: `rustfsalt`)
 - `S3_ALT_SECRET_KEY`: Alt user secret key (default: `rustfsalt`)
 - `S3_REGION`: S3 region (default: `us-east-1`)
@@ -144,9 +144,11 @@ DEPLOY_MODE=existing S3_HOST=192.168.1.100 S3_PORT=9000 ./scripts/s3-tests/run.s
 - `MAXFAIL`: Stop after N failures (default: `1`)
 - `XDIST`: Enable parallel execution with N workers (default: `0`, disabled)
 - `MARKEXPR`: pytest marker expression for filtering tests
-  - Default: `not lifecycle and not versioning and not s3website and not bucket_logging and not encryption`
-  - Excludes features not yet supported by RustFS to reduce test execution time
-  - Can be customized to test specific features or remove exclusions
+  - Default: no marker filtering; file-based test lists control the selected tests
+  - Can be customized to test specific marker groups
+- `TESTEXPR`: optional pytest `-k` expression for custom runs
+  - Default: exact pytest node ids loaded from `implemented_tests.txt`
+  - Setting `TESTEXPR` overrides the implemented test list
 
 ### Configuration Files
 
@@ -182,9 +184,6 @@ DATA_ROOT=/tmp ./scripts/s3-tests/run.sh
 
 # Run specific test markers (e.g., test multipart uploads only)
 MARKEXPR="multipart" ./scripts/s3-tests/run.sh
-
-# Remove feature exclusions (test all features, including unsupported ones)
-MARKEXPR="" ./scripts/s3-tests/run.sh
 ```
 
 ### Binary File Mode
@@ -421,8 +420,8 @@ curl http://192.168.1.100:9000/health
 
 # Verify S3 API is responding
 awscurl --service s3 --region us-east-1 \
-  --access_key rustfsadmin \
-  --secret_key rustfsadmin \
+  --access_key rustfs-ci-admin \
+  --secret_key rustfs-ci-secret \
   -X GET "http://192.168.1.100:9000/"
 ```
 
@@ -454,6 +453,6 @@ The script follows the same steps:
 
 ## See Also
 
-- [GitHub Actions Workflow](../.github/workflows/e2e-s3tests.yml)
-- [S3 Tests Configuration](../.github/s3tests/s3tests.conf)
+- [GitHub Actions Workflow](../../.github/workflows/e2e-s3tests.yml)
+- [S3 Tests Configuration](../../.github/s3tests/s3tests.conf)
 - [Ceph S3 Tests Repository](https://github.com/ceph/s3-tests)

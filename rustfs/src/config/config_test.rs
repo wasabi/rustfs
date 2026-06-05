@@ -16,6 +16,8 @@
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
     use crate::config::{Config, Opt};
+    use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
+    use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
     use rustfs_ecstore::disks_layout::DisksLayout;
     use serial_test::serial;
     use std::env;
@@ -26,6 +28,8 @@ mod tests {
     /// # Safety
     /// This function uses unsafe env::set_var and env::remove_var.
     /// Tests using this helper must be marked with #[serial] to avoid race conditions.
+    // SAFETY: This helper mutates process environment only inside serial tests
+    // and restores the variable before returning or resuming a panic.
     #[allow(unsafe_code)]
     fn with_env_var<F>(key: &str, value: &str, test_fn: F)
     where
@@ -78,6 +82,53 @@ mod tests {
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":9001");
         assert_eq!(opt.address, ":9000");
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_new_defaults() {
+        let volumes = vec!["/tmp/rustfs-vol1".to_string()];
+        let address = "127.0.0.1:9100".to_string();
+        let config = Config::new(&address, volumes.clone());
+
+        assert_eq!(config.volumes, volumes);
+        assert_eq!(config.address, address);
+        assert_eq!(config.server_domains, Vec::<String>::new());
+        assert_eq!(config.access_key, DEFAULT_ACCESS_KEY);
+        assert_eq!(config.secret_key, DEFAULT_SECRET_KEY);
+        assert_eq!(config.console_enable, DEFAULT_CONSOLE_ENABLE);
+        assert_eq!(config.console_address, DEFAULT_CONSOLE_ADDRESS);
+        assert_eq!(config.obs_endpoint, DEFAULT_OBS_ENDPOINT);
+        assert_eq!(config.tls_path, None);
+        assert_eq!(config.license, None);
+        assert_eq!(config.region, Some(RUSTFS_REGION.to_string()));
+        assert!(!config.kms_enable);
+        assert_eq!(config.kms_backend, "local");
+        assert_eq!(config.kms_key_dir, None);
+        assert_eq!(config.kms_vault_address, None);
+        assert_eq!(config.kms_vault_token, None);
+        assert_eq!(config.kms_vault_mount_path, None);
+        assert_eq!(config.kms_default_key_id, None);
+        assert!(!config.buffer_profile_disable);
+        assert_eq!(config.buffer_profile, "GeneralPurpose");
+    }
+
+    #[test]
+    fn default_credentials_allowed_only_for_loopback_or_explicit_opt_in() {
+        let config = Config::new("0.0.0.0:9000", vec!["/tmp/rustfs-vol1".to_string()]);
+
+        assert!(!config.default_credentials_allowed_for_addr("0.0.0.0:9000".parse().unwrap(), false));
+        assert!(config.default_credentials_allowed_for_addr("127.0.0.1:9000".parse().unwrap(), false));
+        assert!(config.default_credentials_allowed_for_addr("0.0.0.0:9000".parse().unwrap(), true));
+    }
+
+    #[test]
+    fn custom_credentials_allowed_on_non_loopback() {
+        let mut config = Config::new("0.0.0.0:9000", vec!["/tmp/rustfs-vol1".to_string()]);
+        config.access_key = "custom-access-key".to_string();
+        config.secret_key = "custom-secret-key".to_string();
+
+        assert!(config.default_credentials_allowed_for_addr("0.0.0.0:9000".parse().unwrap(), false));
     }
 
     #[test]
@@ -143,7 +194,24 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_root_envs_are_used_for_bootstrap_credentials() {
+    fn test_access_key_envs_are_used_for_bootstrap_credentials() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_VOLUMES", Some("/compat/vol1")),
+                ("RUSTFS_ACCESS_KEY", Some("canonical-access")),
+                ("RUSTFS_SECRET_KEY", Some("canonical-secret")),
+            ],
+            || {
+                let config = Config::from_opt(Opt::parse_from(["rustfs"])).expect("config should parse");
+                assert_eq!(config.access_key, "canonical-access");
+                assert_eq!(config.secret_key, "canonical-secret");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_root_envs_fallback_for_bootstrap_credentials() {
         temp_env::with_vars(
             [
                 ("RUSTFS_VOLUMES", Some("/compat/vol1")),
@@ -318,7 +386,6 @@ mod tests {
     /// Uses #[serial] to avoid concurrent env var modifications.
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_rustfs_volumes_env_variable() {
         // Test case 1: Single volume via environment variable
         with_env_var("RUSTFS_VOLUMES", "/data/vol1", || {
@@ -463,7 +530,6 @@ mod tests {
     /// which means paths with spaces are NOT supported.
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_volumes_boundary_cases() {
         // Test case 1: Paths with spaces are not properly supported (known limitation)
         // This test documents the current behavior - space-separated paths will be split
@@ -622,7 +688,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_access_key_arguments_mutually_exclusive_env_var() {
         // Test that env var args configuration fails on conflict
         with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
@@ -662,7 +727,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_secret_key_arguments_mutually_exclusive_env_var() {
         // Test that env var args configuration fails on conflict
         with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {

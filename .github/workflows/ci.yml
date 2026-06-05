@@ -53,10 +53,8 @@ on:
       - ".github/workflows/docker.yml"
       - ".github/workflows/audit.yml"
       - ".github/workflows/performance.yml"
-  # Merge queue runs on a synthetic merge commit; required checks must trigger here.
-  # Do not add branches/paths filters — GitHub ignores path filters for merge_group and
-  # branch filters prevent the workflow from running in the queue.
   merge_group:
+    types: [checks_requested]
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
@@ -101,19 +99,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      # crate-ci/typos needs jq and wget on PATH; minimal runners may omit them (exit 127).
-      - name: Install dependencies for typos action
-        run: |
-          set -euo pipefail
-          APT_CONN_OPTS="-o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 -o Acquire::ftp::Timeout=180 -o Acquire::Retries=3"
-          sudo timeout --kill-after=120 30m apt-get $APT_CONN_OPTS update
-          sudo timeout --kill-after=120 30m apt-get $APT_CONN_OPTS install -y jq wget
       - name: Typos check with custom config file
         uses: crate-ci/typos@master
-
-      - name: Failure diagnostics
-        if: failure()
-        uses: ./.github/actions/diagnostics-on-failure
 
   test-and-lint:
     name: Test and Lint
@@ -121,6 +108,8 @@ jobs:
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubicloud-standard-4
     timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -141,15 +130,14 @@ jobs:
       - name: Check code formatting
         run: cargo fmt --all --check
 
+      - name: Check unsafe code allowances
+        run: ./scripts/check_unsafe_code_allowances.sh
+
       - name: Run clippy lints
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Check layered dependencies
         run: ./scripts/check_layer_dependencies.sh
-
-      - name: Failure diagnostics
-        if: failure()
-        uses: ./.github/actions/diagnostics-on-failure
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
@@ -157,6 +145,8 @@ jobs:
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubicloud-standard-4
     timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -181,10 +171,6 @@ jobs:
           path: target/debug/rustfs
           if-no-files-found: error
           retention-days: 1
-
-      - name: Failure diagnostics
-        if: failure()
-        uses: ./.github/actions/diagnostics-on-failure
 
   e2e-tests:
     name: End-to-End Tests
@@ -218,7 +204,7 @@ jobs:
         with:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
-          rev: 4a04a670cf41274d9be9ab65dc36f4aa3f92fbad
+          rev: 62cb4a71dd759a6ec56b64c4c42fcc183a2c6a52
 
       - name: Run end-to-end tests
         run: |
@@ -232,10 +218,6 @@ jobs:
           name: e2e-test-logs-${{ github.run_number }}
           path: /tmp/rustfs.log
           retention-days: 3
-
-      - name: Failure diagnostics
-        if: failure()
-        uses: ./.github/actions/diagnostics-on-failure
 
   s3-implemented-tests:
     name: S3 Implemented Tests
@@ -272,7 +254,3 @@ jobs:
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3
-
-      - name: Failure diagnostics
-        if: failure()
-        uses: ./.github/actions/diagnostics-on-failure

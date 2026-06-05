@@ -17,13 +17,13 @@ pub mod backpressure;
 pub mod concurrency;
 pub mod deadlock_detector;
 pub mod ecfs;
-pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod lock_optimizer;
 pub mod options;
+pub mod request_context;
 pub mod rpc;
 pub(crate) mod s3_api;
-mod sse;
+pub(crate) mod sse;
 pub mod timeout_wrapper;
 pub mod tonic_service;
 
