@@ -51,18 +51,19 @@ def _bytefmt_to_mbs(s: str) -> float:
     return float(s) / (1024 * 1024)  # bare bytes
 
 
-# Match per-interval lines: #<testNum>/<loopNum>  PUT: ... <throughput>/sec, <avg> avgOpMs, <max> maxOpMs
+# Match per-interval lines: #<testNum>/<loopNum>  <OP>: ... <throughput>/sec, <avg> avgOpMs, <max> maxOpMs
 # The %-4d format left-pads the loop number; we allow whitespace around it.
+# Matches any op type (PUT:, GET:, DEL:, etc.) so non-PUT runs produce valid reports.
 _LOADGEN_PAT = re.compile(
     r"#\d+/\s*(\d+)\s+"
-    r"PUT:\s+\d+ objs,\s+\S+/obj,\s+(\S+)/sec,\s+(\d+) avgOpMs,\s+(\d+) maxOpMs"
+    r"[A-Z]+:\s+\d+ objs,\s+\S+/obj,\s+(\S+)/sec,\s+(\d+) avgOpMs,\s+(\d+) maxOpMs"
 )
 
-# When only the summary row is present (#<test>/AVG PUT: …), e.g. loadgen stdout was
+# When only the summary row is present (#<test>/AVG <OP>: …), e.g. loadgen stdout was
 # block-buffered to tee until SIGTERM dropped earlier interval rows from loadgen.txt.
 _LOADGEN_SUMMARY_AVG_PAT = re.compile(
     r"#\d+/\s*AVG\s+"
-    r"PUT:\s+\d+ objs,\s+\S+/obj,\s+(\S+)/sec,\s+(\d+) avgOpMs,\s+(\d+) maxOpMs"
+    r"[A-Z]+:\s+\d+ objs,\s+\S+/obj,\s+(\S+)/sec,\s+(\d+) avgOpMs,\s+(\d+) maxOpMs"
 )
 
 
@@ -385,23 +386,28 @@ def _iostat_device_is_active(
     return False
 
 
-def _iostat_batch_combined_write_mb_s(batch: dict[str, tuple[float, float]]) -> float:
+def _iostat_batch_combined_write_mb_s(batch: dict[str, tuple[float, float, float]]) -> float:
     """Sum write MB/s for real block devices (exclude loop/ram/zram noise in trim signal)."""
     return sum(
-        w for dev, (w, _) in batch.items()
+        w for dev, (_, w, _) in batch.items()
         if not dev.startswith(("loop", "ram", "zram"))
     )
 
 
-def _iostat_read_batches(path: Path) -> list[dict[str, tuple[float, float]]]:
+def _iostat_read_batches(path: Path) -> list[dict[str, tuple[float, float, float]]]:
     """Parse iostat -xz into one dict per reporting interval (between avg-cpu markers).
+
+    Each device entry is a (read_mbs, write_mbs, util_pct) tuple. read_mbs is 0.0 when
+    the iostat version does not emit rMB/s or rkB/s columns (older kernels).
 
     iostat omits idle loop devices in later intervals; naively glob-appending device rows
     misaligns timelines and makes min(per-device counts)==1 when loop* only appear once,
     destroying combined_write and reported means/peaks.
     """
-    batches: list[dict[str, tuple[float, float]]] = []
-    current: dict[str, tuple[float, float]] = {}
+    batches: list[dict[str, tuple[float, float, float]]] = []
+    current: dict[str, tuple[float, float, float]] = {}
+    read_col: Optional[int] = None
+    read_scale = 1.0
     write_col: Optional[int] = None
     write_scale = 1.0
     util_col: Optional[int] = None
@@ -423,6 +429,12 @@ def _iostat_read_batches(path: Path) -> list[dict[str, tuple[float, float]]]:
                 elif "wkB/s" in cols:
                     write_col = cols.index("wkB/s")
                     write_scale = 1.0 / 1024.0
+                if "rMB/s" in cols:
+                    read_col = cols.index("rMB/s")
+                    read_scale = 1.0
+                elif "rkB/s" in cols:
+                    read_col = cols.index("rkB/s")
+                    read_scale = 1.0 / 1024.0
                 util_col = cols.index("%util")
                 current = {}
                 continue
@@ -441,9 +453,14 @@ def _iostat_read_batches(path: Path) -> list[dict[str, tuple[float, float]]]:
             try:
                 write_mbs = float(parts[write_col]) * write_scale
                 util_pct = float(parts[util_col])
+                read_mbs = (
+                    float(parts[read_col]) * read_scale
+                    if read_col is not None and read_col < len(parts)
+                    else 0.0
+                )
             except (ValueError, IndexError):
                 continue
-            current[device] = (write_mbs, util_pct)
+            current[device] = (read_mbs, write_mbs, util_pct)
 
     if write_col is not None and current:
         batches.append(dict(current))
@@ -490,27 +507,37 @@ def parse_iostat(path: Path, window_fracs: Optional[tuple[float, float]] = None)
     devices: list[dict] = []
     total_mean_write = 0.0
     total_peak_write = 0.0
+    total_mean_read = 0.0
+    total_peak_read = 0.0
 
     for dev in sorted(all_devs):
+        reads: list[float] = []
         writes: list[float] = []
         utils: list[float] = []
         for t in range(start, end):
             if dev in batches[t]:
-                w, u = batches[t][dev]
+                r, w, u = batches[t][dev]
+                reads.append(r)
                 writes.append(w)
                 utils.append(u)
         if not writes:
             continue
+        mean_r = sum(reads) / len(reads)
+        peak_r = max(reads)
         mean_w = sum(writes) / len(writes)
         peak_w = max(writes)
         mean_u = sum(utils) / len(utils)
         peak_u = max(utils)
         if not _iostat_device_is_active(dev, mean_w, peak_w, mean_u, peak_u):
             continue
+        total_mean_read += mean_r
+        total_peak_read += peak_r
         total_mean_write += mean_w
         total_peak_write += peak_w
         devices.append({
             "device":           dev,
+            "mean_read_MBs":    round(mean_r, 1),
+            "peak_read_MBs":    round(peak_r, 1),
             "mean_write_MBs":   round(mean_w, 1),
             "peak_write_MBs":   round(peak_w, 1),
             "mean_util_pct":    round(mean_u, 1),
@@ -523,6 +550,8 @@ def parse_iostat(path: Path, window_fracs: Optional[tuple[float, float]] = None)
 
     return {
         "devices":               devices,
+        "total_mean_read_MBs":   round(total_mean_read, 1),
+        "total_peak_read_MBs":   round(total_peak_read, 1),
         "total_mean_write_MBs":  round(total_mean_write, 1),
         "total_peak_write_MBs":  round(total_peak_write, 1),
     }
@@ -698,16 +727,18 @@ def render_report_md(data: dict) -> str:
         lines.append("")
 
     if dsk:
-        lines += ["## Disk I/O (write)", ""]
+        lines += ["## Disk I/O", ""]
         disk_rows = []
         for node_label, stats in sorted(dsk.items()):
             if not stats:
-                disk_rows.append([node_label, "—", "—", "—", "—", "—", "—"])
+                disk_rows.append([node_label, "—", "—", "—", "—", "—", "—", "—", "—"])
                 continue
             for dev in stats["devices"]:
                 disk_rows.append([
                     node_label,
                     dev["device"],
+                    f"{dev['mean_read_MBs']:.1f}",
+                    f"{dev['peak_read_MBs']:.1f}",
                     f"{dev['mean_write_MBs']:.1f}",
                     f"{dev['peak_write_MBs']:.1f}",
                     f"{dev['mean_util_pct']:.1f}",
@@ -715,7 +746,7 @@ def render_report_md(data: dict) -> str:
                 ])
         if disk_rows:
             lines += _md_table(
-                ["Node", "Device", "Mean Write MB/s", "Peak Write MB/s", "Mean %util", "Peak %util"],
+                ["Node", "Device", "Mean Read MB/s", "Peak Read MB/s", "Mean Write MB/s", "Peak Write MB/s", "Mean %util", "Peak %util"],
                 disk_rows,
             )
             lines.append("")
