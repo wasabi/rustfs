@@ -51,55 +51,77 @@ def _bytefmt_to_mbs(s: str) -> float:
     return float(s) / (1024 * 1024)  # bare bytes
 
 
-# Match per-interval lines: #<testNum>/<loopNum>  <OP>: ... <throughput>/sec, <avg> avgOpMs, <max> maxOpMs
+# Interval line header: #<testNum>/<loopNum> or #<testNum>/AVG
 # The %-4d format left-pads the loop number; we allow whitespace around it.
-# Matches any op type (PUT:, GET:, DEL:, etc.) so non-PUT runs produce valid reports.
-_LOADGEN_PAT = re.compile(
-    r"#\d+/\s*(\d+)\s+"
-    r"[A-Z]+:\s+\d+ objs,\s+\S+/obj,\s+(\S+)/sec,\s+(\d+) avgOpMs,\s+(\d+) maxOpMs"
+_LOADGEN_INTERVAL_HDR = re.compile(r"#\d+/\s*(\d+)\s+")
+_LOADGEN_AVG_HDR = re.compile(r"#\d+/\s*AVG\s+")
+
+# Per-op segment within an interval line. Each line lists every op type; only ops that
+# actually ran have non-zero object counts. The dominant op (most objects) is the one
+# being benchmarked. GET lines include an extra avgTtfbMs field; (?:...)* absorbs it and
+# any future extra XxxMs fields without requiring explicit enumeration.
+_OP_TPUT_PAT = re.compile(
+    r"([A-Z]+):\s+(\d+)\s+objs,\s+"   # OP name + object count
+    r"\S+/obj,\s+"                      # avg object size (discarded)
+    r"(\S+)/sec,\s+"                    # throughput
+    r"(\d+)\s+avgOpMs,\s+"             # avgOpMs
+    r"(?:\d+\s+\w+Ms,\s+)*"           # zero or more extra XxxMs fields (e.g. avgTtfbMs)
+    r"(\d+)\s+maxOpMs"                 # maxOpMs
 )
 
-# When only the summary row is present (#<test>/AVG <OP>: …), e.g. loadgen stdout was
-# block-buffered to tee until SIGTERM dropped earlier interval rows from loadgen.txt.
-_LOADGEN_SUMMARY_AVG_PAT = re.compile(
-    r"#\d+/\s*AVG\s+"
-    r"[A-Z]+:\s+\d+ objs,\s+\S+/obj,\s+(\S+)/sec,\s+(\d+) avgOpMs,\s+(\d+) maxOpMs"
-)
+
+def _parse_loadgen_line(line: str, loop_id: str) -> Optional[dict]:
+    """Parse one interval or AVG line; return a dict or None if no op traffic found.
+
+    Each loadgen line lists every op type regardless of mix.  We find all ops that
+    report throughput (PUT, GET, …) and select the dominant one — the op with the most
+    objects — so a GET run with a small PUT preload correctly reports GET stats.
+    """
+    ops = _OP_TPUT_PAT.findall(line)
+    if not ops:
+        return None
+    # Each match tuple: (op_name, n_objs_str, throughput_str, avg_ms_str, max_ms_str)
+    # Pick the op with the most objects; skip completely idle intervals (all zeros).
+    dominant = max(ops, key=lambda m: int(m[1]))
+    op_name, n_objs_str, throughput_str, avg_ms_str, max_ms_str = dominant
+    if int(n_objs_str) == 0:
+        return None
+    return {
+        "id":            loop_id,
+        "op":            op_name,
+        "throughput_MBs": round(_bytefmt_to_mbs(throughput_str), 1),
+        "avg_op_ms":     int(avg_ms_str),
+        "max_op_ms":     int(max_ms_str),
+    }
 
 
 def parse_loadgen(path: Path) -> list[dict]:
-    """Return list of per-interval dicts with throughput_MBs, avg_op_ms, max_op_ms."""
+    """Return list of per-interval dicts with op, throughput_MBs, avg_op_ms, max_op_ms.
+
+    Each loadgen interval line contains stats for every op type in a single row.
+    The dominant op (highest object count) is selected so that, e.g., a GET run with
+    a small PUT preload reports GET throughput rather than preload PUT throughput.
+    Falls back to the #/AVG summary row when interval rows are absent (e.g. SIGTERM
+    dropped earlier lines from the tee buffer).
+    """
     raw = path.read_text(errors="replace")
     intervals: list[dict] = []
+    avg_entry: Optional[dict] = None
+
     for line in raw.splitlines():
-        m = _LOADGEN_PAT.search(line)
-        if m:
-            loop, throughput_str, avg_ms, max_ms = m.groups()
-            intervals.append(
-                {
-                    "id": loop,
-                    "throughput_MBs": round(_bytefmt_to_mbs(throughput_str), 1),
-                    "avg_op_ms": int(avg_ms),
-                    "max_op_ms": int(max_ms),
-                }
-            )
+        hdr = _LOADGEN_INTERVAL_HDR.search(line)
+        if hdr:
+            entry = _parse_loadgen_line(line, hdr.group(1))
+            if entry:
+                intervals.append(entry)
+            continue
+        if _LOADGEN_AVG_HDR.search(line):
+            avg_entry = _parse_loadgen_line(line, "AVG")
+
     if intervals:
         return intervals
-    # Fallback: one aggregate row printed after PUT traffic (may be the only line left on disk).
-    for line in raw.splitlines():
-        sm = _LOADGEN_SUMMARY_AVG_PAT.search(line)
-        if sm:
-            throughput_str, avg_ms, max_ms = sm.groups()
-            intervals.append(
-                {
-                    "id": "AVG",
-                    "throughput_MBs": round(_bytefmt_to_mbs(throughput_str), 1),
-                    "avg_op_ms": int(avg_ms),
-                    "max_op_ms": int(max_ms),
-                }
-            )
-            break
-    return intervals
+    # Fallback: tee buffer flushed only the summary row before SIGTERM.
+    return [avg_entry] if avg_entry else []
 
 
 # ---------------------------------------------------------------------------
@@ -683,16 +705,17 @@ def render_report_md(data: dict) -> str:
         "",
     ]
     tput_rows = [
-        [iv['id'], f"{iv['throughput_MBs']:.1f}", str(iv['avg_op_ms']), str(iv['max_op_ms'])]
+        [iv['id'], iv.get('op', '—'), f"{iv['throughput_MBs']:.1f}", str(iv['avg_op_ms']), str(iv['max_op_ms'])]
         for iv in lg["intervals"]
     ]
     tput_rows.append([
         "**Mean**",
+        "—",
         f"**{lg['mean_throughput_MBs']:.1f}**",
         f"**{lg['mean_avg_op_ms']:.0f}**",
         "—",
     ])
-    lines += _md_table(["Interval", "MB/s", "avgOpMs", "maxOpMs"], tput_rows)
+    lines += _md_table(["Interval", "Op", "MB/s", "avgOpMs", "maxOpMs"], tput_rows)
     lines.append("")
 
     if net:
