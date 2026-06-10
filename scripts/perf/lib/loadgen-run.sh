@@ -30,6 +30,8 @@ log() { echo "[loadgen] $(date -u '+%H:%M:%S') $*"; }
 # Seed test ID from epoch seconds so each run gets unique bucket names and
 # there is no risk of colliding with a previous run's leftover buckets.
 TEST_ID="$(date +%s)"
+# Allow callers to pin the test ID (e.g. to resume a prior preload pool).
+[[ -n "${LG_TEST_ID:-}" ]] && TEST_ID="$LG_TEST_ID"
 
 log "Starting load generator (duration=${DURATION} test_id=${TEST_ID})..."
 log "Config: ${LOADGEN_CFG}  Endpoint: ${LOADGEN_ENDPOINT:-<from cfg>}"
@@ -48,6 +50,14 @@ log "Config: ${LOADGEN_CFG}  Endpoint: ${LOADGEN_ENDPOINT:-<from cfg>}"
 #   LG_PUTS_PRELOAD integer: pre-populate N objects before the timed phase;
 #                   passed to -puts only when > 0; useful for GET/DELETE runs
 #                   where the pool must exist before the op starts
+#   LG_TEST_ID      override the auto-generated test ID; use to resume a prior
+#                   preload pool (always pair with LG_RESUME=1 and
+#                   LG_NO_DELETE_BUCKETS_BEFORE=1 to avoid silent pool wipe)
+#   LG_SAVE         pass -save to loadgen (saves object map for later resume)
+#   LG_RESUME       pass -resume to loadgen (restores saved object map);
+#                   MUST be paired with LG_NO_DELETE_BUCKETS_BEFORE=1
+#   LG_NO_DELETE_BUCKETS_BEFORE  pass -noDeleteBucketsBefore (skip pre-run wipe)
+#   LG_NO_DELETE_BUCKETS_AFTER   pass -noDeleteBucketsAfter (skip post-run wipe)
 # ---------------------------------------------------------------------------
 
 LG_PUT_PCT="${LG_PUT_PCT:-100}"
@@ -58,6 +68,10 @@ LG_HEAD_PCT="${LG_HEAD_PCT:-0}"
 LG_OBJ_SIZE="${LG_OBJ_SIZE:-0-1500K}"
 LG_THREADS="${LG_THREADS:-100}"
 LG_PUTS_PRELOAD="${LG_PUTS_PRELOAD:-0}"
+LG_SAVE="${LG_SAVE:-0}"
+LG_RESUME="${LG_RESUME:-0}"
+LG_NO_DELETE_BUCKETS_BEFORE="${LG_NO_DELETE_BUCKETS_BEFORE:-0}"
+LG_NO_DELETE_BUCKETS_AFTER="${LG_NO_DELETE_BUCKETS_AFTER:-0}"
 
 # ---------------------------------------------------------------------------
 # Build the loadgen command
@@ -105,6 +119,11 @@ LOADGEN_CMD=(
 if (( LG_PUTS_PRELOAD > 0 )); then
     LOADGEN_CMD+=( -puts "$LG_PUTS_PRELOAD" )
 fi
+
+[[ "$LG_SAVE"                     == "1" ]] && LOADGEN_CMD+=( -save )
+[[ "$LG_RESUME"                   == "1" ]] && LOADGEN_CMD+=( -resume )
+[[ "$LG_NO_DELETE_BUCKETS_BEFORE" == "1" ]] && LOADGEN_CMD+=( -noDeleteBucketsBefore )
+[[ "$LG_NO_DELETE_BUCKETS_AFTER"  == "1" ]] && LOADGEN_CMD+=( -noDeleteBucketsAfter )
 
 # Server endpoint comes from the Server field in LOADGEN_CFG (local.cfg).
 # The binary does not accept a command-line server override flag.
