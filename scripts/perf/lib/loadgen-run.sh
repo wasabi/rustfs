@@ -56,6 +56,8 @@ log "Config: ${LOADGEN_CFG}  Endpoint: ${LOADGEN_ENDPOINT:-<from cfg>}"
 #   LG_SAVE         pass -save to loadgen (saves object map for later resume)
 #   LG_RESUME       pass -resume to loadgen (restores saved object map);
 #                   MUST be paired with LG_NO_DELETE_BUCKETS_BEFORE=1
+#   LG_RESUME_SKIP_CHECK  pass -resumeSkipCheck to loadgen (skip CheckSavedObjects /
+#                   ListObjectsV2 scan on resume; avoids cache re-warm and ~240s hang)
 #   LG_NO_DELETE_BUCKETS_BEFORE  pass -noDeleteBucketsBefore (skip pre-run wipe)
 #   LG_NO_DELETE_BUCKETS_AFTER   pass -noDeleteBucketsAfter (skip post-run wipe)
 # ---------------------------------------------------------------------------
@@ -70,6 +72,7 @@ LG_THREADS="${LG_THREADS:-100}"
 LG_PUTS_PRELOAD="${LG_PUTS_PRELOAD:-0}"
 LG_SAVE="${LG_SAVE:-0}"
 LG_RESUME="${LG_RESUME:-0}"
+LG_RESUME_SKIP_CHECK="${LG_RESUME_SKIP_CHECK:-0}"
 LG_NO_DELETE_BUCKETS_BEFORE="${LG_NO_DELETE_BUCKETS_BEFORE:-0}"
 LG_NO_DELETE_BUCKETS_AFTER="${LG_NO_DELETE_BUCKETS_AFTER:-0}"
 
@@ -122,6 +125,7 @@ fi
 
 [[ "$LG_SAVE"                     == "1" ]] && LOADGEN_CMD+=( -save )
 [[ "$LG_RESUME"                   == "1" ]] && LOADGEN_CMD+=( -resume )
+[[ "$LG_RESUME_SKIP_CHECK"        == "1" ]] && LOADGEN_CMD+=( -resumeSkipCheck )
 [[ "$LG_NO_DELETE_BUCKETS_BEFORE" == "1" ]] && LOADGEN_CMD+=( -noDeleteBucketsBefore )
 [[ "$LG_NO_DELETE_BUCKETS_AFTER"  == "1" ]] && LOADGEN_CMD+=( -noDeleteBucketsAfter )
 
