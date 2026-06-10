@@ -57,7 +57,8 @@ log "Config: ${LOADGEN_CFG}  Endpoint: ${LOADGEN_ENDPOINT:-<from cfg>}"
 #   LG_RESUME       pass -resume to loadgen (restores saved object map);
 #                   MUST be paired with LG_NO_DELETE_BUCKETS_BEFORE=1
 #   LG_RESUME_SKIP_CHECK  pass -resumeSkipCheck to loadgen (skip CheckSavedObjects /
-#                   ListObjectsV2 scan on resume; avoids cache re-warm and ~240s hang)
+#                   ListObjectsV2 scan on both save and resume; required for large
+#                   pools where ListObjectsV2 times out; also avoids cache re-warm)
 #   LG_NO_DELETE_BUCKETS_BEFORE  pass -noDeleteBucketsBefore (skip pre-run wipe)
 #   LG_NO_DELETE_BUCKETS_AFTER   pass -noDeleteBucketsAfter (skip post-run wipe)
 # ---------------------------------------------------------------------------
