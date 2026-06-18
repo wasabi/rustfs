@@ -129,7 +129,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, debug_span, error, info, instrument, warn};
+use tracing::Instrument;
 use uuid::Uuid;
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
@@ -2317,7 +2318,9 @@ impl DefaultObjectUsecase {
         let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
         // mc get 3
 
-        let request_context = Self::prepare_get_object_request_context(&req).await?;
+        let request_context = Self::prepare_get_object_request_context(&req)
+            .instrument(debug_span!(target: "rustfs_get_trace", "get.pre_dispatch"))
+            .await?;
         let GetObjectRequestContext {
             bucket,
             key,

@@ -16,6 +16,7 @@ use super::*;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::future::Future;
 use tokio::task::JoinSet;
+use tracing::{Instrument, debug_span};
 
 async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
@@ -235,17 +236,31 @@ impl SetDisks {
             let bucket = bucket.clone();
             let object = object.clone();
             let version_id = version_id.clone();
-            tokio::spawn(async move {
-                if let Some(disk) = disk {
-                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
-                } else {
-                    Err(DiskError::DiskNotFound)
+            let spawn_time = std::time::Instant::now();
+            let xl_task_span = debug_span!(
+                target: "rustfs_get_trace", "get.xl_task",
+                sched_us = tracing::field::Empty
+            );
+            let xl_task_span_inner = xl_task_span.clone();
+            tokio::spawn(
+                async move {
+                    xl_task_span_inner.record("sched_us", spawn_time.elapsed().as_micros());
+                    if let Some(disk) = disk {
+                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts)
+                            .instrument(debug_span!(target: "rustfs_get_trace", "get.xl_disk_read"))
+                            .await
+                    } else {
+                        Err(DiskError::DiskNotFound)
+                    }
                 }
-            })
+                .instrument(xl_task_span),
+            )
         });
 
         // Wait for all tasks to complete
-        let results = join_all(futures).await;
+        let results = join_all(futures)
+            .instrument(debug_span!(target: "rustfs_get_trace", "get.xl_fanout"))
+            .await;
 
         for result in results {
             match result {
@@ -547,7 +562,11 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
-        let disks = self.disks.read().await;
+        let disks = self
+            .disks
+            .read()
+            .instrument(debug_span!(target: "rustfs_get_trace", "get.disks_lock"))
+            .await;
 
         let disks = disks.clone();
 
@@ -561,36 +580,42 @@ impl SetDisks {
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
-        let (read_quorum, _) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
-            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // error!("Self::object_quorum_from_meta: {:?}, bucket: {}, object: {}", &e, bucket, object);
-                return Err(e);
+        let (fi, op_online_disks) = async {
+            let (read_quorum, _) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
+                .map_err(|err| to_object_err(err.into(), vec![bucket, object]))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // error!("Self::object_quorum_from_meta: {:?}, bucket: {}, object: {}", &e, bucket, object);
+                    return Err(e);
+                }
+            };
+
+            if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum as usize) {
+                error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
+                return Err(to_object_err(err.into(), vec![bucket, object]));
             }
-        };
 
-        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum as usize) {
-            error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
-            return Err(to_object_err(err.into(), vec![bucket, object]));
+            let (op_online_disks, mot_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum as usize);
+
+            let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, read_quorum as usize)?;
+            if errs.iter().any(|err| err.is_some()) {
+                let _ =
+                    rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
+                        fi.volume.to_string(),             // bucket
+                        Some(fi.name.to_string()),         // object_prefix
+                        false,                             // force_start
+                        Some(HealChannelPriority::Normal), // priority
+                        Some(self.pool_index),             // pool_index
+                        Some(self.set_index),              // set_index
+                    ))
+                    .await;
+            }
+            Ok((fi, op_online_disks))
         }
+        .instrument(debug_span!(target: "rustfs_get_trace", "get.xl_postfanout"))
+        .await?;
 
-        let (op_online_disks, mot_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum as usize);
-
-        let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, read_quorum as usize)?;
-        if errs.iter().any(|err| err.is_some()) {
-            let _ =
-                rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                    fi.volume.to_string(),             // bucket
-                    Some(fi.name.to_string()),         // object_prefix
-                    false,                             // force_start
-                    Some(HealChannelPriority::Normal), // priority
-                    Some(self.pool_index),             // pool_index
-                    Some(self.set_index),              // set_index
-                ))
-                .await;
-        }
         // debug!("get_object_fileinfo pick fi {:?}", &fi);
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
@@ -755,37 +780,42 @@ impl SetDisks {
             // Default: enabled (true) for performance
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
-            let mut readers = Vec::with_capacity(disks.len());
-            let mut errors = Vec::with_capacity(disks.len());
-            for (idx, disk_op) in disks.iter().enumerate() {
-                match create_bitrot_reader(
-                    files[idx].data.as_deref(),
-                    disk_op.as_ref(),
-                    bucket,
-                    &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
-                    read_offset,
-                    till_offset.saturating_sub(read_offset),
-                    erasure.shard_size(),
-                    checksum_algo.clone(),
-                    skip_verify_bitrot,
-                    use_zero_copy,
-                )
-                .await
-                {
-                    Ok(Some(reader)) => {
-                        readers.push(Some(reader));
-                        errors.push(None);
-                    }
-                    Ok(None) => {
-                        readers.push(None);
-                        errors.push(Some(DiskError::DiskNotFound));
-                    }
-                    Err(e) => {
-                        readers.push(None);
-                        errors.push(Some(e));
+            let (readers, errors) = async {
+                let mut readers = Vec::with_capacity(disks.len());
+                let mut errors = Vec::with_capacity(disks.len());
+                for (idx, disk_op) in disks.iter().enumerate() {
+                    let result = create_bitrot_reader(
+                        files[idx].data.as_deref(),
+                        disk_op.as_ref(),
+                        bucket,
+                        &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
+                        read_offset,
+                        till_offset.saturating_sub(read_offset),
+                        erasure.shard_size(),
+                        checksum_algo.clone(),
+                        skip_verify_bitrot,
+                        use_zero_copy,
+                    )
+                    .await;
+                    match result {
+                        Ok(Some(reader)) => {
+                            readers.push(Some(reader));
+                            errors.push(None);
+                        }
+                        Ok(None) => {
+                            readers.push(None);
+                            errors.push(Some(DiskError::DiskNotFound));
+                        }
+                        Err(e) => {
+                            readers.push(None);
+                            errors.push(Some(e));
+                        }
                     }
                 }
+                (readers, errors)
             }
+            .instrument(debug_span!(target: "rustfs_get_trace", "get.shard_setup"))
+            .await;
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < erasure.data_shards {
@@ -854,7 +884,9 @@ impl SetDisks {
             //     "read part {} part_offset {},part_length {},part_size {}  ",
             //     part_number, part_offset, part_length, part_size
             // );
-            let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
+            let (written, err) = erasure
+                .decode(writer, readers, part_offset, part_length, part_size)
+                .await;
             debug!(
                 bucket,
                 object,

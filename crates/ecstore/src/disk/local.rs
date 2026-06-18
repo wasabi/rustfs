@@ -59,7 +59,7 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::sync::RwLock;
 use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, debug_span, error, info, warn};
 use uuid::Uuid;
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
@@ -1027,40 +1027,53 @@ impl LocalDisk {
         volume_dir: impl AsRef<Path>,
         file_path: impl AsRef<Path>,
     ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-        let mut f = match super::fs::open_file(file_path.as_ref(), O_RDONLY).await {
-            Ok(f) => f,
-            Err(e) => {
-                if e.kind() == ErrorKind::NotFound
-                    && !skip_access_checks(volume)
-                    && let Err(er) = access(volume_dir.as_ref()).await
-                    && er.kind() == ErrorKind::NotFound
-                {
-                    warn!("read_all_data_with_dmtime os err {:?}", &er);
-                    return Err(DiskError::VolumeNotFound);
+        let volume = volume.to_string();
+        let volume_dir = volume_dir.as_ref().to_path_buf();
+        let file_path = file_path.as_ref().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let mut f = {
+                let _span = debug_span!(target: "rustfs_get_trace", "get.xl_fs_open").entered();
+                match std::fs::File::open(&file_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::NotFound && !skip_access_checks(&volume) {
+                            if let Err(er) = std::fs::metadata(&volume_dir) {
+                                if er.kind() == std::io::ErrorKind::NotFound {
+                                    warn!("read_all_data_with_dmtime os err {:?}", &er);
+                                    return Err(DiskError::VolumeNotFound);
+                                }
+                            }
+                        }
+                        return Err(to_file_error(e).into());
+                    }
                 }
+            };
 
-                return Err(to_file_error(e).into());
+            let meta = {
+                let _span = debug_span!(target: "rustfs_get_trace", "get.xl_fs_stat").entered();
+                f.metadata().map_err(to_file_error).map_err(DiskError::from)?
+            };
+
+            if meta.is_dir() {
+                return Err(DiskError::FileNotFound);
             }
-        };
 
-        let meta = f.metadata().await.map_err(to_file_error)?;
+            let size = meta.len() as usize;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(size).map_err(Error::other)?;
 
-        if meta.is_dir() {
-            return Err(DiskError::FileNotFound);
-        }
+            {
+                let _span = debug_span!(target: "rustfs_get_trace", "get.xl_fs_read").entered();
+                use std::io::Read;
+                f.read_to_end(&mut bytes).map_err(to_file_error).map_err(DiskError::from)?;
+            }
 
-        let size = meta.len() as usize;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(size).map_err(Error::other)?;
-
-        f.read_to_end(&mut bytes).await.map_err(to_file_error)?;
-
-        let modtime = match meta.modified() {
-            Ok(md) => Some(OffsetDateTime::from(md)),
-            Err(_) => None,
-        };
-
-        Ok((bytes, modtime))
+            let modtime = meta.modified().ok().map(OffsetDateTime::from);
+            Ok((bytes, modtime))
+        })
+        .await
+        .map_err(DiskError::from)?
     }
 
     async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &[FileInfo]) -> Result<()> {
@@ -2229,7 +2242,7 @@ impl DiskAPI for LocalDisk {
             let file_path_clone = file_path.clone();
 
             let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
-            let bytes = tokio::task::spawn_blocking(move || {
+            let (bytes, blocking_done) = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
 
                 #[cfg(target_os = "macos")]
@@ -2266,7 +2279,10 @@ impl DiskAPI for LocalDisk {
                 let end = logical_offset
                     .checked_add(length)
                     .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
+                let mmap_copy_start = Instant::now();
                 let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
+                let mmap_copy_us = mmap_copy_start.elapsed().as_micros();
+                debug!(target: "rustfs_get_trace", mmap_copy_us = mmap_copy_us, length = length, "mmap_copy");
 
                 #[cfg(target_os = "linux")]
                 if should_reclaim_after_read {
@@ -2280,10 +2296,13 @@ impl DiskAPI for LocalDisk {
                         .map_err(DiskError::from)?;
                 }
 
-                Ok::<Bytes, DiskError>(bytes)
+                Ok::<(Bytes, Instant), DiskError>((bytes, Instant::now()))
             })
             .await
             .map_err(DiskError::from)??;
+
+            let mmap_repoll_us = blocking_done.elapsed().as_micros();
+            debug!(target: "rustfs_get_trace", mmap_repoll_us = mmap_repoll_us, "mmap_repoll");
 
             // Log successful mmap read metrics
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -2792,6 +2811,7 @@ impl DiskAPI for LocalDisk {
 
         let (data, _) = self
             .read_raw(volume, volume_dir.clone(), file_path, read_data)
+            .instrument(debug_span!(target: "rustfs_get_trace", "get.xl_meta_read"))
             .await
             .map_err(|e| {
                 if e == DiskError::FileNotFound && !version_id.is_empty() {
