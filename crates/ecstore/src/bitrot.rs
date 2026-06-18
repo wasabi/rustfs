@@ -21,6 +21,19 @@ use std::time::Instant;
 use tokio::io::AsyncRead;
 use tracing::debug;
 
+/// Adjusts a raw (offset, length) pair to account for per-shard checksum overhead.
+/// Returns (adjusted_offset, adjusted_length).
+pub fn adjust_shard_read_params(
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    checksum_algo: &HashAlgorithm,
+) -> (usize, usize) {
+    let adj_len = length.div_ceil(shard_size) * checksum_algo.size() + length;
+    let adj_off = offset.div_ceil(shard_size) * checksum_algo.size() + offset;
+    (adj_off, adj_len)
+}
+
 /// Create a BitrotReader from either inline data or disk file stream
 ///
 /// # Parameters
@@ -48,8 +61,7 @@ pub async fn create_bitrot_reader(
     use_zero_copy: bool,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
     // Calculate the total length to read, including the checksum overhead
-    let length = length.div_ceil(shard_size) * checksum_algo.size() + length;
-    let offset = offset.div_ceil(shard_size) * checksum_algo.size() + offset;
+    let (offset, length) = adjust_shard_read_params(offset, length, shard_size, &checksum_algo);
     if let Some(data) = inline_data {
         // Use inline data
         let mut rd = Cursor::new(Bytes::copy_from_slice(data));

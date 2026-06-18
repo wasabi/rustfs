@@ -293,7 +293,7 @@ fn should_reclaim_file_cache_after_write(file_size: i64) -> bool {
     file_size as usize >= threshold
 }
 
-fn should_reclaim_file_cache_after_read(length: usize) -> bool {
+pub(crate) fn should_reclaim_file_cache_after_read(length: usize) -> bool {
     if length == 0 {
         return false;
     }
@@ -3125,6 +3125,73 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
     };
 
     Ok((disk_info, root_drive))
+}
+
+/// Reads N shard files in a single blocking thread.
+/// Each request is (file_path, offset, length, should_reclaim).
+/// Returns Vec<Result<Bytes>> in the same order.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) async fn batch_mmap_read(
+    requests: Vec<(std::path::PathBuf, usize, usize, bool)>,
+) -> Vec<crate::disk::error::Result<bytes::Bytes>> {
+    use tracing::debug;
+    let n = requests.len();
+    tokio::task::spawn_blocking(move || {
+        use memmap2::MmapOptions;
+        use std::time::Instant;
+        let batch_start = Instant::now();
+        let page_size = {
+            let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if ps <= 0 { 4096u64 } else { ps as u64 }
+        };
+        let mut results = Vec::with_capacity(n);
+        for (file_path, offset, length, _should_reclaim) in requests {
+            let r = (|| -> crate::disk::error::Result<bytes::Bytes> {
+                let meta = std::fs::metadata(&file_path).map_err(DiskError::from)?;
+                let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+                if meta.len() < end as u64 { return Err(DiskError::FileCorrupt); }
+                let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
+                let offset_u64 = offset as u64;
+                let aligned = offset_u64 - (offset_u64 % page_size);
+                let logical = (offset_u64 - aligned) as usize;
+                let map_len = logical.checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap length overflow"))?;
+                let mmap = unsafe {
+                    MmapOptions::new().offset(aligned).len(map_len).map(&file)
+                }.map_err(DiskError::other)?;
+                let slice_end = logical.checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap slice overflow"))?;
+                let bytes = bytes::Bytes::copy_from_slice(&mmap[logical..slice_end]);
+                #[cfg(target_os = "linux")]
+                if _should_reclaim {
+                    use core::num::NonZeroU64;
+                    use rustix::fs::{Advice, fadvise};
+                    if let Some(rl) = NonZeroU64::new(map_len as u64) {
+                        let _ = fadvise(&file, aligned, Some(rl), Advice::DontNeed);
+                    }
+                }
+                Ok(bytes)
+            })();
+            results.push(r);
+        }
+        let batch_blocking_done = Instant::now();
+        let batch_blocking_us = batch_start.elapsed().as_micros();
+        debug!(target: "rustfs_get_trace",
+               batch_blocking_us = batch_blocking_us, n = n, "poc4_batch_blocking");
+        (results, batch_blocking_done)
+    })
+    .await
+    .map(|(results, blocking_done)| {
+        let poc4_repoll_us = blocking_done.elapsed().as_micros();
+        tracing::debug!(target: "rustfs_get_trace",
+                        poc4_repoll_us = poc4_repoll_us, n = n, "poc4_repoll");
+        results
+    })
+    .unwrap_or_else(|e| {
+        let msg = format!("spawn_blocking join: {e}");
+        (0..n).map(|_| Err(DiskError::other(msg.clone()))).collect()
+    })
 }
 
 #[cfg(test)]

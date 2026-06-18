@@ -470,6 +470,17 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.enable_health_check(),
         }
     }
+
+    pub fn get_object_path_if_local(
+        &self,
+        volume: &str,
+        path: &str,
+    ) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_object_path_if_local(volume, path)),
+            Disk::Remote(_) => None,
+        }
+    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
