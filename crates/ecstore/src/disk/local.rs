@@ -2197,11 +2197,8 @@ impl DiskAPI for LocalDisk {
         Ok(Box::new(FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop)))
     }
 
-    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
+    /// File read using pread (Unix) or efficient read (non-Unix).
     /// Returns Bytes that can be shared without copying.
-    // SAFETY: Unix unsafe calls in this function only query page size and mmap
-    // a read-only file region after bounds and alignment are validated.
-    #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         let volume_dir = self.get_bucket_path(volume)?;
@@ -2231,70 +2228,28 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileCorrupt);
         }
 
-        // Unix: use mmap to read the data (copies into Bytes for safe ownership)
-        // Non-Unix: fall back to efficient read
+        // Unix: use pread (read_at) to read the data without mmap overhead.
+        // Non-Unix: fall back to efficient read.
         #[cfg(unix)]
         {
-            use memmap2::MmapOptions;
+            use std::os::unix::fs::FileExt;
             use std::time::Instant;
 
             let start = Instant::now();
             let file_path_clone = file_path.clone();
 
-            let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
             let (bytes, blocking_done) = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
 
-                #[cfg(target_os = "macos")]
-                if should_reclaim_after_read {
-                    let _ = set_std_fd_nocache(&file);
-                }
-
-                // mmap offsets on Unix must be page-size aligned. Align the
-                // mapping down to the nearest page boundary, then slice out the
-                // originally requested logical range.
-                // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and
-                // only queries process-global OS configuration.
-                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-                if page_size <= 0 {
-                    return Err(DiskError::other("failed to determine system page size"));
-                }
-                let page_size = page_size as u64;
-                let offset_u64 = offset as u64;
-                let aligned_offset = offset_u64 - (offset_u64 % page_size);
-                let logical_offset = (offset_u64 - aligned_offset) as usize;
-                let map_len = logical_offset
-                    .checked_add(length)
-                    .ok_or_else(|| DiskError::other("mmap length overflow"))?;
-
-                // SAFETY: The file is opened as read-only, and we're mapping a region
-                // that we've already verified exists and is within file bounds. The
-                // file offset passed to mmap is page-size aligned as required on Unix.
-                let mmap =
-                    unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(&file) }.map_err(DiskError::other)?;
-
-                // Copy only the requested logical range into a Bytes buffer. This
-                // avoids undefined behavior from treating OS-managed mmap memory as
-                // allocator-managed Vec storage, at the cost of an extra copy.
-                let end = logical_offset
-                    .checked_add(length)
-                    .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
-                let mmap_copy_start = Instant::now();
-                let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
-                let mmap_copy_us = mmap_copy_start.elapsed().as_micros();
-                debug!(target: "rustfs_get_trace", mmap_copy_us = mmap_copy_us, length = length, "mmap_copy");
-
-                #[cfg(target_os = "linux")]
-                if should_reclaim_after_read {
-                    use core::num::NonZeroU64;
-                    use rustix::fs::{Advice, fadvise};
-
-                    let reclaim_len =
-                        NonZeroU64::new(map_len as u64).ok_or_else(|| DiskError::other("mmap reclaim length overflow"))?;
-                    fadvise(&file, aligned_offset, Some(reclaim_len), Advice::DontNeed)
-                        .map_err(std::io::Error::from)
+                let mut buf = vec![0u8; length];
+                let mut total = 0usize;
+                while total < length {
+                    let nbytes = file.read_at(&mut buf[total..], (offset + total) as u64)
                         .map_err(DiskError::from)?;
+                    if nbytes == 0 { return Err(DiskError::FileCorrupt); }
+                    total += nbytes;
                 }
+                let bytes = Bytes::from(buf);
 
                 Ok::<(Bytes, Instant), DiskError>((bytes, Instant::now()))
             })
@@ -2304,10 +2259,8 @@ impl DiskAPI for LocalDisk {
             let mmap_repoll_us = blocking_done.elapsed().as_micros();
             debug!(target: "rustfs_get_trace", mmap_repoll_us = mmap_repoll_us, "mmap_repoll");
 
-            // Log successful mmap read metrics
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-            // Record mmap read metrics
             rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
 
             debug!(size = length, duration_ms = duration_ms, "mmap_read_success");
@@ -3131,48 +3084,56 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 /// Each request is (file_path, offset, length, should_reclaim).
 /// Returns Vec<Result<Bytes>> in the same order.
 #[cfg(unix)]
-#[allow(unsafe_code)]
 pub(crate) async fn batch_mmap_read(
     requests: Vec<(std::path::PathBuf, usize, usize, bool)>,
 ) -> Vec<crate::disk::error::Result<bytes::Bytes>> {
     use tracing::debug;
     let n = requests.len();
     tokio::task::spawn_blocking(move || {
-        use memmap2::MmapOptions;
+        use std::os::unix::fs::FileExt;
         use std::time::Instant;
         let batch_start = Instant::now();
-        let page_size = {
-            let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            if ps <= 0 { 4096u64 } else { ps as u64 }
-        };
         let mut results = Vec::with_capacity(n);
-        for (file_path, offset, length, _should_reclaim) in requests {
+        for (i, (file_path, offset, length, _should_reclaim)) in
+            requests.into_iter().enumerate()
+        {
+            let mut stat_us: u128 = 0;
+            let mut open_us: u128 = 0;
+            let mut pread_us: u128 = 0;
+
             let r = (|| -> crate::disk::error::Result<bytes::Bytes> {
+                let t = Instant::now();
                 let meta = std::fs::metadata(&file_path).map_err(DiskError::from)?;
+                stat_us = t.elapsed().as_micros();
+
                 let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
                 if meta.len() < end as u64 { return Err(DiskError::FileCorrupt); }
+
+                let t = Instant::now();
                 let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
-                let offset_u64 = offset as u64;
-                let aligned = offset_u64 - (offset_u64 % page_size);
-                let logical = (offset_u64 - aligned) as usize;
-                let map_len = logical.checked_add(length)
-                    .ok_or_else(|| DiskError::other("mmap length overflow"))?;
-                let mmap = unsafe {
-                    MmapOptions::new().offset(aligned).len(map_len).map(&file)
-                }.map_err(DiskError::other)?;
-                let slice_end = logical.checked_add(length)
-                    .ok_or_else(|| DiskError::other("mmap slice overflow"))?;
-                let bytes = bytes::Bytes::copy_from_slice(&mmap[logical..slice_end]);
-                #[cfg(target_os = "linux")]
-                if _should_reclaim {
-                    use core::num::NonZeroU64;
-                    use rustix::fs::{Advice, fadvise};
-                    if let Some(rl) = NonZeroU64::new(map_len as u64) {
-                        let _ = fadvise(&file, aligned, Some(rl), Advice::DontNeed);
-                    }
+                open_us = t.elapsed().as_micros();
+
+                let mut buf = vec![0u8; length];
+                let t = Instant::now();
+                let mut total = 0usize;
+                while total < length {
+                    let nbytes = file.read_at(&mut buf[total..], (offset + total) as u64)
+                        .map_err(DiskError::from)?;
+                    if nbytes == 0 { return Err(DiskError::FileCorrupt); }
+                    total += nbytes;
                 }
+                pread_us = t.elapsed().as_micros();
+                let bytes = bytes::Bytes::from(buf);
                 Ok(bytes)
             })();
+
+            debug!(target: "rustfs_get_trace",
+                   i = i, poc4_stat_us = stat_us, "poc4_stat");
+            debug!(target: "rustfs_get_trace",
+                   i = i, poc4_open_us = open_us, "poc4_open");
+            debug!(target: "rustfs_get_trace",
+                   i = i, poc5_pread_us = pread_us, "poc5_pread");
+
             results.push(r);
         }
         let batch_blocking_done = Instant::now();
