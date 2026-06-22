@@ -2237,8 +2237,6 @@ impl DiskAPI for LocalDisk {
             let start = Instant::now();
             let file_path_clone = file_path.clone();
 
-            let should_reclaim = should_reclaim_file_cache_after_read(length);
-
             let bytes = tokio::task::spawn_blocking(move || {
                 use std::os::unix::fs::FileExt;
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
@@ -2256,7 +2254,7 @@ impl DiskAPI for LocalDisk {
                 }
 
                 #[cfg(target_os = "linux")]
-                if should_reclaim {
+                if should_reclaim_file_cache_after_read(length) {
                     use core::num::NonZeroU64;
                     use rustix::fs::{Advice, fadvise};
                     if let Some(reclaim_len) = NonZeroU64::new(length as u64) {

@@ -782,102 +782,108 @@ impl SetDisks {
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
             let (readers, errors) = async {
-                use crate::bitrot::adjust_shard_read_params;
-                use crate::disk::local::batch_shard_pread;
+                // Unix fast-path: batch all local shard reads into one spawn_blocking.
+                // cfg-gated because batch_shard_pread and adjust_shard_read_params are
+                // unix-only. Falls through to the sequential path on non-unix or when
+                // any shard is inline / not local.
+                #[cfg(unix)]
+                {
+                    use crate::bitrot::adjust_shard_read_params;
+                    use crate::disk::local::batch_shard_pread;
 
-                // Batch fast-path: all disks local, zero-copy enabled, no inline shards.
-                let mut batch_items: Vec<(usize, std::path::PathBuf, usize, usize)> = Vec::new();
-                let mut can_batch = use_zero_copy;
-                let mut readers: Vec<_> = (0..disks.len()).map(|_| None).collect();
-                let mut errors: Vec<_> = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect();
+                    let mut batch_items: Vec<(usize, std::path::PathBuf, usize, usize)> = Vec::new();
+                    let mut can_batch = use_zero_copy;
+                    let mut readers: Vec<_> = (0..disks.len()).map(|_| None).collect();
+                    let mut errors: Vec<_> = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect();
 
-                if can_batch {
-                    for (idx, disk_op) in disks.iter().enumerate() {
-                        if files[idx].data.is_some() {
-                            // Inline shard — fall back to sequential path.
-                            can_batch = false;
-                            break;
-                        } else if let Some(disk) = disk_op.as_ref() {
-                            let path_str = format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number);
-                            let (adj_off, adj_len) = adjust_shard_read_params(
-                                read_offset,
-                                till_offset.saturating_sub(read_offset),
-                                erasure.shard_size(),
-                                &checksum_algo,
-                            );
-                            match disk.get_object_path_if_local(bucket, &path_str) {
-                                Some(Ok(p)) => {
-                                    batch_items.push((idx, p, adj_off, adj_len));
-                                }
-                                _ => {
-                                    can_batch = false;
-                                    break;
-                                }
-                            }
-                        }
-                        // disk_op is None → stays DiskNotFound (valid: missing/offline shard)
-                    }
-                }
-
-                if can_batch && !batch_items.is_empty() {
-                    // One spawn_blocking for all shard reads.
-                    let requests: Vec<_> = batch_items.iter().map(|(_, p, off, len)| (p.clone(), *off, *len)).collect();
-                    let batch_results = batch_shard_pread(requests).await;
-
-                    for (i, (idx, _, _, _)) in batch_items.iter().enumerate() {
-                        match &batch_results[i] {
-                            Ok(bytes) => {
-                                use crate::erasure_coding::BitrotReader;
-                                let rd = std::io::Cursor::new(bytes.clone());
-                                readers[*idx] = Some(BitrotReader::new(
-                                    Box::new(rd) as Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>,
+                    if can_batch {
+                        for (idx, disk_op) in disks.iter().enumerate() {
+                            if files[idx].data.is_some() {
+                                // Inline shard — fall back to sequential path.
+                                can_batch = false;
+                                break;
+                            } else if let Some(disk) = disk_op.as_ref() {
+                                let path_str = format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number);
+                                let (adj_off, adj_len) = adjust_shard_read_params(
+                                    read_offset,
+                                    till_offset.saturating_sub(read_offset),
                                     erasure.shard_size(),
-                                    checksum_algo.clone(),
-                                    skip_verify_bitrot,
-                                ));
-                                errors[*idx] = None;
+                                    &checksum_algo,
+                                );
+                                match disk.get_object_path_if_local(bucket, &path_str) {
+                                    Some(Ok(p)) => {
+                                        batch_items.push((idx, p, adj_off, adj_len));
+                                    }
+                                    _ => {
+                                        can_batch = false;
+                                        break;
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                errors[*idx] = Some(e.clone());
-                            }
+                            // disk_op is None → stays DiskNotFound (valid: missing/offline shard)
                         }
                     }
-                    (readers, errors)
-                } else {
-                    // Sequential fallback (existing logic, unchanged).
-                    let mut readers = Vec::with_capacity(disks.len());
-                    let mut errors = Vec::with_capacity(disks.len());
-                    for (idx, disk_op) in disks.iter().enumerate() {
-                        match create_bitrot_reader(
-                            files[idx].data.as_deref(),
-                            disk_op.as_ref(),
-                            bucket,
-                            &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
-                            read_offset,
-                            till_offset.saturating_sub(read_offset),
-                            erasure.shard_size(),
-                            checksum_algo.clone(),
-                            skip_verify_bitrot,
-                            use_zero_copy,
-                        )
-                        .await
-                        {
-                            Ok(Some(r)) => {
-                                readers.push(Some(r));
-                                errors.push(None);
-                            }
-                            Ok(None) => {
-                                readers.push(None);
-                                errors.push(Some(DiskError::DiskNotFound));
-                            }
-                            Err(e) => {
-                                readers.push(None);
-                                errors.push(Some(e));
+
+                    if can_batch && !batch_items.is_empty() {
+                        // One spawn_blocking for all shard reads.
+                        let requests: Vec<_> = batch_items.iter().map(|(_, p, off, len)| (p.clone(), *off, *len)).collect();
+                        let batch_results = batch_shard_pread(requests).await;
+
+                        for (i, (idx, _, _, _)) in batch_items.iter().enumerate() {
+                            match &batch_results[i] {
+                                Ok(bytes) => {
+                                    use crate::erasure_coding::BitrotReader;
+                                    let rd = std::io::Cursor::new(bytes.clone());
+                                    readers[*idx] = Some(BitrotReader::new(
+                                        Box::new(rd) as Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>,
+                                        erasure.shard_size(),
+                                        checksum_algo.clone(),
+                                        skip_verify_bitrot,
+                                    ));
+                                    errors[*idx] = None;
+                                }
+                                Err(e) => {
+                                    errors[*idx] = Some(e.clone());
+                                }
                             }
                         }
+                        return (readers, errors);
                     }
-                    (readers, errors)
                 }
+
+                // Sequential fallback (existing logic, unchanged).
+                let mut readers = Vec::with_capacity(disks.len());
+                let mut errors = Vec::with_capacity(disks.len());
+                for (idx, disk_op) in disks.iter().enumerate() {
+                    match create_bitrot_reader(
+                        files[idx].data.as_deref(),
+                        disk_op.as_ref(),
+                        bucket,
+                        &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
+                        read_offset,
+                        till_offset.saturating_sub(read_offset),
+                        erasure.shard_size(),
+                        checksum_algo.clone(),
+                        skip_verify_bitrot,
+                        use_zero_copy,
+                    )
+                    .await
+                    {
+                        Ok(Some(r)) => {
+                            readers.push(Some(r));
+                            errors.push(None);
+                        }
+                        Ok(None) => {
+                            readers.push(None);
+                            errors.push(Some(DiskError::DiskNotFound));
+                        }
+                        Err(e) => {
+                            readers.push(None);
+                            errors.push(Some(e));
+                        }
+                    }
+                }
+                (readers, errors)
             }
             .instrument(debug_span!(target: "rustfs_get_trace", "get.shard_setup"))
             .await;

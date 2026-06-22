@@ -23,7 +23,7 @@ use tracing::debug;
 
 /// Adjusts a raw (offset, length) pair to account for per-shard checksum overhead.
 /// Returns (adjusted_offset, adjusted_length).
-pub fn adjust_shard_read_params(
+pub(crate) fn adjust_shard_read_params(
     offset: usize,
     length: usize,
     shard_size: usize,
