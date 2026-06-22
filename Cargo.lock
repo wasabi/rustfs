@@ -9574,7 +9574,6 @@ dependencies = [
  "lazy_static",
  "libc",
  "md-5 0.11.0",
- "memmap2 0.9.10",
  "metrics",
  "num_cpus",
  "opentelemetry 0.32.0",
