@@ -803,7 +803,8 @@ impl SetDisks {
                                 can_batch = false;
                                 break;
                             } else if let Some(disk) = disk_op.as_ref() {
-                                let path_str = format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number);
+                                let path_str =
+                                    format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number);
                                 let (adj_off, adj_len) = adjust_shard_read_params(
                                     read_offset,
                                     till_offset.saturating_sub(read_offset),
