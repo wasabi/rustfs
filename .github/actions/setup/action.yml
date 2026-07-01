@@ -75,6 +75,31 @@ runs:
     - name: Configure user-writable Rust paths
       uses: ./.github/actions/rust-paths
 
+    - name: Set CARGO_BUILD_JOBS from runner resources
+      shell: bash
+      run: bash "${GITHUB_WORKSPACE}/scripts/ci/compute-cargo-build-jobs.sh"
+
+    - name: Enable lab sccache (self-hosted)
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -f /usr/local/share/lab/lab-rust-sccache-env.sh ]]; then
+          # shellcheck disable=SC1091
+          source /usr/local/share/lab/lab-rust-sccache-env.sh
+        elif [[ -f scripts/lab-sccache-env.sh ]]; then
+          # shellcheck disable=SC1091
+          source scripts/lab-sccache-env.sh
+        fi
+        if [[ -n "${GITHUB_ENV:-}" ]]; then
+          [[ -n "${RUSTC_WRAPPER:-}" ]] && echo "RUSTC_WRAPPER=${RUSTC_WRAPPER}" >>"$GITHUB_ENV"
+          [[ -n "${CARGO_BUILD_RUSTC_WRAPPER:-}" ]] && echo "CARGO_BUILD_RUSTC_WRAPPER=${CARGO_BUILD_RUSTC_WRAPPER}" >>"$GITHUB_ENV"
+          [[ -n "${SCCACHE_REDIS:-}" ]] && echo "SCCACHE_REDIS=${SCCACHE_REDIS}" >>"$GITHUB_ENV"
+        fi
+        if command -v sccache >/dev/null 2>&1; then
+          sccache --show-stats || true
+        fi
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
