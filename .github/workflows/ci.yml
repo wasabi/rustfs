@@ -98,6 +98,7 @@ jobs:
     runs-on: [self-hosted, lab-small]
     steps:
       - uses: actions/checkout@v6
+      - uses: ./.github/actions/rust-paths
       - uses: dtolnay/rust-toolchain@stable
       - name: Typos check with custom config file
         uses: crate-ci/typos@master
@@ -195,6 +196,9 @@ jobs:
 
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
+
+      - name: Configure user-writable Rust paths
+        uses: ./.github/actions/rust-paths
 
       - name: Setup Rust toolchain for s3s-e2e installation
         uses: dtolnay/rust-toolchain@stable
