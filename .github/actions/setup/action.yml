@@ -71,6 +71,10 @@ runs:
       with:
         version: "25.12.19"
 
+    # Lab runners ship root-owned /usr/local/{rustup,cargo}; rustup cannot update toolchains there.
+    - name: Configure user-writable Rust paths
+      uses: ./.github/actions/rust-paths
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
