@@ -1362,13 +1362,11 @@ impl LocalDisk {
                     continue;
                 }
 
-                let metadata = self
-                    .read_metadata(bucket, format!("{}/{}", &current, &entry).as_str())
-                    .await?;
+                let metadata = self.read_metadata(bucket, format!("{}/{}", current, entry).as_str()).await?;
 
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
-                let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
+                let name = decode_dir_object(format!("{}/{}", current, name).as_str());
 
                 // if opts.limit > 0
                 //     && let Ok(meta) = FileMeta::load(&metadata)
@@ -1465,7 +1463,7 @@ impl LocalDisk {
                 meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
             }
 
-            let fname = format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE);
+            let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
 
             match self.read_metadata(&opts.bucket, fname.as_str()).await {
                 Ok(res) => {
@@ -2441,8 +2439,8 @@ impl DiskAPI for LocalDisk {
         }
 
         // xl.meta path
-        let src_file_path = self.get_object_path(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str())?;
-        let dst_file_path = self.get_object_path(dst_volume, format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str())?;
+        let src_file_path = self.get_object_path(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str())?;
+        let dst_file_path = self.get_object_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
         // data_dir path
         let has_data_dir_path = {
@@ -2458,11 +2456,11 @@ impl DiskAPI for LocalDisk {
             if let Some(data_dir) = has_data_dir {
                 let src_data_path = self.get_object_path(
                     src_volume,
-                    rustfs_utils::path::retain_slash(format!("{}/{}", &src_path, data_dir).as_str()).as_str(),
+                    rustfs_utils::path::retain_slash(format!("{}/{}", src_path, data_dir).as_str()).as_str(),
                 )?;
                 let dst_data_path = self.get_object_path(
                     dst_volume,
-                    rustfs_utils::path::retain_slash(format!("{}/{}", &dst_path, data_dir).as_str()).as_str(),
+                    rustfs_utils::path::retain_slash(format!("{}/{}", dst_path, data_dir).as_str()).as_str(),
                 )?;
 
                 Some((src_data_path, dst_data_path))
@@ -2538,7 +2536,7 @@ impl DiskAPI for LocalDisk {
 
             self.write_all_private(
                 src_volume,
-                format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(),
+                format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str(),
                 new_dst_buf.into(),
                 true,
                 meta_skip_parent,
@@ -2555,7 +2553,7 @@ impl DiskAPI for LocalDisk {
             }
         } else {
             let new_dst_buf = xlmeta.marshal_msg()?;
-            self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
+            self.write_all(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
                 .await?;
         }
 
@@ -2565,7 +2563,7 @@ impl DiskAPI for LocalDisk {
                 && let Err(err) = self
                     .write_all_private(
                         dst_volume,
-                        format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE).as_str(),
+                        format!("{}/{}/{}", dst_path, old_data_dir, STORAGE_FORMAT_FILE).as_str(),
                         dst_buf.into(),
                         true,
                         &skip_parent,
@@ -2699,7 +2697,7 @@ impl DiskAPI for LocalDisk {
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
             let buf = self
-                .read_all(volume, format!("{}/{}", &path, STORAGE_FORMAT_FILE).as_str())
+                .read_all(volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())
                 .await
                 .map_err(|e| {
                     if e == DiskError::FileNotFound && fi.version_id.is_some() {
@@ -2974,7 +2972,7 @@ impl DiskAPI for LocalDisk {
         let mut found = 0;
 
         for v in req.files.iter() {
-            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", &req.prefix, v).as_str())?;
+            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", req.prefix, v).as_str())?;
             let mut res = ReadMultipleResp {
                 bucket: req.bucket.clone(),
                 prefix: req.prefix.clone(),
@@ -3633,7 +3631,7 @@ mod test {
 
         let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
 
-        println!("ppp :{:?}", &tmpp);
+        println!("ppp :{:?}", tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 
@@ -3661,7 +3659,7 @@ mod test {
 
         let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
 
-        println!("ppp :{:?}", &tmpp);
+        println!("ppp :{:?}", tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 

@@ -328,7 +328,7 @@ impl Operation for StartDecommission {
         let pools_indices = dedup_indices(&parsed_indices);
 
         if !pools_indices.is_empty() {
-            let pool_context = format!("pools {:?}", &pools_indices);
+            let pool_context = format!("pools {:?}", pools_indices);
             store
                 .decommission(ctx.clone(), pools_indices)
                 .await
