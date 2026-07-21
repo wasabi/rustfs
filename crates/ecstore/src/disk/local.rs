@@ -1199,6 +1199,12 @@ impl LocalDisk {
             }
         }
 
+        // tokio::fs::File buffers writes and completes them on a background task; dropping
+        // the handle does not guarantee the buffer has been written, so an immediate reader
+        // can observe a truncated file. Flush explicitly before returning so the write is
+        // fully visible once this call resolves.
+        f.flush().await.map_err(to_file_error)?;
+
         Ok(())
     }
 
