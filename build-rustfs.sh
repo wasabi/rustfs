@@ -206,9 +206,125 @@ get_version() {
     fi
 }
 
+# Ensure protoc is available (required by crates that compile protobuf, e.g. pulsar)
+ensure_protoc() {
+    local install_dir="${HOME}/.local/bin"
+    local protoc_bin=""
+
+    if command -v protoc >/dev/null 2>&1; then
+        protoc_bin="$(command -v protoc)"
+        export PROTOC="$protoc_bin"
+        return 0
+    fi
+
+    protoc_bin="${install_dir}/protoc"
+    if [ -x "$protoc_bin" ]; then
+        export PATH="${install_dir}:${PATH}"
+        export PROTOC="$protoc_bin"
+        return 0
+    fi
+
+    print_message $YELLOW "protoc not found; installing user-local protobuf compiler..."
+
+    if ! command -v curl >/dev/null 2>&1; then
+        print_message $RED "❌ curl is required to install protoc (or run: sudo apt-get install -y protobuf-compiler)"
+        exit 1
+    fi
+    if ! command -v unzip >/dev/null 2>&1; then
+        print_message $RED "❌ unzip is required to install protoc (or run: sudo apt-get install -y protobuf-compiler unzip)"
+        exit 1
+    fi
+
+    # Match CI setup-protoc version in .github/actions/setup/action.yml
+    local protoc_version="29.3"
+    local arch os_suffix zip_url
+    arch="$(uname -m)"
+    case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
+        linux)
+            case "$arch" in
+                x86_64) os_suffix="linux-x86_64" ;;
+                aarch64|arm64) os_suffix="linux-aarch_64" ;;
+                *)
+                    print_message $RED "❌ Unsupported Linux arch for protoc download: $arch"
+                    print_message $YELLOW "Install manually: sudo apt-get install -y protobuf-compiler"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        darwin)
+            case "$arch" in
+                x86_64) os_suffix="osx-x86_64" ;;
+                arm64|aarch64) os_suffix="osx-aarch_64" ;;
+                *)
+                    print_message $RED "❌ Unsupported macOS arch for protoc download: $arch"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            print_message $RED "❌ Unsupported OS for automatic protoc install"
+            print_message $YELLOW "Install protobuf-compiler for your platform, then re-run the build"
+            exit 1
+            ;;
+    esac
+
+    zip_url="https://github.com/protocolbuffers/protobuf/releases/download/v${protoc_version}/protoc-${protoc_version}-${os_suffix}.zip"
+    local temp_dir
+    temp_dir="$(mktemp -d)"
+    (
+        cd "$temp_dir"
+        curl -fsSL -o protoc.zip "$zip_url"
+        unzip -q protoc.zip
+        mkdir -p "$install_dir"
+        cp bin/protoc "$protoc_bin"
+        chmod +x "$protoc_bin"
+    )
+    rm -rf "$temp_dir"
+
+    export PATH="${install_dir}:${PATH}"
+    export PROTOC="$protoc_bin"
+    print_message $GREEN "✅ Installed protoc ${protoc_version} to ${protoc_bin}"
+}
+
+# Prefer a writable rustup (user-local) when the system install is not writable
+ensure_writable_rustup() {
+    local rustup_home=""
+
+    if command -v rustup >/dev/null 2>&1; then
+        rustup_home="$(rustup show home 2>/dev/null || true)"
+        # Writable home: keep current rustup. Empty home: leave as-is (e.g. test stubs).
+        if [ -z "$rustup_home" ] || [ -w "$rustup_home" ]; then
+            return 0
+        fi
+        print_message $YELLOW "Rustup home is not writable ($rustup_home); switching to user-local install..."
+    else
+        print_message $YELLOW "rustup not found; installing user-local rustup..."
+    fi
+
+    if [ ! -x "${HOME}/.cargo/bin/rustup" ]; then
+        if ! command -v curl >/dev/null 2>&1; then
+            print_message $RED "❌ curl is required to install rustup into \$HOME/.cargo"
+            exit 1
+        fi
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    fi
+
+    # Drop system RUSTUP_HOME/CARGO_HOME (e.g. /usr/local) that caused permission errors
+    unset RUSTUP_HOME CARGO_HOME
+    # shellcheck disable=SC1091
+    source "${HOME}/.cargo/env"
+    export PATH="${HOME}/.cargo/bin:${PATH}"
+}
+
 # Setup rust environment
 setup_rust_environment() {
     print_message $BLUE "🔧 Setting up Rust environment..."
+
+    ensure_writable_rustup
+    ensure_protoc
+
+    print_message $YELLOW "Installing toolchain: stable"
+    rustup toolchain install stable
 
     # Install required target for current platform
     print_message $YELLOW "Installing target: $PLATFORM"
