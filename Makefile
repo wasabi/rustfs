@@ -70,6 +70,7 @@ How to use me:
 
 	🚀 Quick Start:
 		make build                               # Build RustFS binary
+		make run                                 # Build and run RustFS locally
 		make docker-dev-local                    # Build development Docker image (local)
 		make dev-env-start                       # Start development environment
 

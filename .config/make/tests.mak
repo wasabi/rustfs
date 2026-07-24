@@ -18,8 +18,18 @@ test: core-deps test-deps script-tests ## Run all tests
 	fi
 	cargo test --all --doc
 
+.PHONY: run
+run: ## Build and run RustFS locally via scripts/run.sh
+	@echo "🚀 Starting RustFS locally..."
+	# IDE/container env often sets these to root-owned /usr/local/{rustup,cargo}.
+	unset RUSTUP_HOME CARGO_HOME
+	export PATH="$${HOME}/.cargo/bin:$${PATH}"
+	$(shell pwd)/scripts/run.sh
+
 .PHONY: e2e-server
 e2e-server: ## Run e2e-server tests
+	unset RUSTUP_HOME CARGO_HOME
+	export PATH="$${HOME}/.cargo/bin:$${PATH}"
 	sh $(shell pwd)/scripts/run.sh
 
 .PHONY: probe-e2e
