@@ -22,7 +22,7 @@ use std::io::ErrorKind;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tracing::error;
+use tracing::{Instrument, debug_span, error};
 
 pin_project! {
 pub(crate) struct ParallelReader<R> {
@@ -271,7 +271,10 @@ impl Erasure {
                 break;
             }
 
-            let (mut shards, errs) = reader.read().await;
+            let (mut shards, errs) = reader
+                .read()
+                .instrument(debug_span!(target: "rustfs_get_trace", "get.shard_read"))
+                .await;
 
             if ret_err.is_none()
                 && let (_, Some(err)) = reduce_errs(&errs, &[])
@@ -287,13 +290,16 @@ impl Erasure {
             }
 
             // Decode the shards
-            if let Err(e) = self.decode_data(&mut shards) {
+            if let Err(e) = debug_span!(target: "rustfs_get_trace", "get.ec_decode").in_scope(|| self.decode_data(&mut shards)) {
                 error!("erasure decode decode_data err: {:?}", e);
                 ret_err = Some(e);
                 break;
             }
 
-            let n = match write_data_blocks(writer, &shards, self.data_shards, block_offset, block_length).await {
+            let n = match write_data_blocks(writer, &shards, self.data_shards, block_offset, block_length)
+                .instrument(debug_span!(target: "rustfs_get_trace", "get.pipe_write"))
+                .await
+            {
                 Ok(n) => n,
                 Err(e) => {
                     error!("erasure decode write_data_blocks err: {:?}", e);

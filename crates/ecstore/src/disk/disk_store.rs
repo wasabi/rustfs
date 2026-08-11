@@ -37,7 +37,7 @@ use std::{
 };
 use tokio::{sync::RwLock, time};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{Instrument, debug_span, info, warn};
 use uuid::Uuid;
 
 /// Disk health status constants
@@ -495,6 +495,10 @@ impl LocalDiskWrapper {
         self.disk.clone()
     }
 
+    pub fn get_object_path_if_local(&self, volume: &str, path: &str) -> crate::disk::error::Result<std::path::PathBuf> {
+        self.disk.get_object_path(volume, path)
+    }
+
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
         self.health.runtime_state()
     }
@@ -834,7 +838,9 @@ impl LocalDiskWrapper {
         }
 
         // Check if disk is stale
-        self.check_disk_stale().await?;
+        self.check_disk_stale()
+            .instrument(debug_span!(target: "rustfs_get_trace", "get.xl_stale_check"))
+            .await?;
 
         // Record operation start
         let now = std::time::SystemTime::now()

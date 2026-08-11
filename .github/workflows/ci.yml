@@ -139,12 +139,66 @@ jobs:
       - name: Check layered dependencies
         run: ./scripts/check_layer_dependencies.sh
 
-  build-rustfs-debug-binary:
-    name: Build RustFS Debug Binary
+  e2e-tests:
+    name: End-to-End Tests
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: [self-hosted, lab-large]
-    timeout-minutes: 30
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Clean up previous test run
+        run: |
+          rm -rf /tmp/rustfs
+          rm -f /tmp/rustfs.log
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-rustfs-debug-binary-${{ hashFiles('**/Cargo.lock') }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build debug binary
+        run: |
+          touch rustfs/build.rs
+          cargo build -p rustfs --bins --jobs 2
+
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
+
+      - name: Install s3s-e2e test tool
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: s3s-e2e
+          git: https://github.com/s3s-project/s3s.git
+          rev: 62cb4a71dd759a6ec56b64c4c42fcc183a2c6a52
+
+      - name: Run end-to-end tests
+        run: |
+          s3s-e2e --version
+          ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
+
+      - name: Upload test logs
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: e2e-test-logs-${{ github.run_number }}
+          path: /tmp/rustfs.log
+          retention-days: 3
+
+  s3-implemented-tests:
+    name: S3 Implemented Tests
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: [self-hosted, lab-large]
+    timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -164,80 +218,6 @@ jobs:
           touch rustfs/build.rs
           cargo build -p rustfs --bins
 
-      - name: Upload debug binary
-        uses: actions/upload-artifact@v6
-        with:
-          name: rustfs-debug-binary
-          path: target/debug/rustfs
-          if-no-files-found: error
-          retention-days: 1
-
-  e2e-tests:
-    name: End-to-End Tests
-    needs: [ skip-check, build-rustfs-debug-binary ]
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: [self-hosted, lab-small]
-    timeout-minutes: 30
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Clean up previous test run
-        run: |
-          rm -rf /tmp/rustfs
-          rm -f /tmp/rustfs.log
-
-      - name: Download debug binary
-        uses: actions/download-artifact@v7
-        with:
-          name: rustfs-debug-binary
-          path: target/debug
-
-      - name: Make binary executable
-        run: chmod +x ./target/debug/rustfs
-
-      - name: Configure user-writable Rust paths
-        uses: ./.github/actions/rust-paths
-
-      - name: Setup Rust toolchain for s3s-e2e installation
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install s3s-e2e test tool
-        uses: taiki-e/cache-cargo-install-action@v2
-        with:
-          tool: s3s-e2e
-          git: https://github.com/s3s-project/s3s.git
-          rev: 62cb4a71dd759a6ec56b64c4c42fcc183a2c6a52
-
-      - name: Run end-to-end tests
-        run: |
-          s3s-e2e --version
-          ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
-
-      - name: Upload test logs
-        if: failure()
-        uses: actions/upload-artifact@v6
-        with:
-          name: e2e-test-logs-${{ github.run_number }}
-          path: /tmp/rustfs.log
-          retention-days: 3
-
-  s3-implemented-tests:
-    name: S3 Implemented Tests
-    needs: [ skip-check, build-rustfs-debug-binary ]
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: [self-hosted, lab-large]
-    timeout-minutes: 60
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Download debug binary
-        uses: actions/download-artifact@v7
-        with:
-          name: rustfs-debug-binary
-          path: target/debug
-
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
@@ -251,6 +231,7 @@ jobs:
 
       - name: Upload s3 test artifacts
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: s3tests-implemented-${{ github.run_number }}

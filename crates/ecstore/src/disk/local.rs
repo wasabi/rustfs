@@ -56,10 +56,10 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
+use tokio::io::{AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::sync::RwLock;
 use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, debug_span, error, info, warn};
 use uuid::Uuid;
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
@@ -293,7 +293,7 @@ fn should_reclaim_file_cache_after_write(file_size: i64) -> bool {
     file_size as usize >= threshold
 }
 
-fn should_reclaim_file_cache_after_read(length: usize) -> bool {
+pub(crate) fn should_reclaim_file_cache_after_read(length: usize) -> bool {
     if length == 0 {
         return false;
     }
@@ -1027,40 +1027,53 @@ impl LocalDisk {
         volume_dir: impl AsRef<Path>,
         file_path: impl AsRef<Path>,
     ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-        let mut f = match super::fs::open_file(file_path.as_ref(), O_RDONLY).await {
-            Ok(f) => f,
-            Err(e) => {
-                if e.kind() == ErrorKind::NotFound
-                    && !skip_access_checks(volume)
-                    && let Err(er) = access(volume_dir.as_ref()).await
-                    && er.kind() == ErrorKind::NotFound
-                {
-                    warn!("read_all_data_with_dmtime os err {:?}", &er);
-                    return Err(DiskError::VolumeNotFound);
+        let volume = volume.to_string();
+        let volume_dir = volume_dir.as_ref().to_path_buf();
+        let file_path = file_path.as_ref().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let mut f = {
+                let _span = debug_span!(target: "rustfs_get_trace", "get.xl_fs_open").entered();
+                match std::fs::File::open(&file_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            && !skip_access_checks(&volume)
+                            && let Err(er) = std::fs::metadata(&volume_dir)
+                            && er.kind() == std::io::ErrorKind::NotFound
+                        {
+                            warn!("read_all_data_with_dmtime os err {:?}", &er);
+                            return Err(DiskError::VolumeNotFound);
+                        }
+                        return Err(to_file_error(e).into());
+                    }
                 }
+            };
 
-                return Err(to_file_error(e).into());
+            let meta = {
+                let _span = debug_span!(target: "rustfs_get_trace", "get.xl_fs_stat").entered();
+                f.metadata().map_err(to_file_error).map_err(DiskError::from)?
+            };
+
+            if meta.is_dir() {
+                return Err(DiskError::FileNotFound);
             }
-        };
 
-        let meta = f.metadata().await.map_err(to_file_error)?;
+            let size = meta.len() as usize;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(size).map_err(Error::other)?;
 
-        if meta.is_dir() {
-            return Err(DiskError::FileNotFound);
-        }
+            {
+                let _span = debug_span!(target: "rustfs_get_trace", "get.xl_fs_read").entered();
+                use std::io::Read;
+                f.read_to_end(&mut bytes).map_err(to_file_error).map_err(DiskError::from)?;
+            }
 
-        let size = meta.len() as usize;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(size).map_err(Error::other)?;
-
-        f.read_to_end(&mut bytes).await.map_err(to_file_error)?;
-
-        let modtime = match meta.modified() {
-            Ok(md) => Some(OffsetDateTime::from(md)),
-            Err(_) => None,
-        };
-
-        Ok((bytes, modtime))
+            let modtime = meta.modified().ok().map(OffsetDateTime::from);
+            Ok((bytes, modtime))
+        })
+        .await
+        .map_err(DiskError::from)?
     }
 
     async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &[FileInfo]) -> Result<()> {
@@ -1185,6 +1198,12 @@ impl LocalDisk {
                 f.write_all(buf.as_ref()).await.map_err(to_file_error)?;
             }
         }
+
+        // tokio::fs::File buffers writes and completes them on a background task; dropping
+        // the handle does not guarantee the buffer has been written, so an immediate reader
+        // can observe a truncated file. Flush explicitly before returning so the write is
+        // fully visible once this call resolves.
+        f.flush().await.map_err(to_file_error)?;
 
         Ok(())
     }
@@ -1343,13 +1362,11 @@ impl LocalDisk {
                     continue;
                 }
 
-                let metadata = self
-                    .read_metadata(bucket, format!("{}/{}", &current, &entry).as_str())
-                    .await?;
+                let metadata = self.read_metadata(bucket, format!("{}/{}", current, entry).as_str()).await?;
 
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
-                let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
+                let name = decode_dir_object(format!("{}/{}", current, name).as_str());
 
                 // if opts.limit > 0
                 //     && let Ok(meta) = FileMeta::load(&metadata)
@@ -1446,7 +1463,7 @@ impl LocalDisk {
                 meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
             }
 
-            let fname = format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE);
+            let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
 
             match self.read_metadata(&opts.bucket, fname.as_str()).await {
                 Ok(res) => {
@@ -2184,11 +2201,8 @@ impl DiskAPI for LocalDisk {
         Ok(Box::new(FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop)))
     }
 
-    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
+    /// File read using pread (Unix) or efficient read (non-Unix).
     /// Returns Bytes that can be shared without copying.
-    // SAFETY: Unix unsafe calls in this function only query page size and mmap
-    // a read-only file region after bounds and alignment are validated.
-    #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         let volume_dir = self.get_bucket_path(volume)?;
@@ -2218,80 +2232,48 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileCorrupt);
         }
 
-        // Unix: use mmap to read the data (copies into Bytes for safe ownership)
-        // Non-Unix: fall back to efficient read
+        // Unix: use pread (read_at) to read the data without mmap overhead.
+        // Non-Unix: fall back to efficient read.
         #[cfg(unix)]
         {
-            use memmap2::MmapOptions;
             use std::time::Instant;
 
             let start = Instant::now();
             let file_path_clone = file_path.clone();
 
-            let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
             let bytes = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::FileExt;
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
 
-                #[cfg(target_os = "macos")]
-                if should_reclaim_after_read {
-                    let _ = set_std_fd_nocache(&file);
+                let mut buf = vec![0u8; length];
+                let mut total = 0usize;
+                while total < length {
+                    let nbytes = file
+                        .read_at(&mut buf[total..], (offset + total) as u64)
+                        .map_err(DiskError::from)?;
+                    if nbytes == 0 {
+                        return Err(DiskError::FileCorrupt);
+                    }
+                    total += nbytes;
                 }
-
-                // mmap offsets on Unix must be page-size aligned. Align the
-                // mapping down to the nearest page boundary, then slice out the
-                // originally requested logical range.
-                // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and
-                // only queries process-global OS configuration.
-                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-                if page_size <= 0 {
-                    return Err(DiskError::other("failed to determine system page size"));
-                }
-                let page_size = page_size as u64;
-                let offset_u64 = offset as u64;
-                let aligned_offset = offset_u64 - (offset_u64 % page_size);
-                let logical_offset = (offset_u64 - aligned_offset) as usize;
-                let map_len = logical_offset
-                    .checked_add(length)
-                    .ok_or_else(|| DiskError::other("mmap length overflow"))?;
-
-                // SAFETY: The file is opened as read-only, and we're mapping a region
-                // that we've already verified exists and is within file bounds. The
-                // file offset passed to mmap is page-size aligned as required on Unix.
-                let mmap =
-                    unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(&file) }.map_err(DiskError::other)?;
-
-                // Copy only the requested logical range into a Bytes buffer. This
-                // avoids undefined behavior from treating OS-managed mmap memory as
-                // allocator-managed Vec storage, at the cost of an extra copy.
-                let end = logical_offset
-                    .checked_add(length)
-                    .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
-                let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
 
                 #[cfg(target_os = "linux")]
-                if should_reclaim_after_read {
+                if should_reclaim_file_cache_after_read(length) {
                     use core::num::NonZeroU64;
                     use rustix::fs::{Advice, fadvise};
-
-                    let reclaim_len =
-                        NonZeroU64::new(map_len as u64).ok_or_else(|| DiskError::other("mmap reclaim length overflow"))?;
-                    fadvise(&file, aligned_offset, Some(reclaim_len), Advice::DontNeed)
-                        .map_err(std::io::Error::from)
-                        .map_err(DiskError::from)?;
+                    if let Some(reclaim_len) = NonZeroU64::new(length as u64) {
+                        let _ = fadvise(&file, offset as u64, Some(reclaim_len), Advice::DontNeed);
+                    }
                 }
 
-                Ok::<Bytes, DiskError>(bytes)
+                Ok::<Bytes, DiskError>(Bytes::from(buf))
             })
             .await
             .map_err(DiskError::from)??;
 
-            // Log successful mmap read metrics
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-            // Record mmap read metrics
             rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
-
-            debug!(size = length, duration_ms = duration_ms, "mmap_read_success");
+            debug!(size = length, duration_ms = duration_ms, "pread_read_success");
 
             return Ok(bytes);
         }
@@ -2299,6 +2281,8 @@ impl DiskAPI for LocalDisk {
         // Non-Unix fallback: efficient read into Bytes
         #[cfg(not(unix))]
         {
+            use tokio::io::AsyncReadExt;
+
             // Record zero-copy fallback
             rustfs_io_metrics::record_zero_copy_fallback("non_unix_platform");
 
@@ -2455,8 +2439,8 @@ impl DiskAPI for LocalDisk {
         }
 
         // xl.meta path
-        let src_file_path = self.get_object_path(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str())?;
-        let dst_file_path = self.get_object_path(dst_volume, format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str())?;
+        let src_file_path = self.get_object_path(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str())?;
+        let dst_file_path = self.get_object_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
         // data_dir path
         let has_data_dir_path = {
@@ -2472,11 +2456,11 @@ impl DiskAPI for LocalDisk {
             if let Some(data_dir) = has_data_dir {
                 let src_data_path = self.get_object_path(
                     src_volume,
-                    rustfs_utils::path::retain_slash(format!("{}/{}", &src_path, data_dir).as_str()).as_str(),
+                    rustfs_utils::path::retain_slash(format!("{}/{}", src_path, data_dir).as_str()).as_str(),
                 )?;
                 let dst_data_path = self.get_object_path(
                     dst_volume,
-                    rustfs_utils::path::retain_slash(format!("{}/{}", &dst_path, data_dir).as_str()).as_str(),
+                    rustfs_utils::path::retain_slash(format!("{}/{}", dst_path, data_dir).as_str()).as_str(),
                 )?;
 
                 Some((src_data_path, dst_data_path))
@@ -2552,7 +2536,7 @@ impl DiskAPI for LocalDisk {
 
             self.write_all_private(
                 src_volume,
-                format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(),
+                format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str(),
                 new_dst_buf.into(),
                 true,
                 meta_skip_parent,
@@ -2569,7 +2553,7 @@ impl DiskAPI for LocalDisk {
             }
         } else {
             let new_dst_buf = xlmeta.marshal_msg()?;
-            self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
+            self.write_all(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
                 .await?;
         }
 
@@ -2579,7 +2563,7 @@ impl DiskAPI for LocalDisk {
                 && let Err(err) = self
                     .write_all_private(
                         dst_volume,
-                        format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE).as_str(),
+                        format!("{}/{}/{}", dst_path, old_data_dir, STORAGE_FORMAT_FILE).as_str(),
                         dst_buf.into(),
                         true,
                         &skip_parent,
@@ -2713,7 +2697,7 @@ impl DiskAPI for LocalDisk {
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
             let buf = self
-                .read_all(volume, format!("{}/{}", &path, STORAGE_FORMAT_FILE).as_str())
+                .read_all(volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())
                 .await
                 .map_err(|e| {
                     if e == DiskError::FileNotFound && fi.version_id.is_some() {
@@ -2792,6 +2776,7 @@ impl DiskAPI for LocalDisk {
 
         let (data, _) = self
             .read_raw(volume, volume_dir.clone(), file_path, read_data)
+            .instrument(debug_span!(target: "rustfs_get_trace", "get.xl_meta_read"))
             .await
             .map_err(|e| {
                 if e == DiskError::FileNotFound && !version_id.is_empty() {
@@ -2987,7 +2972,7 @@ impl DiskAPI for LocalDisk {
         let mut found = 0;
 
         for v in req.files.iter() {
-            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", &req.prefix, v).as_str())?;
+            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", req.prefix, v).as_str())?;
             let mut res = ReadMultipleResp {
                 bucket: req.bucket.clone(),
                 prefix: req.prefix.clone(),
@@ -3105,6 +3090,84 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
     };
 
     Ok((disk_info, root_drive))
+}
+
+/// Reads N shard files in a single blocking thread using pread (FileExt::read_at).
+///
+/// Each request is `(file_path, offset, length)`.  Returns `Vec<Result<Bytes>>` in
+/// the same order.  All shards for one EC part are batched into one `spawn_blocking`
+/// call to eliminate per-shard async re-poll delay while keeping total blocking-thread
+/// occupancy to one event per GET.
+#[cfg(unix)]
+pub(crate) async fn batch_shard_pread(
+    requests: Vec<(std::path::PathBuf, usize, usize)>,
+) -> Vec<crate::disk::error::Result<bytes::Bytes>> {
+    use tracing::debug;
+    let n = requests.len();
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::FileExt;
+        use std::time::Instant;
+        let batch_start = Instant::now();
+        let mut results = Vec::with_capacity(n);
+
+        for (i, (file_path, offset, length)) in requests.into_iter().enumerate() {
+            let mut stat_us: u128 = 0;
+            let mut open_us: u128 = 0;
+            let mut pread_us: u128 = 0;
+
+            let r = (|| -> crate::disk::error::Result<bytes::Bytes> {
+                let t = Instant::now();
+                let meta = std::fs::metadata(&file_path).map_err(DiskError::from)?;
+                stat_us = t.elapsed().as_micros();
+
+                let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+                if meta.len() < end as u64 {
+                    return Err(DiskError::FileCorrupt);
+                }
+
+                let t = Instant::now();
+                let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
+                open_us = t.elapsed().as_micros();
+
+                let mut buf = vec![0u8; length];
+                let t = Instant::now();
+                let mut total = 0usize;
+                while total < length {
+                    let nbytes = file
+                        .read_at(&mut buf[total..], (offset + total) as u64)
+                        .map_err(DiskError::from)?;
+                    if nbytes == 0 {
+                        return Err(DiskError::FileCorrupt);
+                    }
+                    total += nbytes;
+                }
+                pread_us = t.elapsed().as_micros();
+
+                Ok(bytes::Bytes::from(buf))
+            })();
+
+            debug!(target: "rustfs_get_trace", i = i, batch_stat_us = stat_us, "batch_stat");
+            debug!(target: "rustfs_get_trace", i = i, batch_open_us = open_us, "batch_open");
+            debug!(target: "rustfs_get_trace", i = i, batch_pread_us = pread_us, "batch_pread");
+
+            results.push(r);
+        }
+
+        let batch_blocking_done = Instant::now();
+        let batch_blocking_us = batch_start.elapsed().as_micros();
+        debug!(target: "rustfs_get_trace", batch_blocking_us = batch_blocking_us, n = n, "batch_blocking");
+        (results, batch_blocking_done)
+    })
+    .await
+    .map(|(results, blocking_done)| {
+        let batch_repoll_us = blocking_done.elapsed().as_micros();
+        tracing::debug!(target: "rustfs_get_trace", batch_repoll_us = batch_repoll_us, n = n, "batch_repoll");
+        results
+    })
+    .unwrap_or_else(|e| {
+        let msg = format!("spawn_blocking join: {e}");
+        (0..n).map(|_| Err(DiskError::other(msg.clone()))).collect()
+    })
 }
 
 #[cfg(test)]
@@ -3568,7 +3631,7 @@ mod test {
 
         let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
 
-        println!("ppp :{:?}", &tmpp);
+        println!("ppp :{:?}", tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 
@@ -3596,7 +3659,7 @@ mod test {
 
         let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
 
-        println!("ppp :{:?}", &tmpp);
+        println!("ppp :{:?}", tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 
@@ -3974,5 +4037,123 @@ mod test {
                 assert!(!should_reclaim_file_cache_after_read(1024));
             });
         });
+    }
+
+    #[tokio::test]
+    async fn test_read_all_data_with_dmtime_round_trip() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let bucket = "my-test-bucket";
+        disk.make_volume(bucket).await.unwrap();
+        let data = b"hello round trip";
+        disk.write_all(bucket, "object/data", Bytes::copy_from_slice(data))
+            .await
+            .unwrap();
+
+        let volume_dir = disk.get_bucket_path(bucket).unwrap();
+        let file_path = disk.get_object_path(bucket, "object/data").unwrap();
+
+        let (content, modtime) = disk.read_all_data_with_dmtime(bucket, &volume_dir, &file_path).await.unwrap();
+        assert_eq!(content, data);
+        assert!(modtime.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_read_all_data_with_dmtime_file_not_found() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let bucket = "my-test-bucket";
+        disk.make_volume(bucket).await.unwrap();
+
+        let volume_dir = disk.get_bucket_path(bucket).unwrap();
+        let file_path = volume_dir.join("nonexistent.txt");
+
+        let result = disk.read_all_data_with_dmtime(bucket, &volume_dir, &file_path).await;
+        assert!(matches!(result, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_read_all_data_with_dmtime_volume_not_found() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // A plain bucket whose directory was never created; skip_access_checks returns false for it
+        let bucket = "regular-bucket";
+        let volume_dir = disk.root.join(bucket);
+        let file_path = volume_dir.join("object.dat");
+
+        let result = disk.read_all_data_with_dmtime(bucket, &volume_dir, &file_path).await;
+        assert!(matches!(result, Err(DiskError::VolumeNotFound)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_basic() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let payloads: &[&[u8]] = &[b"aaaaaa", b"bbbbbb", b"cccccc"];
+        let mut requests = Vec::new();
+        for (i, payload) in payloads.iter().enumerate() {
+            let p = dir.path().join(format!("shard-{i}.bin"));
+            std::fs::write(&p, payload).unwrap();
+            requests.push((p, 0usize, payload.len()));
+        }
+
+        let results = batch_shard_pread(requests).await;
+        assert_eq!(results.len(), payloads.len());
+        for (result, expected) in results.iter().zip(payloads.iter()) {
+            assert_eq!(result.as_ref().unwrap().as_ref(), *expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_partial_errors() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let good_path = dir.path().join("good.bin");
+        std::fs::write(&good_path, b"good data").unwrap();
+        let missing_path = dir.path().join("does-not-exist.bin");
+
+        let requests = vec![(good_path, 0usize, 9usize), (missing_path, 0usize, 4usize)];
+
+        let results = batch_shard_pread(requests).await;
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert_eq!(results[0].as_ref().unwrap().as_ref(), b"good data");
+        assert!(results[1].is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_zero_copy_pread_basic() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let bucket = "test-bucket-zc";
+        disk.make_volume(bucket).await.unwrap();
+        let data = b"0123456789abcdef";
+        disk.write_all(bucket, "shard.bin", Bytes::copy_from_slice(data))
+            .await
+            .unwrap();
+
+        // Read sub-range [4..12] (offset=4, length=8)
+        let result = disk.read_file_zero_copy(bucket, "shard.bin", 4, 8).await.unwrap();
+        assert_eq!(result.as_ref(), b"456789ab");
     }
 }

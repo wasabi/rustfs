@@ -1682,7 +1682,7 @@ pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
     let mut hasher = Sha256::new();
     hasher.update(format!("{}/{}", get_global_deployment_id().unwrap_or_default(), bucket).as_bytes());
     let hash = rustfs_utils::crypto::hex(hasher.finalize().as_slice());
-    let obj = format!("{}/{}/{}/{}", &hash[0..16], &us[0..2], &us[2..4], &us);
+    let obj = format!("{}/{}/{}/{}", &hash[0..16], &us[0..2], &us[2..4], us);
     Ok(obj)
 }
 

@@ -1196,7 +1196,7 @@ impl Store for ObjectStore {
                 };
             }
 
-            for (_, v) in items_cache.iter() {
+            for v in items_cache.values() {
                 let parent = v.credentials.parent_user.clone();
                 if !user_items_cache.contains_key(&parent) {
                     info!("load sts user policy: {}", parent);

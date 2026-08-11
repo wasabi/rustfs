@@ -754,7 +754,7 @@ def render_report_md(data: dict) -> str:
         disk_rows = []
         for node_label, stats in sorted(dsk.items()):
             if not stats:
-                disk_rows.append([node_label, "—", "—", "—", "—", "—", "—", "—", "—"])
+                disk_rows.append([node_label, "—", "—", "—", "—", "—", "—", "—"])
                 continue
             for dev in stats["devices"]:
                 disk_rows.append([

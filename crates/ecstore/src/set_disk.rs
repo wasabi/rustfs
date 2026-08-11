@@ -667,6 +667,7 @@ impl ObjectIO for SetDisks {
                 .new_ns_lock(bucket, object)
                 .await?
                 .get_read_lock_with_metadata(get_lock_acquire_timeout(), read_lock_metadata(opts))
+                .instrument(debug_span!(target: "rustfs_get_trace", "get.ns_lock"))
                 .await
                 .map_err(|e| {
                     Error::other(format!(
@@ -689,9 +690,12 @@ impl ObjectIO for SetDisks {
 
         let (fi, files, disks) = self
             .get_object_fileinfo(bucket, object, opts, true)
+            .instrument(debug_span!(target: "rustfs_get_trace", "get.xlmeta_read"))
             .await
             .map_err(|err| to_object_err(err, vec![bucket, object]))?;
         let object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let pre_spawn_span = debug_span!(target: "rustfs_get_trace", "get.pre_spawn");
+        let _pre_spawn_guard = pre_spawn_span.enter();
 
         if object_info.delete_marker {
             if opts.version_id.is_none() {
@@ -764,7 +768,9 @@ impl ObjectIO for SetDisks {
         // Move the read-lock guard into the task so it lives for the duration of the read
         // Note: when lock optimization is enabled, read_lock_guard is None
         // let _guard_to_hold = _read_lock_guard; // moved into closure below
+        drop(_pre_spawn_guard);
         tokio::spawn(async move {
+            drop(pre_spawn_span);
             let _guard = read_lock_guard; // keep guard alive until task ends (None if optimization enabled)
             let mut writer = wd;
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
@@ -784,6 +790,7 @@ impl ObjectIO for SetDisks {
                 pool_index,
                 skip_verify,
             )
+            .instrument(debug_span!(target: "rustfs_get_trace", "get.spawn_task"))
             .await
             {
                 error!("get_object_with_fileinfo  {bucket}/{object} err {:?}", e);

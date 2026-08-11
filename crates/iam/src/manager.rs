@@ -639,7 +639,7 @@ where
         let mut user_exists = false;
         let mut ret = Vec::new();
 
-        for (_, v) in users.iter() {
+        for v in users.values() {
             let is_derived = v.credentials.is_service_account() || v.credentials.is_temp();
 
             if !is_derived && v.credentials.access_key.as_str() == access_key {
@@ -657,7 +657,7 @@ where
         }
 
         let sts_accounts = self.cache.sts_accounts.load();
-        for (_, v) in sts_accounts.iter() {
+        for v in sts_accounts.values() {
             if v.credentials.parent_user == access_key {
                 user_exists = true;
                 if v.credentials.is_temp() && !v.credentials.is_service_account() {
@@ -1303,7 +1303,7 @@ where
 
             let users_cache = self.cache.users.load();
 
-            for (_, v) in users_cache.iter() {
+            for v in users_cache.values() {
                 let u = &v.credentials;
                 if u.parent_user.as_str() == access_key {
                     if u.is_service_account() {
@@ -1821,7 +1821,7 @@ where
 
             if user_type == UserType::Reg {
                 let users_cache = self.cache.users.load();
-                for (_, v) in users_cache.iter() {
+                for v in users_cache.values() {
                     let u = &v.credentials;
                     if u.parent_user.as_str() == name && u.is_service_account() {
                         let _ = self.api.delete_user_identity(&u.access_key, UserType::Svc).await;

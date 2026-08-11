@@ -148,7 +148,7 @@ fn test_base64_encoding_decoding() {
 
     let encoded_string = base64_encode_url_safe_no_pad(original_uuid_timestamp.as_bytes());
 
-    println!("Encoded: {}", &encoded_string);
+    println!("Encoded: {}", encoded_string);
 
     let decoded_bytes = base64_decode_url_safe_no_pad(encoded_string.as_bytes()).unwrap();
     let decoded_string = String::from_utf8(decoded_bytes).unwrap();

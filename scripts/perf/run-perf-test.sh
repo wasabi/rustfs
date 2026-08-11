@@ -147,7 +147,7 @@ fi
 # ---------------------------------------------------------------------------
 
 if $TRACE; then
-    RUST_LOG='error,rustfs_put_trace=debug,rustfs_lock_rpc=debug,h2=warn,hyper=warn,tonic=warn,reqwest=warn,tower=warn'
+    RUST_LOG='error,rustfs_put_trace=debug,rustfs_get_trace=debug,rustfs_lock_rpc=debug,h2=warn,hyper=warn,tonic=warn,reqwest=warn,tower=warn'
     log "Trace mode enabled — RUST_LOG set to debug recipe"
 else
     RUST_LOG='error'

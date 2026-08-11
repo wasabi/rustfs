@@ -21,6 +21,19 @@ use std::time::Instant;
 use tokio::io::AsyncRead;
 use tracing::debug;
 
+/// Adjusts a raw (offset, length) pair to account for per-shard checksum overhead.
+/// Returns (adjusted_offset, adjusted_length).
+pub(crate) fn adjust_shard_read_params(
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    checksum_algo: &HashAlgorithm,
+) -> (usize, usize) {
+    let adj_len = length.div_ceil(shard_size) * checksum_algo.size() + length;
+    let adj_off = offset.div_ceil(shard_size) * checksum_algo.size() + offset;
+    (adj_off, adj_len)
+}
+
 /// Create a BitrotReader from either inline data or disk file stream
 ///
 /// # Parameters
@@ -33,7 +46,7 @@ use tracing::debug;
 /// * `shard_size` - Shard size for erasure coding
 /// * `checksum_algo` - Hash algorithm for bitrot verification
 /// * `skip_verify` - If true, skip checksum verification
-/// * `use_zero_copy` - If true, use zero-copy read (mmap on Unix)
+/// * `use_zero_copy` - If true, use zero-copy read (pread on Unix)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_bitrot_reader(
     inline_data: Option<&[u8]>,
@@ -48,8 +61,7 @@ pub async fn create_bitrot_reader(
     use_zero_copy: bool,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
     // Calculate the total length to read, including the checksum overhead
-    let length = length.div_ceil(shard_size) * checksum_algo.size() + length;
-    let offset = offset.div_ceil(shard_size) * checksum_algo.size() + offset;
+    let (offset, length) = adjust_shard_read_params(offset, length, shard_size, &checksum_algo);
     if let Some(data) = inline_data {
         // Use inline data
         let mut rd = Cursor::new(Bytes::copy_from_slice(data));
@@ -335,5 +347,24 @@ mod tests {
         let error = wrapper.unwrap_err();
         println!("error: {error:?}");
         assert_eq!(error, DiskError::DiskNotFound);
+    }
+
+    #[test]
+    fn test_adjust_shard_read_params_no_checksum() {
+        let algo = HashAlgorithm::None;
+        let (adj_off, adj_len) = adjust_shard_read_params(10, 100, 64, &algo);
+        assert_eq!(adj_off, 10);
+        assert_eq!(adj_len, 100);
+    }
+
+    #[test]
+    fn test_adjust_shard_read_params_known_values() {
+        // shard_size=128, SHA256.size()=32, offset=0, length=128
+        // adj_len = 128.div_ceil(128) * 32 + 128 = 1 * 32 + 128 = 160
+        // adj_off = 0.div_ceil(128) * 32 + 0 = 0
+        let algo = HashAlgorithm::SHA256;
+        let (adj_off, adj_len) = adjust_shard_read_params(0, 128, 128, &algo);
+        assert_eq!(adj_off, 0);
+        assert_eq!(adj_len, 160);
     }
 }
